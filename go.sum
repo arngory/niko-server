@@ -149,8 +149,6 @@ github.com/sagernet/quic-go v0.61.0-sing-box-mod.12 h1:9/USaaiONHFeqBePb+4C/A0MB
 github.com/sagernet/quic-go v0.61.0-sing-box-mod.12/go.mod h1:hmLC8GJPp+BrpBgrgJnacvI4fZGIhasuy1ROJJ8GR4E=
 github.com/sagernet/sing v0.9.7-0.20261023115459-5dc452e537bf h1:qWlGERjsI0F1I9e1W5Z/ARk/9KEN7xIas6e2QHEypUM=
 github.com/sagernet/sing v0.9.7-0.20261023115459-5dc452e537bf/go.mod h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=
-github.com/sagernet/sing-quic v0.7.2-0.20261020082049-7e0a5869a5f4 h1:QuhAb8QW0pKYmSvfj/nK91libunBwVJiWb852yidlxI=
-github.com/sagernet/sing-quic v0.7.2-0.20261020082049-7e0a5869a5f4/go.mod h1:rJFeVxbEej2iuyeCJ3drKW+p5rOgtLIW3XhZ6ty7Fig=
 github.com/sagernet/sing-tun v0.9.7-0.20261023115432-040db71fcd33 h1:0+op+qbxh/M/JsqIG8tkEwPM+5pZtBeicf1ciMxp4OI=
 github.com/sagernet/sing-tun v0.9.7-0.20261023115432-040db71fcd33/go.mod h1:3EgPst7agntRO7D6GOsiZ1l9FoqdLeuWmKT5TnWkmf0=
 github.com/sagernet/sing-usbip v0.0.0-20260817040617-28bd42667eca h1:5wA+IE0Fq1CGVLOgSpm0gKKZ03HzugcJ2JyhmDqeX6A=
