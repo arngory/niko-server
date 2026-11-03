@@ -237,7 +237,7 @@ func relayUDP(ctx context.Context, conn N.PacketConn) error {
 				resolved.Store(destination.Fqdn, addr)
 			}
 		}
-		if addr.IsValid() && Public(addr) {
+		if addr.IsValid() && (Public(addr) || anyDestination()) {
 			_, _ = udp.WriteToUDPAddrPort(buffer.Bytes(), netip.AddrPortFrom(addr.Unmap(), destination.Port))
 		}
 		buffer.Release()
