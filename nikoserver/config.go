@@ -4,7 +4,7 @@
 // a front (multiplexers) and one backend process per protocol, linked by unix
 // sockets. Contracts: arngory/niko docs/server/CONFIG.md (schema 1) and
 // docs/server/IPC.md (version 1). This release serves the DNS tunnels
-// (dnstt, MasterDnsVPN) and TCP 443 (tcpmux); UDP 443 comes later.
+// (dnstt, MasterDnsVPN), TCP 443 (tcpmux) and UDP 443 (udpmux).
 package nikoserver
 
 import (
@@ -74,13 +74,28 @@ type FrontTCP struct {
 	WindowClamp int      `json:"window_clamp,omitempty"`
 }
 
+// UDPRoute sends QUIC flows whose ClientHello names one of these servers,
+// or salamander flows that open with this password, to a backend.
+type UDPRoute struct {
+	SNI                    []string `json:"sni,omitempty"`
+	SalamanderPasswordFile string   `json:"salamander_password_file,omitempty"`
+	Backend                string   `json:"backend"`
+}
+
+// FrontUDP is udpmux (SPEC §3.2).
+type FrontUDP struct {
+	Listen []string   `json:"listen"`
+	Idle   string     `json:"idle,omitempty"`
+	Routes []UDPRoute `json:"routes"`
+}
+
 type FrontConfig struct {
 	Schema   int                   `json:"schema"`
 	Role     string                `json:"role"`
 	Log      LogOptions            `json:"log"`
 	DNS      *FrontDNS             `json:"dns,omitempty"`
 	TCP      *FrontTCP             `json:"tcp,omitempty"`
-	UDP      json.RawMessage       `json:"udp,omitempty"`
+	UDP      *FrontUDP             `json:"udp,omitempty"`
 	Backends map[string]BackendRef `json:"backends"`
 }
 
@@ -92,6 +107,19 @@ type BackendOptions struct {
 	Zones             []string `json:"zones,omitempty"`
 	EncryptionMethod  *int     `json:"encryption_method,omitempty"`
 	EncryptionKeyFile string   `json:"encryption_key_file,omitempty"`
+	// hy2-*: the per-connection ceilings of the server's Brutal (Mbit/s, 0:
+	// the client's own rate, or BBR without one); hy2-obfs: salamander.
+	UpMbps           int    `json:"up_mbps,omitempty"`
+	DownMbps         int    `json:"down_mbps,omitempty"`
+	ObfsPasswordFile string `json:"obfs_password_file,omitempty"`
+}
+
+// BackendTLS is a backend's certificate; curves default to X25519MLKEM768
+// and nothing else is accepted.
+type BackendTLS struct {
+	CertificateFile string   `json:"certificate_file"`
+	KeyFile         string   `json:"key_file"`
+	Curves          []string `json:"curves,omitempty"`
 }
 
 type BackendConfig struct {
@@ -102,6 +130,7 @@ type BackendConfig struct {
 	Socket    string         `json:"socket"`
 	FrontUID  int            `json:"front_uid"`
 	UsersFile string         `json:"users_file,omitempty"`
+	TLS       *BackendTLS    `json:"tls,omitempty"`
 	Options   BackendOptions `json:"options"`
 	Inner     string         `json:"inner,omitempty"`
 }
@@ -168,10 +197,6 @@ func checkSocket(e *configErrors, path, value string) {
 func (c *FrontConfig) validate() []ConfigError {
 	var e configErrors
 	checkLog(&e, c.Log)
-	// UDP 443 comes later (a route there would be silently dropped)
-	if len(c.UDP) > 0 && string(c.UDP) != "null" {
-		e.add("udp", "UDP 443 is not served by this niko-server release; leave the section out")
-	}
 	if len(c.Backends) == 0 {
 		e.add("backends", "no backends")
 	}
@@ -187,12 +212,15 @@ func (c *FrontConfig) validate() []ConfigError {
 			e.add(path+".uid", "must be the backend's UID")
 		}
 	}
-	if c.DNS == nil && c.TCP == nil {
-		e.add("", "nothing to serve: no dns or tcp section")
+	if c.DNS == nil && c.TCP == nil && c.UDP == nil {
+		e.add("", "nothing to serve: no dns, tcp or udp section")
 		return e
 	}
 	if c.TCP != nil {
 		c.TCP.validate(&e, c.Backends)
+	}
+	if c.UDP != nil {
+		c.UDP.validate(&e, c.Backends)
 	}
 	if c.DNS == nil {
 		return e
@@ -256,10 +284,31 @@ func (c *BackendConfig) validate() []ConfigError {
 			e.add("options.encryption_method", "must be 3, 4 or 5 (AES-GCM; 5 = AES-256-GCM)")
 		}
 		checkSocket(&e, "options.encryption_key_file", c.Options.EncryptionKeyFile)
+	case "hy2-masq", "hy2-obfs":
+		checkSocket(&e, "users_file", c.UsersFile)
+		if c.TLS == nil {
+			e.add("tls", "a Hysteria2 backend needs its certificate")
+		} else {
+			checkSocket(&e, "tls.certificate_file", c.TLS.CertificateFile)
+			checkSocket(&e, "tls.key_file", c.TLS.KeyFile)
+			for i, curve := range c.TLS.Curves {
+				if curve != "X25519MLKEM768" {
+					e.add(fmt.Sprintf("tls.curves[%d]", i), "only X25519MLKEM768 (post-quantum, no fallback)")
+				}
+			}
+		}
+		if c.Kind == "hy2-obfs" {
+			checkSocket(&e, "options.obfs_password_file", c.Options.ObfsPasswordFile)
+		} else if c.Options.ObfsPasswordFile != "" {
+			e.add("options.obfs_password_file", "only hy2-obfs has salamander")
+		}
+		if c.Options.UpMbps < 0 || c.Options.DownMbps < 0 {
+			e.add("options", "up_mbps and down_mbps cannot be negative")
+		}
 	case "":
 		e.add("kind", "missing")
 	default:
-		e.add("kind", "kind %q is not served by this niko-server release (dnstt, masterdns)", c.Kind)
+		e.add("kind", "kind %q is not served by this niko-server release (dnstt, masterdns, hy2-masq, hy2-obfs)", c.Kind)
 	}
 	if c.Kind == "dnstt" || c.Kind == "masterdns" {
 		if c.Inner == "" {
@@ -339,5 +388,51 @@ func (t *FrontTCP) validate(e *configErrors, backends map[string]BackendRef) {
 	}
 	if t.Default != "" {
 		streamBackend("tcp.default", t.Default)
+	}
+}
+
+func (u *FrontUDP) validate(e *configErrors, backends map[string]BackendRef) {
+	if len(u.Listen) == 0 {
+		e.add("udp.listen", "no addresses")
+	}
+	for i, listen := range u.Listen {
+		if _, err := netip.ParseAddrPort(listen); err != nil {
+			e.add(fmt.Sprintf("udp.listen[%d]", i), "want IP:port, like 0.0.0.0:443 or [::]:443")
+		}
+	}
+	if u.Idle != "" {
+		if d, err := time.ParseDuration(u.Idle); err != nil || d < 5*time.Second || d > 10*time.Minute {
+			e.add("udp.idle", "want a duration from 5s to 10m, like 60s")
+		}
+	}
+	if len(u.Routes) == 0 {
+		e.add("udp.routes", "no routes")
+	}
+	names := map[string]bool{}
+	for i, r := range u.Routes {
+		path := fmt.Sprintf("udp.routes[%d]", i)
+		if (len(r.SNI) == 0) == (r.SalamanderPasswordFile == "") {
+			e.add(path, "give either sni or salamander_password_file")
+		}
+		for j, name := range r.SNI {
+			n := normalName(name)
+			if !dnsName.MatchString(n) {
+				e.add(fmt.Sprintf("%s.sni[%d]", path, j), "not a DNS name: %q", name)
+			}
+			if names[n] {
+				e.add(fmt.Sprintf("%s.sni[%d]", path, j), "%q has a route already", name)
+			}
+			names[n] = true
+		}
+		if r.SalamanderPasswordFile != "" {
+			checkSocket(e, path+".salamander_password_file", r.SalamanderPasswordFile)
+		}
+		b, ok := backends[r.Backend]
+		switch {
+		case !ok:
+			e.add(path+".backend", "no backend %q in backends", r.Backend)
+		case b.Mode != "packet":
+			e.add(path+".backend", "backend %q must have mode packet", r.Backend)
+		}
 	}
 }

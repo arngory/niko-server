@@ -12,12 +12,14 @@ Data plane ноды под управлением [raycontrol](https://github.co
 | Бэкенды `dnstt`, `masterdns` (AES-256-GCM, метод 5) | готово (v0.1) |
 | `check` (коды 0/1/2, `--json`), `keygen dnstt`, `version` | готово |
 | Фронт TCP 443 (tcpmux): маршрут по SNI и ALPN, `proxy-v2` (Xray REALITY), `fd` (передача сокета) | готово (v0.2) |
-| Фронт UDP 443 (udpmux) | не начато — [`docs/SPEC.md`](docs/SPEC.md) §3.2 |
+| Фронт UDP 443 (udpmux): QUIC Initial (v1, v2) → SNI, salamander, потоки с забыванием по бездействию | готово (v0.3) |
+| Бэкенды `hy2-masq`, `hy2-obfs` (sing-quic): пароли из `users_file`, перечитываются без разрыва, выход только на публичные адреса | готово (v0.3) |
+| naive-quic, DoH3 | в `rayd` raycontrol за udpmux (HTTP/3) — следующий шаг |
 | Бэкенд `site` | не нужен: сайт-приманку держит `rayd site` raycontrol (решения R2-12, R4-8) |
-| Бэкенды naive-quic, DoH3 (нужен udpmux), Yggdrasil | не начато |
+| Бэкенд Yggdrasil | не начато |
 | Нагрузочный тест (SPEC §6.6) | не выполнен |
 
-Пока нет udpmux, Hysteria2 слушает UDP 443 сам (Xray). REALITY (Xray), DoH и naive (`rayd`) стоят за tcpmux.
+REALITY (Xray), DoH и naive (`rayd`) стоят за tcpmux; Hysteria2 — бэкенды niko-server за udpmux.
 
 ## Документы
 
