@@ -150,6 +150,9 @@ type BackendConfig struct {
 	TLS       *BackendTLS    `json:"tls,omitempty"`
 	Options   BackendOptions `json:"options"`
 	Inner     string         `json:"inner,omitempty"`
+	// StatsSocket (hy2-*): where the backend answers for the sessions of a
+	// client address (raycontrol's channel probes).
+	StatsSocket string `json:"stats_socket,omitempty"`
 }
 
 var dnsName = regexp.MustCompile(`^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
@@ -347,6 +350,13 @@ func (c *BackendConfig) validate() []ConfigError {
 		e.add("kind", "missing")
 	default:
 		e.add("kind", "kind %q is not served by this niko-server release (dnstt, masterdns, hy2-masq, hy2-obfs, yggdrasil)", c.Kind)
+	}
+	if c.StatsSocket != "" {
+		if c.Kind != "hy2-masq" && c.Kind != "hy2-obfs" {
+			e.add("stats_socket", "only the Hysteria2 backends have session stats")
+		} else {
+			checkSocket(&e, "stats_socket", c.StatsSocket)
+		}
 	}
 	if c.Options.Probe != nil && c.Kind != "hy2-masq" && c.Kind != "hy2-obfs" {
 		e.add("options.probe", "only the Hysteria2 backends route a probe name")
