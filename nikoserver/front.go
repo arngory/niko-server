@@ -12,12 +12,38 @@ import (
 	"time"
 )
 
-// RunFront serves the front until ctx ends. R1: the DNS front (UDP 53); a
-// backend that is down only loses the datagrams sent meanwhile.
+// RunFront serves the front until ctx ends: the DNS front (UDP 53) and
+// tcpmux (TCP 443), each if configured. A backend that is down only loses
+// what was sent meanwhile.
 func RunFront(ctx context.Context, c *FrontConfig, log *Logger) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	errCh := make(chan error, 2)
+	running := 0
+	if c.TCP != nil {
+		tcp := newTCPFront(c.TCP, c.Backends, log)
+		if err := tcp.listen(c.TCP.Listen); err != nil {
+			return err
+		}
+		log.Infof("TCP front on %s, %d routes", strings.Join(c.TCP.Listen, ", "), len(c.TCP.Routes))
+		running++
+		go func() { errCh <- tcp.run(ctx) }()
+	}
+	if c.DNS != nil {
+		running++
+		go func() { errCh <- runDNSFront(ctx, c, log) }()
+	}
+	var first error
+	for range running {
+		if err := <-errCh; err != nil && first == nil {
+			first = err
+			cancel()
+		}
+	}
+	return first
+}
 
+func runDNSFront(ctx context.Context, c *FrontConfig, log *Logger) error {
 	front := &dnsFront{log: log, zoneBackend: make(map[string]*backendLink), sockets: make(map[netip.AddrPort]*net.UDPConn)}
 	for _, listen := range c.DNS.Listen {
 		addr := netip.MustParseAddrPort(listen)
@@ -39,6 +65,9 @@ func RunFront(ctx context.Context, c *FrontConfig, log *Logger) error {
 	// the links answer through the front's sockets: built complete before they run
 	links := make(map[string]*backendLink)
 	for name, ref := range c.Backends {
+		if ref.Mode != "packet" {
+			continue
+		}
 		links[name] = &backendLink{name: name, ref: ref, log: log, out: make(chan []byte, 1024), answer: front.answer}
 	}
 	for _, z := range c.DNS.Zones {

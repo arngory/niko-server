@@ -3,8 +3,8 @@
 // niko-server is the data plane of a raycontrol node (arngory/niko
 // docs/server/SPEC.md):
 //
-//	niko-server front   -c front.json      # multiplexers (R1: DNS on UDP 53)
-//	niko-server backend -c backend.json    # one protocol (R1: dnstt, masterdns)
+//	niko-server front   -c front.json      # multiplexers: DNS on UDP 53, TCP 443
+//	niko-server backend -c backend.json    # one protocol: dnstt, masterdns
 //	niko-server check   -c FILE [--json]   # validate without running
 //
 // Exit codes: 0 fine, 1 the config is wrong, 2 the environment failed (sockets,
