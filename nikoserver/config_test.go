@@ -49,8 +49,22 @@ func TestNekoServerConfigCheck(t *testing.T) {
 	if errs := checkConfig(t, masterdns); len(errs) > 0 {
 		t.Fatal(errs)
 	}
+	// R4: Yggdrasil behind tcpmux.
+	ygg := `{"schema":1,"role":"backend","kind":"yggdrasil","socket":"/run/niko/ygg/fd.sock","front_uid":9100,
+		"users_file":"/run/niko-rendered/ygg/users.json",
+		"tls":{"certificate_file":"/run/credentials/niko-ygg.service/chain.pem","key_file":"/run/credentials/niko-ygg.service/key.pem"},
+		"options":{"private_key_file":"/run/credentials/niko-ygg.service/node.key","exit_ports":[4433]},
+		"inner":"/run/niko/inner/vless.sock"}`
+	if errs := checkConfig(t, ygg); len(errs) > 0 {
+		t.Fatal(errs)
+	}
 
 	for want, content := range map[string]string{
+		"options.exit_ports":        strings.Replace(ygg, `"exit_ports":[4433]`, `"exit_ports":[]`, 1),
+		"options.exit_ports[1]":     strings.Replace(ygg, `"exit_ports":[4433]`, `"exit_ports":[4433,4433]`, 1),
+		"options.peers[0]":          strings.Replace(ygg, `"exit_ports":[4433]`, `"exit_ports":[4433],"peers":["unix:///tmp/x"]`, 1),
+		"tls.curves[0]":             strings.Replace(ygg, `"key_file"`, `"curves":["X25519"],"key_file"`, 1),
+		"options":                   strings.Replace(dnstt, `"zone":"t.example.com"`, `"zone":"t.example.com","exit_ports":[1]`, 1),
 		"schema":                    `{"schema":2,"role":"front"}`,
 		"tcp.routes":                strings.Replace(front, `"dns":{"listen"`, `"tcp":{"listen":["0.0.0.0:443"],"routes":[]},"dns":{"listen"`, 1),
 		"tcp.routes[0].backend":     strings.Replace(front, `"dns":{"listen"`, `"tcp":{"listen":["0.0.0.0:443"],"routes":[{"sni":["r.example.com"],"backend":"dns"}]},"dns":{"listen"`, 1),

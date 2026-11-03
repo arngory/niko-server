@@ -4,14 +4,26 @@ go 1.25.5
 
 require (
 	github.com/quic-go/quic-go v0.60.0
+	github.com/sagernet/gvisor v0.0.0-20260727.0-sing-box-mod.1
 	github.com/sagernet/sing v0.9.7-0.20261023115459-5dc452e537bf
 	github.com/sagernet/sing-box v1.14.4
 	github.com/sagernet/sing-quic v0.7.2-0.20261020082049-7e0a5869a5f4
 	github.com/xtaci/kcp-go/v5 v5.6.8
 	github.com/xtaci/smux v1.5.24
+	github.com/yggdrasil-network/yggdrasil-go v0.5.14
 	golang.org/x/crypto v0.54.0
+	golang.org/x/net v0.57.0
 	masterdnsvpn-go v0.0.0
 	www.bamsoftware.com/git/dnstt.git v1.20260501.0
+)
+
+require (
+	github.com/Arceliar/ironwood v0.0.0-20260613025018-d50055b11f5e // indirect
+	github.com/Arceliar/phony v0.0.0-20220903101357-530938a4b13d // indirect
+	github.com/bits-and-blooms/bitset v1.24.5 // indirect
+	github.com/bits-and-blooms/bloom/v3 v3.7.1 // indirect
+	github.com/coder/websocket v1.8.15 // indirect
+	github.com/gologme/log v1.3.0 // indirect
 )
 
 require (
@@ -52,7 +64,6 @@ require (
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/sagernet/fswatch v0.1.2 // indirect
-	github.com/sagernet/gvisor v0.0.0-20260727.0-sing-box-mod.1 // indirect
 	github.com/sagernet/netlink v0.0.0-20260814022025-64455d367bbf // indirect
 	github.com/sagernet/nftables v0.3.0-mod.4 // indirect
 	github.com/sagernet/quic-go v0.61.0-sing-box-mod.12 // indirect
@@ -69,7 +80,6 @@ require (
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba // indirect
 	golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f // indirect
 	golang.org/x/mod v0.37.0 // indirect
-	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
@@ -80,3 +90,5 @@ require (
 replace github.com/sagernet/sing-box => github.com/arngory/sing-box v1.14.5-0.20261102040805-34eaa8c9c5a9
 
 replace masterdnsvpn-go => github.com/arngory/sing-box/third_party/masterdnsvpn v0.0.0-20261102040805-34eaa8c9c5a9
+
+replace github.com/yggdrasil-network/yggdrasil-go => github.com/arngory/sing-box/third_party/yggdrasil-go v0.0.0-20261102040805-34eaa8c9c5a9

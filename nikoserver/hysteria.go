@@ -41,6 +41,9 @@ type UsersFile struct {
 		Hy2     *struct {
 			Password string `json:"password"`
 		} `json:"hy2,omitempty"`
+		Yggdrasil *struct {
+			PublicKey string `json:"public_key"`
+		} `json:"yggdrasil,omitempty"`
 	} `json:"users"`
 }
 

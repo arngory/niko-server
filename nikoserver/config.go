@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -112,6 +113,12 @@ type BackendOptions struct {
 	UpMbps           int    `json:"up_mbps,omitempty"`
 	DownMbps         int    `json:"down_mbps,omitempty"`
 	ObfsPasswordFile string `json:"obfs_password_file,omitempty"`
+	// yggdrasil: the node's key in private_key_file (hex: a 32-byte seed or
+	// the 64-byte key of yggdrasil-go's config), the TCP ports of the node's
+	// mesh address that lead to inner, and outgoing peers (public ones; none
+	// by default: clients connect directly, raycontrol decision P-14).
+	ExitPorts []int    `json:"exit_ports,omitempty"`
+	Peers     []string `json:"peers,omitempty"`
 }
 
 // BackendTLS is a backend's certificate; curves default to X25519MLKEM768
@@ -286,17 +293,7 @@ func (c *BackendConfig) validate() []ConfigError {
 		checkSocket(&e, "options.encryption_key_file", c.Options.EncryptionKeyFile)
 	case "hy2-masq", "hy2-obfs":
 		checkSocket(&e, "users_file", c.UsersFile)
-		if c.TLS == nil {
-			e.add("tls", "a Hysteria2 backend needs its certificate")
-		} else {
-			checkSocket(&e, "tls.certificate_file", c.TLS.CertificateFile)
-			checkSocket(&e, "tls.key_file", c.TLS.KeyFile)
-			for i, curve := range c.TLS.Curves {
-				if curve != "X25519MLKEM768" {
-					e.add(fmt.Sprintf("tls.curves[%d]", i), "only X25519MLKEM768 (post-quantum, no fallback)")
-				}
-			}
-		}
+		checkBackendTLS(&e, c.TLS, "a Hysteria2 backend needs its certificate")
 		if c.Kind == "hy2-obfs" {
 			checkSocket(&e, "options.obfs_password_file", c.Options.ObfsPasswordFile)
 		} else if c.Options.ObfsPasswordFile != "" {
@@ -305,19 +302,59 @@ func (c *BackendConfig) validate() []ConfigError {
 		if c.Options.UpMbps < 0 || c.Options.DownMbps < 0 {
 			e.add("options", "up_mbps and down_mbps cannot be negative")
 		}
+	case "yggdrasil":
+		checkSocket(&e, "users_file", c.UsersFile)
+		checkBackendTLS(&e, c.TLS, "a Yggdrasil backend needs the certificate of its name")
+		checkSocket(&e, "options.private_key_file", c.Options.PrivateKeyFile)
+		if len(c.Options.ExitPorts) == 0 {
+			e.add("options.exit_ports", "no exit ports: nothing would reach inner")
+		}
+		seen := map[int]bool{}
+		for i, port := range c.Options.ExitPorts {
+			if port < 1 || port > 65535 || seen[port] {
+				e.add(fmt.Sprintf("options.exit_ports[%d]", i), "want a port 1-65535, once")
+			}
+			seen[port] = true
+		}
+		for i, peer := range c.Options.Peers {
+			u, err := url.Parse(peer)
+			switch {
+			case err != nil || u.Host == "":
+				e.add(fmt.Sprintf("options.peers[%d]", i), "want a peer URI like tls://host:port")
+			case u.Scheme != "tls" && u.Scheme != "tcp" && u.Scheme != "quic" && u.Scheme != "ws" && u.Scheme != "wss":
+				e.add(fmt.Sprintf("options.peers[%d]", i), "scheme %q: tls, tcp, quic, ws or wss", u.Scheme)
+			}
+		}
 	case "":
 		e.add("kind", "missing")
 	default:
-		e.add("kind", "kind %q is not served by this niko-server release (dnstt, masterdns, hy2-masq, hy2-obfs)", c.Kind)
+		e.add("kind", "kind %q is not served by this niko-server release (dnstt, masterdns, hy2-masq, hy2-obfs, yggdrasil)", c.Kind)
 	}
-	if c.Kind == "dnstt" || c.Kind == "masterdns" {
+	if c.Kind != "yggdrasil" && (len(c.Options.ExitPorts) > 0 || len(c.Options.Peers) > 0) {
+		e.add("options", "exit_ports and peers are Yggdrasil options")
+	}
+	if c.Kind == "dnstt" || c.Kind == "masterdns" || c.Kind == "yggdrasil" {
 		if c.Inner == "" {
-			e.add("inner", "the DNS tunnels lead to the inner stage: its socket is required")
+			e.add("inner", "the DNS tunnels and Yggdrasil lead to the inner stage: its socket is required")
 		} else {
 			checkSocket(&e, "inner", c.Inner)
 		}
 	}
 	return e
+}
+
+func checkBackendTLS(e *configErrors, t *BackendTLS, missing string) {
+	if t == nil {
+		e.add("tls", "%s", missing)
+		return
+	}
+	checkSocket(e, "tls.certificate_file", t.CertificateFile)
+	checkSocket(e, "tls.key_file", t.KeyFile)
+	for i, curve := range t.Curves {
+		if curve != "X25519MLKEM768" {
+			e.add(fmt.Sprintf("tls.curves[%d]", i), "only X25519MLKEM768 (post-quantum, no fallback)")
+		}
+	}
 }
 
 // zoneOf returns the zone that name falls into (by labels), or "".
