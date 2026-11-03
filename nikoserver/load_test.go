@@ -157,6 +157,7 @@ func TestNekoServerLoad(t *testing.T) {
 	wg.Wait()
 	udp.expire(time.Now().Add(time.Minute))
 	g1, h1 := settle()
+	tlsErrs.Range(func(k, v any) bool { t.Logf("tcp error %q: %d", k, v.(*atomic.Int64).Load()); return true })
 	t.Logf("failed: tcp %d, dns %d, udp %d", failedBy[0].Load(), failedBy[1].Load(), failedBy[2].Load())
 	t.Logf("%v: %d rounds, %d failed; goroutines %d -> %d, heap %d -> %d KiB", d, ok.Load(), failed.Load(), g0, g1, h0>>10, h1>>10)
 	if total := ok.Load() + failed.Load(); total == 0 || failed.Load()*100 > total {
@@ -192,7 +193,16 @@ func echoTLS(ln net.Listener, cert tls.Certificate) {
 }
 
 // tlsRound: a handshake, 32 KiB each way, close.
-func tlsRound(ctx context.Context, addr, name string) bool {
+var tlsErrs sync.Map
+
+func tlsRound(ctx context.Context, addr, name string) (ok bool) {
+	var err error
+	defer func() {
+		if !ok && err != nil && ctx.Err() == nil {
+			n, _ := tlsErrs.LoadOrStore(err.Error()[:min(len(err.Error()), 60)], new(atomic.Int64))
+			n.(*atomic.Int64).Add(1)
+		}
+	}()
 	var d net.Dialer
 	c, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
@@ -210,7 +220,7 @@ func tlsRound(ctx context.Context, addr, name string) bool {
 	}
 	go s.Write(payload)
 	got := make([]byte, len(payload))
-	if _, err := io.ReadFull(s, got); err != nil {
+	if _, err = io.ReadFull(s, got); err != nil {
 		return false
 	}
 	return bytes.Equal(got, payload)
