@@ -113,3 +113,94 @@ func listenPacketSocket(path string) (*net.UnixListener, error) {
 	}
 	return listener, nil
 }
+
+// IPC version 1, mode "fd": one SOCK_SEQPACKET message per accepted TCP
+// connection, its socket in SCM_RIGHTS (IPC.md):
+//
+//	magic "NKT1" | flags | route_len | route | src (19) | dst (19) |
+//	sni_len | sni | prefetch_len (BE32) | prefetch
+const fdMagic = "NKT1"
+
+var errBadFDMessage = errors.New("ipc: malformed fd message")
+
+// tcpHandoff is what travels with a passed socket.
+type tcpHandoff struct {
+	route    string
+	src, dst netip.AddrPort
+	sni      string
+	prefetch []byte
+}
+
+func encodeHandoff(h tcpHandoff) []byte {
+	route, sni := h.route, h.sni
+	if len(route) > 255 {
+		route = route[:255]
+	}
+	if len(sni) > 255 {
+		sni = sni[:255]
+	}
+	b := make([]byte, 0, 4+2+len(route)+2*addrSize+1+len(sni)+4+len(h.prefetch))
+	b = append(b, fdMagic...)
+	b = append(b, 0, byte(len(route)))
+	b = append(b, route...)
+	var a [addrSize]byte
+	putAddr(a[:], h.src)
+	b = append(b, a[:]...)
+	putAddr(a[:], h.dst)
+	b = append(b, a[:]...)
+	b = append(b, byte(len(sni)))
+	b = append(b, sni...)
+	b = binary.BigEndian.AppendUint32(b, uint32(len(h.prefetch)))
+	return append(b, h.prefetch...)
+}
+
+func decodeHandoff(msg []byte) (tcpHandoff, error) {
+	var h tcpHandoff
+	if len(msg) < 6 || string(msg[:4]) != fdMagic {
+		return h, errBadFDMessage
+	}
+	n := int(msg[5])
+	rest := msg[6:]
+	if len(rest) < n+2*addrSize+1 {
+		return h, errBadFDMessage
+	}
+	h.route, rest = string(rest[:n]), rest[n:]
+	var err error
+	if h.src, err = getAddr(rest[:addrSize]); err != nil {
+		return h, errBadFDMessage
+	}
+	if h.dst, err = getAddr(rest[addrSize : 2*addrSize]); err != nil {
+		return h, errBadFDMessage
+	}
+	rest = rest[2*addrSize:]
+	n = int(rest[0])
+	if len(rest) < 1+n+4 {
+		return h, errBadFDMessage
+	}
+	h.sni, rest = string(rest[1:1+n]), rest[1+n:]
+	size := binary.BigEndian.Uint32(rest[:4])
+	if uint32(len(rest)-4) != size {
+		return h, errBadFDMessage
+	}
+	h.prefetch = rest[4:]
+	return h, nil
+}
+
+// proxyV2Header is the PROXY protocol v2 header for a TCP stream (IPC.md,
+// mode "proxy-v2"): Xray reads the client's address from it.
+func proxyV2Header(src, dst netip.AddrPort) []byte {
+	b := []byte("\r\n\r\n\x00\r\nQUIT\n\x21")
+	s, d := src.Addr().Unmap(), dst.Addr().Unmap()
+	if s.Is4() && d.Is4() {
+		b = append(b, 0x11, 0, 12)
+		b = append(b, s.AsSlice()...)
+		b = append(b, d.AsSlice()...)
+	} else {
+		b = append(b, 0x21, 0, 36)
+		s16, d16 := netip.AddrFrom16(s.As16()), netip.AddrFrom16(d.As16())
+		b = append(b, s16.AsSlice()...)
+		b = append(b, d16.AsSlice()...)
+	}
+	b = binary.BigEndian.AppendUint16(b, src.Port())
+	return binary.BigEndian.AppendUint16(b, dst.Port())
+}

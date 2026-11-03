@@ -282,7 +282,7 @@ systemd credentials (TPM при наличии), systemd-resolved stub выкл�
 |---|---|---|
 | R0 | — | сделано: SPA v2 по векторам, импорт `rcdev1:` (v1.11.0) |
 | R1 | сделано (`niko-server-v0.1.1`): dnstt и MasterDnsVPN как библиотеки, фронт и бэкенды, IPC 1, схема конфигов 1, dnsmux, `inner` на Xray | сделано: подписка subscription-v1 (v1.13.0–v1.13.2), SPA v2 по TCP (v1.12.1) |
-| R2 | tcpmux, Xray на unix-сокете, `site`, naive, DoH | — (PQ-проверка REALITY уже есть) |
+| R2 | tcpmux (v0.2), Xray на unix-сокете; `site`, naive и DoH — в `rayd` raycontrol (R2-12, R2-14, R3-2) | — (PQ-проверка REALITY уже есть) |
 | R3 | udpmux без SPA, Hysteria2 ×2, naive-quic | регистрация через API |
 | R4 | Yggdrasil через tcpmux, ротация через `SIGHUP` | переключение учётных данных с перекрытием |
 | R5 | `inner` для olcRTC и OpenFlux | olcRTC, OpenFlux, вторая ступень к `inner` |

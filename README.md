@@ -11,11 +11,13 @@ Data plane ноды под управлением [raycontrol](https://github.co
 | Фронт: DNS (UDP 53, маршрут по зоне) | готово (v0.1) |
 | Бэкенды `dnstt`, `masterdns` (AES-256-GCM, метод 5) | готово (v0.1) |
 | `check` (коды 0/1/2, `--json`), `keygen dnstt`, `version` | готово |
-| Фронт TCP 443 (tcpmux) и UDP 443 (udpmux), бэкенд `site` | не начато — [`docs/SPEC.md`](docs/SPEC.md) §3.1–§3.2 |
+| Фронт TCP 443 (tcpmux): маршрут по SNI и ALPN, `proxy-v2` (Xray REALITY), `fd` (передача сокета) | готово (v0.2) |
+| Фронт UDP 443 (udpmux) | не начато — [`docs/SPEC.md`](docs/SPEC.md) §3.2 |
+| Бэкенд `site` | не нужен: сайт-приманку держит `rayd site` raycontrol (решения R2-12, R4-8) |
 | Бэкенды naive-quic, DoH3 (нужен udpmux), Yggdrasil | не начато |
 | Нагрузочный тест (SPEC §6.6) | не выполнен |
 
-Пока фронта 443 нет, REALITY, Hysteria2, DoH и naive работают на Xray и `rayd` (raycontrol, решения R3).
+Пока нет udpmux, Hysteria2 слушает UDP 443 сам (Xray). REALITY (Xray), DoH и naive (`rayd`) стоят за tcpmux.
 
 ## Документы
 
