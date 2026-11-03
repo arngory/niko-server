@@ -46,8 +46,18 @@ func RunBackend(ctx context.Context, c *BackendConfig, log *Logger) error {
 		conn.Close()
 	}()
 
-	log.Infof("%s backend on %s, inner %s", c.Kind, c.Socket, c.Inner)
+	log.Infof("%s backend on %s", c.Kind, c.Socket)
 	switch c.Kind {
+	case "hy2-masq", "hy2-obfs":
+		conn.port = 443
+		err := runHysteria(ctx, c, conn, log, PublicDialer().DialContext)
+		if ctx.Err() != nil {
+			return nil
+		}
+		if err == nil {
+			err = errors.New("hysteria2 stopped")
+		}
+		return err
 	case "dnstt":
 		key, err := dnsttserver.ReadKey(c.Options.PrivateKeyFile)
 		if err != nil {
@@ -109,6 +119,7 @@ type packetConn struct {
 	// where each client's last query came in, for the answer's local address
 	locals   map[netip.AddrPort]netip.AddrPort
 	deadline time.Time
+	port     int // what LocalAddr says: 53 for the DNS tunnels, 443 for QUIC
 }
 
 type inbound struct {
@@ -275,7 +286,11 @@ func (c *packetConn) Close() error {
 }
 
 func (c *packetConn) LocalAddr() net.Addr {
-	return &net.UDPAddr{IP: net.IPv6unspecified, Port: 53}
+	port := c.port
+	if port == 0 {
+		port = 53
+	}
+	return &net.UDPAddr{IP: net.IPv6unspecified, Port: port}
 }
 
 func (c *packetConn) SetDeadline(t time.Time) error { return c.SetReadDeadline(t) }
