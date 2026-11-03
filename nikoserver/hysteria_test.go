@@ -57,6 +57,11 @@ func TestNekoServerHysteria(t *testing.T) {
 	pwFile := filepath.Join(dir, "salamander")
 	os.WriteFile(pwFile, []byte(salamander+"\n"), 0o600)
 
+	// The probe route (raycontrol's channel probes): TCP and UDP echo on one
+	// loopback port.
+	probeTCP, probeUDP := echoPair(t)
+	probe := &ProbeRoute{Name: "probe.raycontrol.invalid", Address: probeTCP.Addr().String()}
+
 	// The destination is on loopback, which a node never dials: the test's
 	// backends dial directly.
 	var direct net.Dialer
@@ -68,6 +73,7 @@ func TestNekoServerHysteria(t *testing.T) {
 		if kind == "hy2-obfs" {
 			c.Options.ObfsPasswordFile = pwFile
 		}
+		c.Options.Probe = probe
 		if errs := c.validate(); len(errs) > 0 {
 			t.Fatal(errs)
 		}
@@ -135,6 +141,60 @@ func TestNekoServerHysteria(t *testing.T) {
 	if err := fetch("h.example.com", "password-one", ""); err != nil {
 		t.Fatalf("hy2-masq: %v", err)
 	}
+	// The probe name leads to its address, TCP and UDP; replies come from the
+	// name. Loopback by address stays out over UDP (the test dials TCP
+	// directly, so only UDP shows the node's own refusal).
+	probeClient := func() *hysteria2.Client {
+		tlsConfig, _ := sbtls.NewClient(ctx, nopLogger(), "h.example.com", option.OutboundTLSOptions{Enabled: true, ServerName: "h.example.com",
+			Insecure: true, ALPN: []string{"h3"}, CurvePreferences: []option.CurvePreference{option.CurvePreference(tls.X25519MLKEM768)}})
+		client, err := hysteria2.NewClient(hysteria2.ClientOptions{Context: ctx, Dialer: N.SystemDialer, Logger: nopLogger(),
+			ServerAddress: server, Password: "password-one", TLSConfig: tlsConfig})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return client
+	}
+	pcl := probeClient()
+	defer pcl.CloseWithError(nil)
+	pconn, err := pcl.DialConn(ctx, M.ParseSocksaddrHostPort(probe.Name, 443))
+	if err != nil {
+		t.Fatalf("probe over TCP: %v", err)
+	}
+	pconn.SetDeadline(time.Now().Add(5 * time.Second))
+	pconn.Write([]byte("probe"))
+	got := make([]byte, 5)
+	if _, err := io.ReadFull(pconn, got); err != nil || string(got) != "probe" {
+		t.Fatalf("probe over TCP: %q %v", got, err)
+	}
+	pconn.Close()
+	ppc, err := pcl.ListenPacket(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ppc.Close()
+	target := M.ParseSocksaddrHostPort(probe.Name, 34567)
+	if _, err := ppc.WriteTo([]byte("datagram"), target); err != nil {
+		t.Fatal(err)
+	}
+	b := make([]byte, 100)
+	n, from, err := ppc.ReadFrom(b)
+	if err != nil || string(b[:n]) != "datagram" || M.SocksaddrFromNet(from).Fqdn != probe.Name {
+		t.Fatalf("probe over UDP: %q from %v, %v", b[:n], from, err)
+	}
+	// sing-quic's packet conn has no read deadline: wait, then close it.
+	ppc.WriteTo([]byte("loopback"), probeUDP.LocalAddr())
+	leaked := make(chan string, 1)
+	go func() {
+		if n, _, err := ppc.ReadFrom(b); err == nil {
+			leaked <- string(b[:n])
+		}
+	}()
+	select {
+	case got := <-leaked:
+		t.Fatalf("loopback by address over UDP: %q", got)
+	case <-time.After(500 * time.Millisecond):
+		ppc.Close()
+	}
 	if err := fetch("x.invalid", "password-one", salamander); err != nil {
 		t.Fatalf("hy2-obfs: %v", err)
 	}
@@ -165,4 +225,43 @@ func TestNekoServerHysteria(t *testing.T) {
 	if err := fetch("h.example.com", "password-one", ""); err == nil {
 		t.Fatal("the old password still works")
 	}
+}
+
+// echoPair is a TCP and a UDP echo on the same loopback port.
+func echoPair(t *testing.T) (net.Listener, net.PacketConn) {
+	t.Helper()
+	for range 20 {
+		pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ln, err := net.Listen("tcp4", pc.LocalAddr().String())
+		if err != nil {
+			pc.Close()
+			continue
+		}
+		t.Cleanup(func() { ln.Close(); pc.Close() })
+		go func() {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				go func() { io.Copy(c, c); c.Close() }()
+			}
+		}()
+		go func() {
+			b := make([]byte, 2048)
+			for {
+				n, from, err := pc.ReadFrom(b)
+				if err != nil {
+					return
+				}
+				pc.WriteTo(b[:n], from)
+			}
+		}()
+		return ln, pc
+	}
+	t.Fatal("no free port for TCP and UDP")
+	return nil, nil
 }
