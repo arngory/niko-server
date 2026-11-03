@@ -4,7 +4,7 @@
 // a front (multiplexers) and one backend process per protocol, linked by unix
 // sockets. Contracts: arngory/niko docs/server/CONFIG.md (schema 1) and
 // docs/server/IPC.md (version 1). This release serves the DNS tunnels
-// (dnstt, MasterDnsVPN); TCP and UDP 443 come in later releases.
+// (dnstt, MasterDnsVPN) and TCP 443 (tcpmux); UDP 443 comes later.
 package nikoserver
 
 import (
@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
 
 const Schema = 1
@@ -53,12 +54,32 @@ type FrontDNS struct {
 	Zones  []DNSZone `json:"zones"`
 }
 
+// TCPRoute sends TLS connections with one of these server names, or
+// offering one of these ALPN protocols, to a backend.
+type TCPRoute struct {
+	SNI     []string `json:"sni,omitempty"`
+	ALPN    []string `json:"alpn,omitempty"`
+	Backend string   `json:"backend"`
+}
+
+// FrontTCP is tcpmux (SPEC §3.1).
+type FrontTCP struct {
+	Listen       []string   `json:"listen"`
+	SniffTimeout string     `json:"sniff_timeout,omitempty"`
+	Routes       []TCPRoute `json:"routes"`
+	Default      string     `json:"default,omitempty"`
+	// Not served yet (check says so): raycontrol issues certificates with
+	// DNS-01 or an HTTP-01 window, and clamping the window is a proposal.
+	ACMEListen  []string `json:"acme_listen,omitempty"`
+	WindowClamp int      `json:"window_clamp,omitempty"`
+}
+
 type FrontConfig struct {
 	Schema   int                   `json:"schema"`
 	Role     string                `json:"role"`
 	Log      LogOptions            `json:"log"`
 	DNS      *FrontDNS             `json:"dns,omitempty"`
-	TCP      json.RawMessage       `json:"tcp,omitempty"`
+	TCP      *FrontTCP             `json:"tcp,omitempty"`
 	UDP      json.RawMessage       `json:"udp,omitempty"`
 	Backends map[string]BackendRef `json:"backends"`
 }
@@ -147,10 +168,7 @@ func checkSocket(e *configErrors, path, value string) {
 func (c *FrontConfig) validate() []ConfigError {
 	var e configErrors
 	checkLog(&e, c.Log)
-	// R1: only the DNS front; TCP and UDP 443 come later (a route there would be silently dropped)
-	if len(c.TCP) > 0 && string(c.TCP) != "null" {
-		e.add("tcp", "TCP 443 is not served by this niko-server release; leave the section out")
-	}
+	// UDP 443 comes later (a route there would be silently dropped)
 	if len(c.UDP) > 0 && string(c.UDP) != "null" {
 		e.add("udp", "UDP 443 is not served by this niko-server release; leave the section out")
 	}
@@ -161,9 +179,7 @@ func (c *FrontConfig) validate() []ConfigError {
 		path := "backends." + name
 		checkSocket(&e, path+".socket", b.Socket)
 		switch b.Mode {
-		case "packet":
-		case "fd", "proxy-v2":
-			e.add(path+".mode", "mode %q is not served by this release (packet only)", b.Mode)
+		case "packet", "fd", "proxy-v2":
 		default:
 			e.add(path+".mode", "unknown mode %q", b.Mode)
 		}
@@ -171,8 +187,14 @@ func (c *FrontConfig) validate() []ConfigError {
 			e.add(path+".uid", "must be the backend's UID")
 		}
 	}
+	if c.DNS == nil && c.TCP == nil {
+		e.add("", "nothing to serve: no dns or tcp section")
+		return e
+	}
+	if c.TCP != nil {
+		c.TCP.validate(&e, c.Backends)
+	}
 	if c.DNS == nil {
-		e.add("dns", "nothing to serve: the dns section is missing")
 		return e
 	}
 	if len(c.DNS.Listen) == 0 {
@@ -258,4 +280,64 @@ func zoneOf(name string, zones []string) string {
 		}
 	}
 	return ""
+}
+
+func (t *FrontTCP) validate(e *configErrors, backends map[string]BackendRef) {
+	if len(t.Listen) == 0 {
+		e.add("tcp.listen", "no addresses")
+	}
+	for i, listen := range t.Listen {
+		if _, err := netip.ParseAddrPort(listen); err != nil {
+			e.add(fmt.Sprintf("tcp.listen[%d]", i), "want IP:port, like 0.0.0.0:443 or [::]:443")
+		}
+	}
+	if t.SniffTimeout != "" {
+		if d, err := time.ParseDuration(t.SniffTimeout); err != nil || d <= 0 || d > 30*time.Second {
+			e.add("tcp.sniff_timeout", "want a duration up to 30s, like 5s")
+		}
+	}
+	if len(t.ACMEListen) > 0 {
+		e.add("tcp.acme_listen", "the ACME window is not served by this release: raycontrol issues certificates with DNS-01 or HTTP-01")
+	}
+	if t.WindowClamp != 0 {
+		e.add("tcp.window_clamp", "not served by this release")
+	}
+	streamBackend := func(path, name string) {
+		b, ok := backends[name]
+		switch {
+		case !ok:
+			e.add(path, "no backend %q in backends", name)
+		case b.Mode != "fd" && b.Mode != "proxy-v2":
+			e.add(path, "backend %q must have mode fd or proxy-v2", name)
+		}
+	}
+	if len(t.Routes) == 0 && t.Default == "" {
+		e.add("tcp.routes", "no routes and no default")
+	}
+	names := map[string]bool{}
+	for i, r := range t.Routes {
+		path := fmt.Sprintf("tcp.routes[%d]", i)
+		if (len(r.SNI) == 0) == (len(r.ALPN) == 0) {
+			e.add(path, "give either sni or alpn")
+		}
+		for j, name := range r.SNI {
+			n := normalName(name)
+			if !dnsName.MatchString(n) {
+				e.add(fmt.Sprintf("%s.sni[%d]", path, j), "not a DNS name: %q", name)
+			}
+			if names[n] {
+				e.add(fmt.Sprintf("%s.sni[%d]", path, j), "%q has a route already", name)
+			}
+			names[n] = true
+		}
+		for j, proto := range r.ALPN {
+			if proto == "" || len(proto) > 255 {
+				e.add(fmt.Sprintf("%s.alpn[%d]", path, j), "want a protocol name")
+			}
+		}
+		streamBackend(path+".backend", r.Backend)
+	}
+	if t.Default != "" {
+		streamBackend("tcp.default", t.Default)
+	}
 }
