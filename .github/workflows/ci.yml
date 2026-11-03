@@ -1,0 +1,136 @@
+name: CI
+
+# niko-server end to end: the DNS front, the dnstt and masterdns backends and
+# the inner stage on Xray, with the Niko client core through both tunnels.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+  # release.yml
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the client core and Xray
+        run: |
+          . .github/interop.env
+          git clone --filter=blob:none "$REPOSITORY_SING_BOX" core
+          git -C core checkout -q "$COMMIT_SING_BOX"
+          git clone --filter=blob:none "$REPOSITORY_XRAY" xray
+          git -C xray checkout -q "$COMMIT_XRAY"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: xray/go.mod
+          cache: false
+      - name: Build Xray
+        working-directory: xray
+        run: CGO_ENABLED=0 go build -o /tmp/xray -trimpath ./main
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Unit and in-process tests
+        run: go vet ./... && go test -race -count=1 -timeout 300s ./...
+      - name: Build niko-server
+        run: CGO_ENABLED=0 go build -o /tmp/niko-server -trimpath ./cmd/niko-server
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: core/go.mod
+          cache: false
+      - name: Build the client core
+        working-directory: core
+        run: |
+          go build -o /tmp/sing-box -ldflags=-checklinkname=0 \
+            -tags=with_utls,with_quic,with_dnstt,with_masterdnsvpn,badlinkname,tfogo_checklinkname0 ./cmd/sing-box
+
+      - name: Start the node
+        run: |
+          R=/tmp/run; C=/tmp/cred
+          mkdir -p $R/dns $R/mdns $R/inner $C
+          chmod 0710 $R/dns $R/mdns $R/inner
+          uid=$(id -u)
+          /tmp/niko-server keygen dnstt > /tmp/dnstt.keys
+          awk '/^private/{print $2}' /tmp/dnstt.keys > $C/noise.key
+          awk '/^public/{print $2}' /tmp/dnstt.keys > /tmp/dnstt.pub
+          openssl rand -hex 16 | tr -d '\n' > $C/encryption.key
+          v=$(/tmp/xray vlessenc | sed -n '/ML-KEM-768/,$p')
+          dec=$(echo "$v" | awk -F'"' '/"decryption"/{print $4}')
+          echo "$v" | awk -F'"' '/"encryption"/{print $4}' > /tmp/inner.enc
+          cat /proc/sys/kernel/random/uuid > /tmp/inner.uuid
+          jq -n --arg dec "$dec" --arg id "$(cat /tmp/inner.uuid)" --arg sock "$R/inner/vless.sock,0660" '{
+            log: {loglevel: "warning", access: "none"},
+            inbounds: [{listen: $sock, protocol: "vless", settings: {clients: [{id: $id}], decryption: $dec}}],
+            outbounds: [{protocol: "freedom"}]}' > /tmp/inner.json
+          jq -n --arg uid "$uid" --arg R "$R" --arg C "$C" '{schema: 1, role: "backend", kind: "dnstt",
+            log: {level: "info"}, socket: ($R + "/dns/packet.sock"), front_uid: ($uid | tonumber),
+            options: {zone: "t.example.com", private_key_file: ($C + "/noise.key")}, inner: ($R + "/inner/vless.sock")}' > /tmp/dns.json
+          jq -n --arg uid "$uid" --arg R "$R" --arg C "$C" '{schema: 1, role: "backend", kind: "masterdns",
+            log: {level: "info"}, socket: ($R + "/mdns/packet.sock"), front_uid: ($uid | tonumber),
+            options: {zones: ["v.example.com"], encryption_method: 5, encryption_key_file: ($C + "/encryption.key")},
+            inner: ($R + "/inner/vless.sock")}' > /tmp/mdns.json
+          jq -n --arg uid "$uid" --arg R "$R" '{schema: 1, role: "front", log: {level: "info"},
+            backends: {dns: {socket: ($R + "/dns/packet.sock"), mode: "packet", uid: ($uid | tonumber)},
+                       mdns: {socket: ($R + "/mdns/packet.sock"), mode: "packet", uid: ($uid | tonumber)}},
+            dns: {listen: ["127.0.0.1:5353"], zones: [{zone: "t.example.com", backend: "dns"}, {zone: "v.example.com", backend: "mdns"}]}}' > /tmp/front.json
+          for f in dns mdns front; do /tmp/niko-server check -c /tmp/$f.json --json; done
+          echo '{"schema":1,"role":"front","tcp":{}}' > /tmp/bad.json
+          set +e; /tmp/niko-server check -c /tmp/bad.json --json; code=$?; set -e
+          [ "$code" = 1 ] || { echo "check exit $code, want 1"; exit 1; }
+          # order as the units start: inner, backends, front
+          nohup /tmp/xray run -c /tmp/inner.json > /tmp/inner.log 2>&1 &
+          sleep 1
+          nohup /tmp/niko-server backend -c /tmp/dns.json > /tmp/dns.log 2>&1 &
+          nohup /tmp/niko-server backend -c /tmp/mdns.json > /tmp/mdns.log 2>&1 &
+          nohup /tmp/niko-server front -c /tmp/front.json > /tmp/front.log 2>&1 &
+          sleep 2
+
+      - name: Client through the tunnels
+        run: |
+          jq -n --arg pub "$(cat /tmp/dnstt.pub)" --arg key "$(cat /tmp/cred/encryption.key)" \
+                --arg id "$(cat /tmp/inner.uuid)" --arg enc "$(cat /tmp/inner.enc)" '{
+            log: {level: "warn"},
+            inbounds: [
+              {type: "mixed", tag: "in-dnstt", listen: "127.0.0.1", listen_port: 11080},
+              {type: "mixed", tag: "in-mdns", listen: "127.0.0.1", listen_port: 11081}],
+            outbounds: [
+              {type: "vless", tag: "inner-dnstt", server: "127.0.0.1", server_port: 1, uuid: $id, encryption: $enc, detour: "dnstt"},
+              {type: "vless", tag: "inner-mdns", server: "127.0.0.1", server_port: 1, uuid: $id, encryption: $enc, detour: "mdns"},
+              {type: "dnstt", tag: "dnstt", domain: "t.example.com", public_key: $pub, resolver: "udp://127.0.0.1:5353"},
+              {type: "masterdnsvpn", tag: "mdns", domains: ["v.example.com"], resolvers: ["127.0.0.1:5353"],
+               encryption_method: 5, encryption_key: $key, mode: "tcp"}],
+            route: {rules: [{inbound: ["in-dnstt"], outbound: "inner-dnstt"}, {inbound: ["in-mdns"], outbound: "inner-mdns"}]}}' > /tmp/client.json
+          /tmp/sing-box check -c /tmp/client.json
+          nohup /tmp/sing-box run -c /tmp/client.json > /tmp/client.log 2>&1 &
+          sleep 3
+          fail=0
+          probe() {
+            got=$(curl -s -m 90 -o /dev/null -w '%{http_code}' -x "socks5h://127.0.0.1:$2" https://www.gstatic.com/generate_204 || true)
+            echo "$1: $got (want 204)"; [ "$got" = 204 ] || fail=1
+          }
+          probe "dnstt → inner (VLESS ML-KEM-768)" 11080
+          probe "MasterDnsVPN AES-256-GCM → inner (VLESS ML-KEM-768)" 11081
+          # the node answers no foreign names
+          dig +short +tries=1 +time=3 @127.0.0.1 -p 5353 example.org A > /tmp/dig.out 2>&1 || true
+          dig +tries=1 +time=3 @127.0.0.1 -p 5353 example.org A | grep -q "status: REFUSED" && echo "foreign name: REFUSED" || { echo "foreign name not refused"; fail=1; }
+          exit $fail
+
+      - name: Logs
+        if: always()
+        run: |
+          for f in inner dns mdns front client; do echo "--- $f"; tail -n 20 /tmp/$f.log 2>/dev/null || true; done
+          pkill -x xray || true; pkill -x niko-server || true; pkill -x sing-box || true
+
