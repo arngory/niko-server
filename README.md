@@ -17,7 +17,7 @@ Data plane ноды под управлением [raycontrol](https://github.co
 | naive-quic, DoH3 | в `rayd` raycontrol за udpmux (HTTP/3) — следующий шаг |
 | Бэкенд `site` | не нужен: сайт-приманку держит `rayd site` raycontrol (решения R2-12, R4-8) |
 | Бэкенд Yggdrasil | не начато |
-| Нагрузочный тест (SPEC §6.6) | не выполнен |
+| Нагрузочный тест (SPEC §6.6): 200 потоков через каждый мультиплексор (TCP: fd и proxy-v2, UDP, DNS) без утечек горутин и памяти | готово: `NIKO_LOAD=10m go test -run Load ./nikoserver` (10 мин: 878 611 раундов, 47 неудач UDP, 0,005 %); в CI — минута |
 
 REALITY (Xray), DoH и naive (`rayd`) стоят за tcpmux; Hysteria2 — бэкенды niko-server за udpmux.
 
