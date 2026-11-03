@@ -28,6 +28,9 @@ func envError(format string, args ...any) error { return ErrEnvironment{fmt.Erro
 
 // RunBackend serves one backend until ctx ends or its protocol stops.
 func RunBackend(ctx context.Context, c *BackendConfig, log *Logger) error {
+	if c.Kind == "yggdrasil" { // streams from tcpmux, mode fd
+		return runYggdrasil(ctx, c, log)
+	}
 	listener, err := listenPacketSocket(c.Socket)
 	if err != nil {
 		return envError("listen %s: %v", c.Socket, err)

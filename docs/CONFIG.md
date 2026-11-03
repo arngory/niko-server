@@ -129,7 +129,7 @@ JSON Schema появится в `arngory/sing-box`, `cmd/niko-server/schema/` в
 | `doh` | `path_token_file`, `upstream` (DNS-серверы sing-box) |
 | `dnstt` | `zone`, `private_key_file` (hex закрытого ключа X25519, 64 символа и перевод строки, как `dnstt-server -gen-key`) |
 | `masterdns` | `zones`, `encryption_method` (только AEAD: 3–5; raycontrol — `5`, AES-256-GCM), `encryption_key_file` (ключ текстом: 32 символа для метода 5) |
-| `yggdrasil` | `private_key_file`, `allowed_public_keys_file`, `public_peers` (bool, по умолчанию `false`), `exit_ports` |
+| `yggdrasil` | `private_key_file` — ключ узла (hex: seed 32 байта или ключ 64 байта, как в конфиге yggdrasil-go); `exit_ports` — порты TCP адреса узла, ведущие в `inner`; `peers` (необязательно) — исходящие пиры (`tls://`, `tcp://`, `quic://`, `ws://`, `wss://`), по умолчанию нет: клиенты подключаются напрямую (P-14). Ключи пользователей — `yggdrasil.public_key` в `users_file`. Нужны `tls` (сертификат имени `<y>`) и `inner` |
 | `site` | `root` (каталог сгенерированного сайта), `tls` как выше (сертификат `<r>` для self-steal) |
 
 ## Файл пользователей (`users_file`)
@@ -156,7 +156,7 @@ raycontrol пишет отдельный файл для каждого бэке
 не задаёт, бэкенд при ней пишет предупреждение.
 
 Бэкенды Hysteria2 перечитывают файл по `SIGHUP` и сами, когда он меняется (проверка раз в 5 с), без разрыва
-соединений.
+соединений. Бэкенд `yggdrasil` перечитывает так же; линки ключей, которых больше нет в файле, закрываются сразу.
 
 Пары «текущие + следующие» для ротации: raycontrol кладёт в файл обе записи, например с именами
 `u-17` и `u-17@next`. Бэкенд принимает обе до следующего `SIGHUP`.
