@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -123,11 +124,13 @@ func TestNekoServerLoad(t *testing.T) {
 		if i%2 == 1 {
 			name = "r.example.com"
 		}
+		// Rounds have deadlines of their own and are not cut at the end: one
+		// that started runs to its end, so every failure counted is real.
 		wg.Go(func() { // TLS through tcpmux, both modes
 			for work.Err() == nil {
-				if tlsRound(work, tcpAddr, name) {
+				if tlsRound(tcpAddr, name) {
 					ok.Add(1)
-				} else if work.Err() == nil {
+				} else {
 					failed.Add(1)
 					failedBy[0].Add(1)
 				}
@@ -137,7 +140,7 @@ func TestNekoServerLoad(t *testing.T) {
 			for work.Err() == nil {
 				if dnsRound(dnsAddr) {
 					ok.Add(1)
-				} else if work.Err() == nil {
+				} else {
 					failed.Add(1)
 					failedBy[1].Add(1)
 				}
@@ -147,7 +150,7 @@ func TestNekoServerLoad(t *testing.T) {
 			for work.Err() == nil {
 				if udpRound(udpAddr, hello) {
 					ok.Add(1)
-				} else if work.Err() == nil {
+				} else {
 					failed.Add(1)
 					failedBy[2].Add(1)
 				}
@@ -195,16 +198,19 @@ func echoTLS(ln net.Listener, cert tls.Certificate) {
 // tlsRound: a handshake, 32 KiB each way, close.
 var tlsErrs sync.Map
 
-func tlsRound(ctx context.Context, addr, name string) (ok bool) {
+var portRE = regexp.MustCompile(`:\d+`)
+
+func tlsRound(addr, name string) (ok bool) {
 	var err error
 	defer func() {
-		if !ok && err != nil && ctx.Err() == nil {
-			n, _ := tlsErrs.LoadOrStore(err.Error()[:min(len(err.Error()), 60)], new(atomic.Int64))
+		if !ok && err != nil {
+			// By error, ports left out (each dial has its own).
+			msg := portRE.ReplaceAllString(err.Error(), "")
+			n, _ := tlsErrs.LoadOrStore(msg[:min(len(msg), 80)], new(atomic.Int64))
 			n.(*atomic.Int64).Add(1)
 		}
 	}()
-	var d net.Dialer
-	c, err := d.DialContext(ctx, "tcp", addr)
+	c, err := net.DialTimeout("tcp", addr, 10*time.Second)
 	if err != nil {
 		return false
 	}
