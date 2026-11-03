@@ -44,6 +44,8 @@ jobs:
           cache: false
       - name: Unit and in-process tests
         run: go vet ./... && go test -race -count=1 -timeout 300s ./...
+      - name: Load through every multiplexer (SPEC §6.6, a minute; NIKO_LOAD=10m for the full run)
+        run: NIKO_LOAD=60s go test -count=1 -timeout 300s -run TestNekoServerLoad -v ./nikoserver
       - name: Build niko-server
         run: CGO_ENABLED=0 go build -o /tmp/niko-server -trimpath ./cmd/niko-server
 
