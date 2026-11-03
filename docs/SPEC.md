@@ -130,8 +130,8 @@ UDP 53  ──► front/dnsmux ─┬─ *.<t>.example.com ──► backend dns
 
 SPA в udpmux нет: SPA v2 принимает `rayspa` на отдельном ротируемом порту (§3.5).
 
-Inbound hysteria2 и naive-quic должны принимать готовый `net.PacketConn` (виртуальный, от IPC) вместо listen —
-патч в форке.
+Hysteria2 принимает готовый `net.PacketConn` (виртуальный, от IPC) без патча: `hysteria2.Service.Start(conn)` из
+sing-quic. Бэкенды `hy2-masq` и `hy2-obfs` — niko-server на sing-quic.
 
 Два конфига Hysteria2 — два бэкенда:
 - `hy2-masq`: TLS с сертификатом `<h>.example.com` и `masquerade`;
@@ -283,7 +283,7 @@ systemd credentials (TPM при наличии), systemd-resolved stub выкл�
 | R0 | — | сделано: SPA v2 по векторам, импорт `rcdev1:` (v1.11.0) |
 | R1 | сделано (`niko-server-v0.1.1`): dnstt и MasterDnsVPN как библиотеки, фронт и бэкенды, IPC 1, схема конфигов 1, dnsmux, `inner` на Xray | сделано: подписка subscription-v1 (v1.13.0–v1.13.2), SPA v2 по TCP (v1.12.1) |
 | R2 | tcpmux (v0.2), Xray на unix-сокете; `site`, naive и DoH — в `rayd` raycontrol (R2-12, R2-14, R3-2) | — (PQ-проверка REALITY уже есть) |
-| R3 | udpmux без SPA, Hysteria2 ×2, naive-quic | регистрация через API |
+| R3 | udpmux без SPA (v0.3), Hysteria2 ×2 на sing-quic (v0.3); naive-quic и DoH3 — в `rayd` | регистрация через API |
 | R4 | Yggdrasil через tcpmux, ротация через `SIGHUP` | переключение учётных данных с перекрытием |
 | R5 | `inner` для olcRTC и OpenFlux | olcRTC, OpenFlux, вторая ступень к `inner` |
 
