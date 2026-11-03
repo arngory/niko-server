@@ -1,9 +1,9 @@
 module github.com/arngory/niko-server
 
-go 1.25.5
+go 1.26.0
 
 require (
-	github.com/quic-go/quic-go v0.60.0
+	github.com/quic-go/quic-go v0.64.1
 	github.com/sagernet/gvisor v0.0.0-20260727.0-sing-box-mod.1
 	github.com/sagernet/sing v0.9.7-0.20261023115459-5dc452e537bf
 	github.com/sagernet/sing-box v1.14.4
@@ -11,22 +11,23 @@ require (
 	github.com/xtaci/kcp-go/v5 v5.6.8
 	github.com/xtaci/smux v1.5.24
 	github.com/yggdrasil-network/yggdrasil-go v0.5.14
-	golang.org/x/crypto v0.54.0
-	golang.org/x/net v0.57.0
+	golang.org/x/crypto v0.58.0
+	golang.org/x/net v0.61.0
 	masterdnsvpn-go v0.0.0
 	www.bamsoftware.com/git/dnstt.git v1.20260501.0
 )
 
 require (
-	github.com/Arceliar/ironwood v0.0.0-20260613025018-d50055b11f5e // indirect
+	github.com/Arceliar/ironwood v0.0.0-20261023231900-0712eccbb962 // indirect
 	github.com/Arceliar/phony v0.0.0-20220903101357-530938a4b13d // indirect
-	github.com/bits-and-blooms/bitset v1.24.5 // indirect
+	github.com/bits-and-blooms/bitset v1.26.0 // indirect
 	github.com/bits-and-blooms/bloom/v3 v3.7.1 // indirect
 	github.com/coder/websocket v1.8.15 // indirect
 	github.com/gologme/log v1.3.0 // indirect
 )
 
 require (
+	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/BurntSushi/toml v1.4.1-0.20240526193622-a339e1f7089c // indirect
 	github.com/andybalholm/brotli v1.1.0 // indirect
 	github.com/caddyserver/certmagic v0.25.3-0.20260421143802-60d9d8b415d6 // indirect
@@ -79,18 +80,18 @@ require (
 	go.uber.org/zap/exp v0.3.0 // indirect
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba // indirect
 	golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f // indirect
-	golang.org/x/mod v0.37.0 // indirect
-	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.40.0 // indirect
+	golang.org/x/mod v0.41.0 // indirect
+	golang.org/x/sync v0.24.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/text v0.43.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
-	golang.org/x/tools v0.47.0 // indirect
+	golang.org/x/tools v0.51.0 // indirect
 )
 
 replace github.com/sagernet/sing-box => github.com/arngory/sing-box v1.14.5-0.20261102040805-34eaa8c9c5a9
 
 replace masterdnsvpn-go => github.com/arngory/sing-box/third_party/masterdnsvpn v0.0.0-20261102040805-34eaa8c9c5a9
 
-replace github.com/yggdrasil-network/yggdrasil-go => github.com/arngory/sing-box/third_party/yggdrasil-go v0.0.0-20261102040805-34eaa8c9c5a9
+replace github.com/yggdrasil-network/yggdrasil-go => github.com/arngory/yggdrasil-go v0.5.16-0.20261103204312-0db15d43777a
 
 replace github.com/sagernet/sing-quic => ./third_party/sing-quic
