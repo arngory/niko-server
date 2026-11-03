@@ -167,14 +167,30 @@ sing-quic. Бэкенды `hy2-masq` и `hy2-obfs` — niko-server на sing-qui
 
 ### 3.4. Yggdrasil
 
-- Бэкенд `yggdrasil`: endpoint из форка, ключ узла от raycontrol.
-- Только прямые подключения: клиент указывает пир `tls://<адрес ноды>:443?sni=<y>.example.com`, линк идёт
-  через tcpmux. Публичные пиры — флагом в конфиге (по умолчанию выключены).
-  - Проверить, что yggdrasil-go передаёт `sni` из URI в TLS, и что `parsePeer` в клиенте пропускает этот параметр.
-- Выход: входящие соединения endpoint отдаёт в роутер с адресом `127.0.0.1:<порт>`. Маршрут `inbound: [yggdrasil]` +
-  `port: [<порт выхода>]` → `inner`; остальное из `yggdrasil` → `reject`.
-- Постквант: см. [`RAYCONTROL.md`](https://github.com/arngory/niko/blob/claude/intelligent-allen-0oa8na/docs/server/RAYCONTROL.md), вопрос 5 — линк TLS с `X25519MLKEM768`, сквозное шифрование
-  Yggdrasil классическое, поэтому полезный трафик идёт в `inner`.
+Сделано в v0.4.0 (`nikoserver/yggdrasil.go`).
+
+- **Подключение — только прямое (P-14).** Клиент указывает пир `tls://<адрес ноды>:443?sni=<y>.example.com&key=<ключ узла>`.
+  tcpmux отдаёт поток по SNI бэкенду `yggdrasil` в режиме `fd`.
+  - yggdrasil-go передаёт `sni` из URI в TLS: `tlsSNI` в `link_tls.go`.
+  - Клиент Niko отправляет ClientHello Chrome через uTLS (`tls_fingerprint`).
+- **TLS в бэкенде.** TLS 1.3, только `X25519MLKEM768`, сертификат имени `<y>` из `tls`. ALPN — `h2` и `http/1.1`,
+  как у веб-сервера.
+- **Проверка ключа.** Бэкенд читает рукопожатие линка (`meta`: TLV и подпись ed25519 над BLAKE2b ключа). Ключ должен
+  быть в `users_file` (`yggdrasil.public_key`), подпись должна сходиться. Всё, что начинается не с `meta`, получает
+  ответ сайта: пустой `404` по h2 или HTTP/1.1, смотря что выбрал TLS.
+- **Перечитывание пользователей.** Файл перечитывается по `SIGHUP` и при изменении, без перезапуска. Линки удалённых
+  ключей закрываются сразу.
+- **Передача линка ядру.** Ядро yggdrasil-go (форк из `arngory/sing-box/third_party`) слушает unix-сокет в каталоге
+  0700, который виден только процессу бэкенда.
+  - Каждый линк приходит в ядро со своего адреса: ядро различает входящие линки по адресу собеседника.
+  - Своего `AllowedPublicKeys` у ядра нет: проверку ключей ведёт бэкенд.
+- **Выход.** На адресе узла в mesh работает стек gVisor. TCP на `exit_ports` уходит в `inner`, на другие порты —
+  RST; UDP отбрасывается. Соединения выхода держат keepalive: клиент, пропавший из mesh, сброса не шлёт.
+- **Публичные пиры.** Включаются списком `peers`; по умолчанию его нет.
+- **Постквант.** См. [`RAYCONTROL.md`](https://github.com/arngory/niko/blob/claude/intelligent-allen-0oa8na/docs/server/RAYCONTROL.md),
+  вопрос 5.
+  - Линк — TLS с `X25519MLKEM768`, при прямом подключении он и есть весь путь.
+  - Сквозное шифрование Yggdrasil классическое, поэтому полезный трафик идёт в `inner` (VLESS с ML-KEM-768).
 
 ### 3.5. SPA
 
@@ -257,7 +273,7 @@ systemd credentials (TPM при наличии), systemd-resolved stub выкл�
 | `arngory/xray-core` | REALITY, `inner`, эталон для тестов | есть |
 | `arngory/dnstt` | серверная библиотека (§3.3) | есть: зеркало апстрима, работа от `master` (v1.20260501.0) |
 | `arngory/MasterDnsVPN` | сервер с внешним PacketConn | есть, `main` (сервер в `cmd/server`, `internal/`) |
-| `arngory/yggdrasil-go` | патч `LinkDialer` (сейчас вендорен в `sing-box/third_party`) | есть, `master` = 0.5.15 (в ядре 0.5.14); перенести патч и вендорить из форка |
+| `arngory/yggdrasil-go` | патч `LinkDialer` (сейчас вендорен в `sing-box/third_party`) | есть, `master` = 0.5.15 (в ядре 0.5.14); перенести патч и вендорить из форка. niko-server берёт ядро из `arngory/sing-box/third_party/yggdrasil-go` (`replace` в `go.mod`) |
 | `arngory/naiveproxy` | клиент naive для тестов и плагин Android | есть, Chromium 154.0.8037.49; в `apk/` — сборка плагина (свой ключ подписи) |
 | `arngory/olcrtc`, `arngory/OpenFlux` | белые списки (§3.10) | по raycontrol |
 | apernet/hysteria | официальный клиент для тестов | форк не нужен, тег собирается в CI |
@@ -284,7 +300,7 @@ systemd credentials (TPM при наличии), systemd-resolved stub выкл�
 | R1 | сделано (`niko-server-v0.1.1`): dnstt и MasterDnsVPN как библиотеки, фронт и бэкенды, IPC 1, схема конфигов 1, dnsmux, `inner` на Xray | сделано: подписка subscription-v1 (v1.13.0–v1.13.2), SPA v2 по TCP (v1.12.1) |
 | R2 | tcpmux (v0.2), Xray на unix-сокете; `site`, naive и DoH — в `rayd` raycontrol (R2-12, R2-14, R3-2) | — (PQ-проверка REALITY уже есть) |
 | R3 | udpmux без SPA (v0.3), Hysteria2 ×2 на sing-quic (v0.3); naive-quic и DoH3 — в `rayd` | регистрация через API |
-| R4 | Yggdrasil через tcpmux, ротация через `SIGHUP` | переключение учётных данных с перекрытием |
+| R4 | Yggdrasil через tcpmux (v0.4), ключи пользователей перечитываются по `SIGHUP` и при изменении файла | переключение учётных данных с перекрытием |
 | R5 | `inner` для olcRTC и OpenFlux | olcRTC, OpenFlux, вторая ступень к `inner` |
 
 После каждого этапа — релиз.
