@@ -123,8 +123,8 @@ JSON Schema появится в `arngory/sing-box`, `cmd/niko-server/schema/` в
 
 | `kind` | `options` |
 |---|---|
-| `hy2-masq` | `up_mbps`/`down_mbps` (необязательно): потолки Brutal на одно соединение. Сервер шлёт со скоростью min(`up_mbps`, темп клиента из `Hysteria-CC-RX`), без темпа клиента — BBR; `down_mbps` ограничивает отдачу клиента. Неавторизованные получают пустой `404` |
-| `hy2-obfs` | `obfs_password_file` (тот же пароль salamander, что у фронта), `up_mbps`/`down_mbps` как у `hy2-masq` |
+| `hy2-masq` | `probe` (необязательно): `{"name": "probe.raycontrol.invalid", "address": "127.0.0.1:<порт>"}` — потоки и датаграммы на это имя идут на этот адрес loopback (замер канала raycontrol, probe-v1), ответы приходят от имени; другие адреса узла недоступны, как и прежде. `up_mbps`/`down_mbps` (необязательно): потолки Brutal на одно соединение. Сервер шлёт со скоростью min(`up_mbps`, темп клиента из `Hysteria-CC-RX`), без темпа клиента — BBR; `down_mbps` ограничивает отдачу клиента. Неавторизованные получают пустой `404` |
+| `hy2-obfs` | `obfs_password_file` (тот же пароль salamander, что у фронта), `up_mbps`/`down_mbps` как у `hy2-masq`; `probe` как у `hy2-masq` |
 | `naive` | `site` — сокет бэкенда `site` для запросов без авторизации |
 | `doh` | `path_token_file`, `upstream` (DNS-серверы sing-box) |
 | `dnstt` | `zone`, `private_key_file` (hex закрытого ключа X25519, 64 символа и перевод строки, как `dnstt-server -gen-key`) |

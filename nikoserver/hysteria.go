@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -100,7 +101,7 @@ func runHysteria(ctx context.Context, c *BackendConfig, conn *packetConn, log *L
 		SalamanderPassword: salamander,
 		TLSConfig:          tlsConfig,
 		UDPTimeout:         2 * time.Minute,
-		Handler:            &outbound{dial: dial, log: log},
+		Handler:            &outbound{dial: dial, log: log, probe: c.Options.Probe},
 		MasqueradeHandler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Length", "0")
 			w.WriteHeader(http.StatusNotFound)
@@ -165,13 +166,27 @@ type dialFunc func(ctx context.Context, network, address string) (net.Conn, erro
 
 // outbound takes the users' streams and datagrams out to public addresses.
 type outbound struct {
-	dial dialFunc
-	log  *Logger
+	dial  dialFunc
+	log   *Logger
+	probe *ProbeRoute
+}
+
+// isProbe reports whether a destination is the probe name.
+func (o *outbound) isProbe(d M.Socksaddr) bool {
+	return o.probe != nil && d.IsFqdn() && strings.EqualFold(strings.TrimSuffix(d.Fqdn, "."), o.probe.Name)
 }
 
 func (o *outbound) NewConnectionEx(ctx context.Context, conn net.Conn, _ M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
 	dctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	out, err := o.dial(dctx, "tcp", destination.String())
+	var out net.Conn
+	var err error
+	if o.isProbe(destination) {
+		// The probe name leads to its address on the node, and only it.
+		var d net.Dialer
+		out, err = d.DialContext(dctx, "tcp", o.probe.Address)
+	} else {
+		out, err = o.dial(dctx, "tcp", destination.String())
+	}
 	cancel()
 	if err != nil {
 		o.log.Debugf("destination: %v", err)
@@ -188,14 +203,19 @@ func (o *outbound) NewConnectionEx(ctx context.Context, conn net.Conn, _ M.Socks
 }
 
 func (o *outbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, _ M.Socksaddr, _ M.Socksaddr, onClose N.CloseHandlerFunc) {
-	err := relayUDP(ctx, conn)
+	err := relayUDP(ctx, conn, o)
 	if onClose != nil {
 		onClose(err)
 	}
 }
 
 // relayUDP carries a user's datagrams to and from public addresses.
-func relayUDP(ctx context.Context, conn N.PacketConn) error {
+func relayUDP(ctx context.Context, conn N.PacketConn, o *outbound) error {
+	var probeAddr netip.AddrPort
+	var probeFrom atomic.Pointer[M.Socksaddr] // what the client sent to: replies come from it
+	if o != nil && o.probe != nil {
+		probeAddr, _ = netip.ParseAddrPort(o.probe.Address)
+	}
 	udp, err := net.ListenUDP("udp", nil)
 	if err != nil {
 		conn.Close()
@@ -219,7 +239,15 @@ func relayUDP(ctx context.Context, conn N.PacketConn) error {
 				return
 			}
 			buffer := buf.As(b[:n])
-			if err := conn.WritePacket(buffer, M.SocksaddrFromNetIP(netip.AddrPortFrom(from.Addr().Unmap(), from.Port()))); err != nil {
+			// A dual-stack socket reports IPv4 senders as ::ffff:a.b.c.d.
+			sender := netip.AddrPortFrom(from.Addr().Unmap(), from.Port())
+			source := M.SocksaddrFromNetIP(sender)
+			if probeAddr.IsValid() && sender == probeAddr {
+				if p := probeFrom.Load(); p != nil {
+					source = *p
+				}
+			}
+			if err := conn.WritePacket(buffer, source); err != nil {
 				return
 			}
 		}
@@ -230,6 +258,13 @@ func relayUDP(ctx context.Context, conn N.PacketConn) error {
 		if err != nil {
 			buffer.Release()
 			return err
+		}
+		if probeAddr.IsValid() && o.isProbe(destination) {
+			d := destination
+			probeFrom.Store(&d)
+			_, _ = udp.WriteToUDPAddrPort(buffer.Bytes(), probeAddr)
+			buffer.Release()
+			continue
 		}
 		addr := destination.Addr
 		if destination.IsFqdn() {

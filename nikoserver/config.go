@@ -119,6 +119,16 @@ type BackendOptions struct {
 	// by default: clients connect directly, raycontrol decision P-14).
 	ExitPorts []int    `json:"exit_ports,omitempty"`
 	Peers     []string `json:"peers,omitempty"`
+	// hy2-*: a name that leads to an address on the node, TCP and UDP (the
+	// channel probes of raycontrol, probe-v1); nothing else of the node is
+	// reachable.
+	Probe *ProbeRoute `json:"probe,omitempty"`
+}
+
+// ProbeRoute sends streams and datagrams for Name to Address.
+type ProbeRoute struct {
+	Name    string `json:"name"`
+	Address string `json:"address"`
 }
 
 // BackendTLS is a backend's certificate; curves default to X25519MLKEM768
@@ -302,6 +312,14 @@ func (c *BackendConfig) validate() []ConfigError {
 		if c.Options.UpMbps < 0 || c.Options.DownMbps < 0 {
 			e.add("options", "up_mbps and down_mbps cannot be negative")
 		}
+		if pr := c.Options.Probe; pr != nil {
+			if !dnsName.MatchString(pr.Name) {
+				e.add("options.probe.name", "not a DNS name: %q", pr.Name)
+			}
+			if ap, err := netip.ParseAddrPort(pr.Address); err != nil || !ap.Addr().IsLoopback() {
+				e.add("options.probe.address", "want a loopback IP:port, like 127.0.0.1:34567")
+			}
+		}
 	case "yggdrasil":
 		checkSocket(&e, "users_file", c.UsersFile)
 		checkBackendTLS(&e, c.TLS, "a Yggdrasil backend needs the certificate of its name")
@@ -329,6 +347,9 @@ func (c *BackendConfig) validate() []ConfigError {
 		e.add("kind", "missing")
 	default:
 		e.add("kind", "kind %q is not served by this niko-server release (dnstt, masterdns, hy2-masq, hy2-obfs, yggdrasil)", c.Kind)
+	}
+	if c.Options.Probe != nil && c.Kind != "hy2-masq" && c.Kind != "hy2-obfs" {
+		e.add("options.probe", "only the Hysteria2 backends route a probe name")
 	}
 	if c.Kind != "yggdrasil" && (len(c.Options.ExitPorts) > 0 || len(c.Options.Peers) > 0) {
 		e.add("options", "exit_ports and peers are Yggdrasil options")
