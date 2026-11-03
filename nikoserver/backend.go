@@ -50,7 +50,13 @@ func RunBackend(ctx context.Context, c *BackendConfig, log *Logger) error {
 	switch c.Kind {
 	case "hy2-masq", "hy2-obfs":
 		conn.port = 443
-		err := runHysteria(ctx, c, conn, log, PublicDialer().DialContext)
+		dial := PublicDialer().DialContext
+		if anyDestination() {
+			log.Warnf("%s=1: users may reach any address, the node's own included (tests only)", unsafeAnyDestination)
+			var direct net.Dialer
+			dial = direct.DialContext
+		}
+		err := runHysteria(ctx, c, conn, log, dial)
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -310,3 +316,10 @@ func (c *packetConn) SetWriteBuffer(int) error         { return nil }
 func DNSTTKeypair() (private, public string, err error) {
 	return dnsttserver.GenerateKeypair()
 }
+
+// unsafeAnyDestination lets the backends' users reach any address, loopback
+// and private ranges included: for tests on one host only. raycontrol
+// never sets it.
+const unsafeAnyDestination = "NIKO_SERVER_UNSAFE_ANY_DESTINATION"
+
+func anyDestination() bool { return os.Getenv(unsafeAnyDestination) == "1" }
