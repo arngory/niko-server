@@ -239,8 +239,10 @@ func relayUDP(ctx context.Context, conn N.PacketConn, o *outbound) error {
 				return
 			}
 			buffer := buf.As(b[:n])
-			source := M.SocksaddrFromNetIP(netip.AddrPortFrom(from.Addr().Unmap(), from.Port()))
-			if probeAddr.IsValid() && from == probeAddr {
+			// A dual-stack socket reports IPv4 senders as ::ffff:a.b.c.d.
+			sender := netip.AddrPortFrom(from.Addr().Unmap(), from.Port())
+			source := M.SocksaddrFromNetIP(sender)
+			if probeAddr.IsValid() && sender == probeAddr {
 				if p := probeFrom.Load(); p != nil {
 					source = *p
 				}
