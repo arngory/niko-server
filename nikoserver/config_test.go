@@ -59,7 +59,16 @@ func TestNekoServerConfigCheck(t *testing.T) {
 		t.Fatal(errs)
 	}
 
+	hy2 := `{"schema":1,"role":"backend","kind":"hy2-masq","socket":"/run/niko/h/packet.sock","front_uid":9100,
+		"users_file":"/r/h/users.json","tls":{"certificate_file":"/r/h/chain.pem","key_file":"/run/niko/h/key.pem"},
+		"options":{"probe":{"name":"probe.raycontrol.invalid","address":"127.0.0.1:34567"}}}`
+	if errs := checkConfig(t, hy2); len(errs) > 0 {
+		t.Fatal(errs)
+	}
 	for want, content := range map[string]string{
+		"options.probe.address":     strings.Replace(hy2, `127.0.0.1:34567`, `203.0.113.7:34567`, 1),
+		"options.probe.name":        strings.Replace(hy2, `"probe.raycontrol.invalid"`, `"bad name"`, 1),
+		"options.probe":             strings.Replace(ygg, `"exit_ports":[4433]`, `"exit_ports":[4433],"probe":{"name":"p.invalid","address":"127.0.0.1:1"}`, 1),
 		"options.exit_ports":        strings.Replace(ygg, `"exit_ports":[4433]`, `"exit_ports":[]`, 1),
 		"options.exit_ports[1]":     strings.Replace(ygg, `"exit_ports":[4433]`, `"exit_ports":[4433,4433]`, 1),
 		"options.peers[0]":          strings.Replace(ygg, `"exit_ports":[4433]`, `"exit_ports":[4433],"peers":["unix:///tmp/x"]`, 1),

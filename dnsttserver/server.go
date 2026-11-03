@@ -780,8 +780,9 @@ func run(privkey []byte, domain dns.Name, upstream Dialer, dnsConn net.PacketCon
 		}
 	}()
 
+	// recvLoop is the only sender on ch and closes it when it returns
+	// (neko): run may return first, and closing ch then raced a send.
 	ch := make(chan *record, 100)
-	defer close(ch)
 
 	// We could run multiple copies of sendLoop; that would allow more time
 	// for each response to collect downstream data before being evicted by
@@ -797,6 +798,7 @@ func run(privkey []byte, domain dns.Name, upstream Dialer, dnsConn net.PacketCon
 	go func() {
 		defer done()
 		err := recvLoop(domain, dnsConn, ttConn, ch)
+		close(ch)
 		if err != nil {
 			log.Printf("recvLoop: %v", err)
 		}
