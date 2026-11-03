@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -22,6 +23,7 @@ import (
 
 	sbtls "github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-quic/hysteria"
 	"github.com/sagernet/sing-quic/hysteria2"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -74,6 +76,7 @@ func TestNekoServerHysteria(t *testing.T) {
 			c.Options.ObfsPasswordFile = pwFile
 		}
 		c.Options.Probe = probe
+		c.StatsSocket = filepath.Join(dir, kind+"-stats.sock")
 		if errs := c.validate(); len(errs) > 0 {
 			t.Fatal(errs)
 		}
@@ -167,6 +170,45 @@ func TestNekoServerHysteria(t *testing.T) {
 		t.Fatalf("probe over TCP: %q %v", got, err)
 	}
 	pconn.Close()
+	// Session stats by client address: a Brutal client (it gives its
+	// receive rate) next to the BBR one above.
+	brutalTLS, _ := sbtls.NewClient(ctx, nopLogger(), "h.example.com", option.OutboundTLSOptions{Enabled: true, ServerName: "h.example.com",
+		Insecure: true, ALPN: []string{"h3"}, CurvePreferences: []option.CurvePreference{option.CurvePreference(tls.X25519MLKEM768)}})
+	bcl, err := hysteria2.NewClient(hysteria2.ClientOptions{Context: ctx, Dialer: N.SystemDialer, Logger: nopLogger(),
+		ServerAddress: server, Password: "password-one", TLSConfig: brutalTLS, ReceiveBPS: 10 * hysteria.MbpsToBps})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bcl.CloseWithError(nil)
+	bconn, err := bcl.DialConn(ctx, M.ParseSocksaddrHostPort(probe.Name, 443))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bconn.Write([]byte("brutal"))
+	io.ReadFull(bconn, make([]byte, 6))
+	defer bconn.Close()
+	query := func(ip string) HysteriaStats {
+		c, err := net.Dial("unix", filepath.Join(dir, "hy2-masq-stats.sock"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		fmt.Fprintln(c, ip)
+		var st HysteriaStats
+		if err := json.NewDecoder(c).Decode(&st); err != nil {
+			t.Fatal(err)
+		}
+		return st
+	}
+	st := query("127.0.0.1")
+	if st.Connections != 2 || st.RTTus.Max == 0 || st.PacketsSent == 0 || st.Brutal.Connections != 1 ||
+		st.Brutal.RateBps.Max != 10*1000*1000 || st.Brutal.AckRate.Max <= 0 || st.Brutal.AckRate.Max > 1 {
+		t.Fatalf("stats %+v", st)
+	}
+	if other := query("203.0.113.9"); other.Connections != 0 {
+		t.Fatalf("another address: %+v", other)
+	}
+
 	ppc, err := pcl.ListenPacket(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -209,13 +251,8 @@ func TestNekoServerHysteria(t *testing.T) {
 		}
 	}
 
-	// A rotated password: the users file changes, SIGHUP reloads it.
-	// sing-quic's UpdateUsers swaps the users table without a lock while
-	// sessions read it (the old and new tables are never written, so a
-	// reader sees one or the other): the race detector would report it.
-	if raceEnabled {
-		return
-	}
+	// A rotated password: the users file changes, SIGHUP reloads it (the
+	// vendored sing-quic swaps the table atomically: no race any more).
 	writeUsers(t, usersFile, "password-two")
 	syscall.Kill(os.Getpid(), syscall.SIGHUP)
 	time.Sleep(300 * time.Millisecond)

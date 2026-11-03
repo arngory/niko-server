@@ -93,7 +93,16 @@ func runHysteria(ctx context.Context, c *BackendConfig, conn *packetConn, log *L
 		}
 		salamander = strings.TrimRight(string(b), "\r\n")
 	}
+	var live sessions
+	if c.StatsSocket != "" {
+		stop, err := live.serveStats(c.StatsSocket, log)
+		if err != nil {
+			return envError("stats socket: %v", err)
+		}
+		defer stop()
+	}
 	service, err := hysteria2.NewService[int](hysteria2.ServiceOptions{
+		ConnectionHook:     live.hook,
 		Context:            ctx,
 		Logger:             nopLogger(),
 		SendBPS:            uint64(c.Options.UpMbps * hysteria.MbpsToBps),
@@ -115,9 +124,7 @@ func runHysteria(ctx context.Context, c *BackendConfig, conn *packetConn, log *L
 		if err != nil {
 			return err
 		}
-		// UpdateUsers swaps the table without a lock: sessions see the old
-		// or the new one, never one being written (to fix in a sing-quic
-		// fork with an atomic swap).
+		// The vendored sing-quic swaps the table atomically.
 		service.UpdateUsers(ids, passwords)
 		log.Infof("%d users", len(ids))
 		return nil
