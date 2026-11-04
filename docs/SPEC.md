@@ -273,7 +273,7 @@ systemd credentials (TPM при наличии), systemd-resolved stub выкл�
 | `arngory/xray-core` | REALITY, `inner`, эталон для тестов | есть |
 | `arngory/dnstt` | серверная библиотека (§3.3) | есть: зеркало апстрима, работа от `master` (v1.20260501.0) |
 | `arngory/MasterDnsVPN` | сервер с внешним PacketConn | есть, `main` (сервер в `cmd/server`, `internal/`) |
-| sing-quic | сервер Hysteria2 | вендорен в `third_party/sing-quic` (`replace` в `go.mod`, с версии v0.6.0). Правки помечены `neko`: хук соединений со статистикой QUIC и Brutal, атомарная доля подтверждённых у Brutal, атомарная замена таблицы пользователей (раньше запись без блокировки гонялась с чтением) |
+| sing-quic | сервер Hysteria2 | вендорен в `third_party/sing-quic` (`replace` в `go.mod`, с версии v0.6.0). Правки помечены `neko`: хук соединений с пользователем и статистикой QUIC и Brutal, атомарная доля подтверждённых у Brutal, атомарная замена таблицы пользователей (раньше запись без блокировки гонялась с чтением) |
 | `arngory/yggdrasil-go` | патч `LinkDialer` (исходящие линки через дозвонщик встраивающей программы) | есть: 0.5.15 с патчем в `develop` ([#1](https://github.com/arngory/yggdrasil-go/pull/1)). niko-server берёт ядро отсюда (`replace` в `go.mod`); клиенту — перейти с `sing-box/third_party/yggdrasil-go` на этот форк |
 | `arngory/naiveproxy` | клиент naive для тестов и плагин Android | есть, Chromium 154.0.8037.49; в `apk/` — сборка плагина (свой ключ подписи) |
 | `arngory/olcrtc`, `arngory/OpenFlux` | белые списки (§3.10) | по raycontrol |

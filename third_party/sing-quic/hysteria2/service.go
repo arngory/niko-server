@@ -50,8 +50,9 @@ type ServiceOptions struct {
 	BBRProfile            string
 	RealmOptions          *realm.Options
 	// ConnectionHook, if set, learns of each authenticated connection: the
-	// client's address, its stats while it lives, and when it ends (neko).
-	ConnectionHook func(remote net.Addr, stats func() ConnectionStats, done <-chan struct{})
+	// client's address, the user it authenticated as, its stats while it
+	// lives, and when it ends (neko).
+	ConnectionHook func(remote net.Addr, user any, stats func() ConnectionStats, done <-chan struct{})
 }
 
 // ConnectionStats is what the server knows of a client connection (neko):
@@ -83,7 +84,7 @@ type Service[U comparable] struct {
 	tlsConfig             aTLS.ServerConfig
 	quicConfig            *quic.Config
 	users                 atomic.Pointer[map[string]U] // swapped whole by UpdateUsers (neko: was a racy map write)
-	connectionHook        func(remote net.Addr, stats func() ConnectionStats, done <-chan struct{})
+	connectionHook        func(remote net.Addr, user any, stats func() ConnectionStats, done <-chan struct{})
 	udpDisabled           bool
 	udpTimeout            time.Duration
 	handler               ServerHandler
@@ -332,7 +333,7 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(protocol.StatusAuthOK)
 		if s.connectionHook != nil {
 			conn := s.quicConn
-			s.connectionHook(conn.RemoteAddr(), func() ConnectionStats {
+			s.connectionHook(conn.RemoteAddr(), user, func() ConnectionStats {
 				st := ConnectionStats{ConnectionStats: conn.ConnectionStats()}
 				if brutal != nil {
 					st.Brutal, st.RateBPS, st.AckRate = true, brutal.BPS(), brutal.AckRate()
