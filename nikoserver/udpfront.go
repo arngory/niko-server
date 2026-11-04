@@ -11,6 +11,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // udpFront is udpmux (SPEC §3.2): UDP 443, one socket per address, the
@@ -112,6 +114,7 @@ func (f *udpFront) listen(addrs []string) error {
 		}
 		_ = conn.SetReadBuffer(8 << 20)
 		_ = conn.SetWriteBuffer(8 << 20)
+		probeMTU(conn, addr.Addr().Is4())
 		f.sockets[addr] = conn
 	}
 	return nil
@@ -286,4 +289,22 @@ func (f *udpFront) answer(client, local netip.AddrPort, payload []byte) {
 	}
 	f.access.Unlock()
 	_, _ = conn.WriteToUDPAddrPort(payload, client)
+}
+
+// probeMTU does on the front's sockets what quic-go does on its own: DF
+// set, and the path MTU the kernel learns from ICMP is not applied, so the
+// kernel never fragments a datagram here; QUIC finds its own packet size
+// (review, P-2).
+func probeMTU(conn *net.UDPConn, v4 bool) {
+	rc, err := conn.SyscallConn()
+	if err != nil {
+		return
+	}
+	_ = rc.Control(func(fd uintptr) {
+		if v4 {
+			_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_MTU_DISCOVER, unix.IP_PMTUDISC_PROBE)
+			return
+		}
+		_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_MTU_DISCOVER, unix.IPV6_PMTUDISC_PROBE)
+	})
 }
