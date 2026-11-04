@@ -220,7 +220,7 @@ func (f *udpFront) classify(key flowKey, d []byte, now time.Time) (*backendLink,
 		return nil, nil
 	}
 	for _, r := range f.salamander {
-		if open, ok := salamanderOpen(r.password, d); ok && isQUICInitial(open) {
+		if salamanderInitial(r.password, d) {
 			return r.link, [][]byte{append([]byte(nil), d...)}
 		}
 	}

@@ -1,6 +1,7 @@
 package nikoserver
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
@@ -98,5 +99,17 @@ func TestNekoServerSalamander(t *testing.T) {
 	}
 	if wrong, _ := salamanderOpen([]byte("another password"), obfs); isQUICInitial(wrong) {
 		t.Fatal("a wrong password opened it")
+	}
+	// The front's check opens the 7 bytes that tell, and agrees.
+	if !salamanderInitial(password, obfs) || salamanderInitial([]byte("another password"), obfs) ||
+		salamanderInitial(password, obfs[:14]) || salamanderInitial(password, d) {
+		t.Fatal("salamanderInitial disagrees")
+	}
+	long := bytes.Repeat([]byte("p"), 200) // a password past the stack buffer
+	if salamanderKey(long, salt) != blake2b.Sum256(append(bytes.Clone(long), salt...)) {
+		t.Fatal("key of a long password")
+	}
+	if n := testing.AllocsPerRun(100, func() { salamanderInitial(password, obfs) }); n != 0 {
+		t.Fatalf("salamanderInitial allocates %v times", n)
 	}
 }

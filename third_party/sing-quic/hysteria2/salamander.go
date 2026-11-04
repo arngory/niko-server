@@ -1,7 +1,7 @@
 package hysteria2
 
 import (
-	"crypto/subtle"
+	"encoding/binary"
 	"net"
 	"sync"
 
@@ -15,9 +15,9 @@ import (
 
 const salamanderSaltLen = 8
 
-// neko: the key without an allocation per packet, and the XOR word by word
-// (crypto/subtle) over the key tiled once, instead of a byte loop with a
-// modulo: about 9 times faster on a full packet (niko-server review, P-1).
+// neko: the key without an allocation per packet, and the XOR word by word,
+// instead of a byte loop with a modulo: about 17 times faster on a full
+// packet (niko-server review, P-1, and the review after v0.8.0).
 
 // salamanderKey is BLAKE2b-256(password || salt).
 func salamanderKey(password, salt []byte) [blake2b.Size256]byte {
@@ -30,27 +30,47 @@ func salamanderKey(password, salt []byte) [blake2b.Size256]byte {
 	return blake2b.Sum256(append(password[:len(password):len(password)], salt...))
 }
 
-// salamanderTile is the key repeated: XOR goes in chunks of it.
-const salamanderTile = 2048
-
 // SalamanderXOR sets dst to src XOR the key repeated, starting at byte off
-// of the key stream; dst and src are the same slice or do not overlap.
+// of the key stream; dst and src are the same slice or do not overlap, and
+// dst is at least as long as src. The key goes as four 64-bit words over
+// each 32-byte block, with no key stream built per packet.
 func SalamanderXOR(dst, src []byte, key *[blake2b.Size256]byte, off int) {
-	var ks [salamanderTile + blake2b.Size256]byte
-	tiled := min(len(src)+blake2b.Size256, len(ks))
-	for i := 0; i < tiled; i += blake2b.Size256 {
-		copy(ks[i:], key[:])
+	if len(src) == 0 {
+		return
 	}
-	stream := ks[off%blake2b.Size256 : tiled]
-	for len(src) > 0 {
-		n := subtle.XORBytes(dst, src, stream[:min(len(src), salamanderTile)])
-		dst, src = dst[n:], src[n:]
+	dst = dst[:len(src)]
+	i := 0
+	if off %= blake2b.Size256; off != 0 {
+		// Up to where the key starts again.
+		i = min(blake2b.Size256-off, len(src))
+		for j := range i {
+			dst[j] = src[j] ^ key[off+j]
+		}
+	}
+	k0 := binary.LittleEndian.Uint64(key[0:])
+	k1 := binary.LittleEndian.Uint64(key[8:])
+	k2 := binary.LittleEndian.Uint64(key[16:])
+	k3 := binary.LittleEndian.Uint64(key[24:])
+	for ; len(src)-i >= blake2b.Size256; i += blake2b.Size256 {
+		s, d := src[i:i+32:i+32], dst[i:i+32:i+32]
+		w0 := binary.LittleEndian.Uint64(s[0:]) ^ k0
+		w1 := binary.LittleEndian.Uint64(s[8:]) ^ k1
+		w2 := binary.LittleEndian.Uint64(s[16:]) ^ k2
+		w3 := binary.LittleEndian.Uint64(s[24:]) ^ k3
+		binary.LittleEndian.PutUint64(d[0:], w0)
+		binary.LittleEndian.PutUint64(d[8:], w1)
+		binary.LittleEndian.PutUint64(d[16:], w2)
+		binary.LittleEndian.PutUint64(d[24:], w3)
+	}
+	for j := 0; i < len(src); i, j = i+1, j+1 {
+		dst[i] = src[i] ^ key[j]
 	}
 }
 
 // salamanderBuf holds a datagram with its salt while it is read: quic-go
-// reads into 1452 bytes, and a full packet is 8 more on the wire (P-6).
-var salamanderBuf = sync.Pool{New: func() any { b := make([]byte, 65536); return &b }}
+// reads into 1452 bytes, and a full packet is 8 more on the wire (P-6). A
+// reader with a larger buffer grows the one it gets.
+var salamanderBuf = sync.Pool{New: func() any { b := make([]byte, 2048); return &b }}
 
 const ObfsTypeSalamander = "salamander"
 
@@ -83,7 +103,10 @@ func NewSalamanderConn(conn net.PacketConn, password []byte) net.PacketConn {
 func (s *SalamanderPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	bp := salamanderBuf.Get().(*[]byte)
 	defer salamanderBuf.Put(bp)
-	b := (*bp)[:min(len(p)+salamanderSaltLen, len(*bp))]
+	if want := min(len(p)+salamanderSaltLen, 65536); cap(*bp) < want {
+		*bp = make([]byte, want)
+	}
+	b := (*bp)[:min(len(p)+salamanderSaltLen, cap(*bp))]
 	n, addr, err = s.PacketConn.ReadFrom(b)
 	if err != nil {
 		return
