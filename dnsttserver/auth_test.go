@@ -114,7 +114,9 @@ func TestAuthServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	ask := func(payload []byte) uint16 {
+	var askSized func(payload []byte, edns uint16) uint16
+	ask := func(payload []byte) uint16 { return askSized(payload, 4096) }
+	askSized = func(payload []byte, edns uint16) uint16 {
 		t.Helper()
 		enc := []byte(strings.ToLower(base32Encoding.EncodeToString(payload)))
 		var labels [][]byte
@@ -128,7 +130,7 @@ func TestAuthServer(t *testing.T) {
 			t.Fatal(err)
 		}
 		q := dns.Message{ID: 7, Flags: 0x0100, Question: []dns.Question{{Name: name, Type: dns.RRTypeTXT, Class: dns.ClassIN}},
-			Additional: []dns.RR{{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 4096, TTL: 0, Data: []byte{}}}}
+			Additional: []dns.RR{{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: edns, TTL: 0, Data: []byte{}}}}
 		b, err := q.WireFormat()
 		if err != nil {
 			t.Fatal(err)
@@ -160,5 +162,88 @@ func TestAuthServer(t *testing.T) {
 	tag = Tag(&other, EpochOf(time.Now()), body)
 	if rc := ask(append(tag[:], body...)); rc != dns.RcodeNameError {
 		t.Fatalf("query tagged by another key: rcode %d, want NXDOMAIN", rc)
+	}
+	// A probe with a small EDNS size learns nothing either: NXDOMAIN, not
+	// dnstt's FORMERR for a payload size under its minimum.
+	if rc := askSized(body, 512); rc != dns.RcodeNameError {
+		t.Fatalf("untagged query with EDNS 512: rcode %d, want NXDOMAIN", rc)
+	}
+	tag = Tag(&dev, EpochOf(time.Now()), body)
+	if rc := askSized(append(tag[:], body...), 512); rc != dns.RcodeFormatError {
+		t.Fatalf("tagged query with EDNS 512: rcode %d, want FORMERR", rc)
+	}
+}
+
+// Full scans of the keys have a budget: garbage beyond it is refused
+// unread, while sessions already known go on; the budget refills.
+func TestAuthScanBudget(t *testing.T) {
+	var dev [32]byte
+	rand.Read(dev[:])
+	now := time.Unix(1_800_000_000, 0)
+	a := &Auth{Mode: AuthRequired, Now: func() time.Time { return now }, ScanRate: 1, ScanBurst: 3}
+	if err := a.SetKeys([]byte("d1 " + hex.EncodeToString(dev[:]))); err != nil {
+		t.Fatal(err)
+	}
+	body := append([]byte("CLIENTID"), 0xe0)
+	tag := Tag(&dev, EpochOf(now), body)
+	good := append(tag[:], body...)
+	if _, ok := a.Check(good); !ok { // a scan: the session is known from now on
+		t.Fatal("first tagged query refused")
+	}
+	garbage := func(i byte) []byte {
+		g := append([]byte{i, 1, 2, 3, 4, 5, 6, 7}, "OTHERCID\xe0"...)
+		return g
+	}
+	for i := range byte(10) {
+		a.Check(garbage(i))
+	}
+	if th := a.Throttled.Load(); th != 8 { // 3 - 1 tokens left for garbage
+		t.Fatalf("throttled %d, want 8", th)
+	}
+	// The known session needs no scan, and a reload of the same keys keeps it.
+	a.SetKeys([]byte("d1 " + hex.EncodeToString(dev[:])))
+	if _, ok := a.Check(good); !ok {
+		t.Fatal("known session refused over the budget")
+	}
+	now = now.Add(2 * time.Second)
+	before := a.Throttled.Load()
+	a.Check(garbage(99))
+	if a.Throttled.Load() != before {
+		t.Fatal("the budget did not refill")
+	}
+
+	// Optional mode: an old client's untagged ClientID is scanned once.
+	o := &Auth{Mode: AuthOptional, Now: func() time.Time { return now }, ScanRate: 0.001, ScanBurst: 1}
+	o.SetKeys([]byte("d1 " + hex.EncodeToString(dev[:])))
+	old := append([]byte("OLDCLIEN"), "\xe0 packets of an old client"...)
+	for range 5 {
+		if rest, ok := o.Check(old); !ok || !bytes.Equal(rest, old) {
+			t.Fatalf("untagged query in optional mode: %v", ok)
+		}
+	}
+	if o.Throttled.Load() != 0 || o.Untagged.Load() != 5 {
+		t.Fatalf("throttled %d untagged %d", o.Throttled.Load(), o.Untagged.Load())
+	}
+}
+
+// What a garbage query costs with 100 devices: 3 HMACs a device, no
+// allocation per HMAC.
+func BenchmarkAuthGarbage(b *testing.B) {
+	var keys strings.Builder
+	for i := range 100 {
+		var k [32]byte
+		rand.Read(k[:])
+		keys.WriteString("d" + strings.Repeat("x", i%7) + hex.EncodeToString(k[:4]) + " " + hex.EncodeToString(k[:]) + "\n")
+	}
+	a := &Auth{Mode: AuthRequired, ScanRate: 1e12, ScanBurst: 1e12}
+	if err := a.SetKeys([]byte(keys.String())); err != nil {
+		b.Fatal(err)
+	}
+	q := make([]byte, 120)
+	rand.Read(q)
+	b.ReportAllocs()
+	for b.Loop() {
+		q[0]++
+		a.Check(q)
 	}
 }
