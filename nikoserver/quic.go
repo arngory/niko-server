@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 
+	"github.com/sagernet/sing-quic/hysteria2"
 	"golang.org/x/crypto/blake2b"
 )
 
@@ -268,8 +269,6 @@ func salamanderOpen(password, datagram []byte) ([]byte, bool) {
 	}
 	key := blake2b.Sum256(append(append([]byte(nil), password...), datagram[:8]...))
 	out := make([]byte, len(datagram)-8)
-	for i := range out {
-		out[i] = datagram[8+i] ^ key[i%32]
-	}
+	hysteria2.SalamanderXOR(out, datagram[8:], &key, 0)
 	return out, true
 }
