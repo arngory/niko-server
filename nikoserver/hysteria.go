@@ -48,7 +48,9 @@ type UsersFile struct {
 	} `json:"users"`
 }
 
-func readHy2Users(path string) ([]int, []string, error) {
+// readHy2Users returns the names and passwords of the enabled Hysteria2
+// users; the service knows each session's user by its name.
+func readHy2Users(path string) ([]string, []string, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, nil, err
@@ -57,15 +59,14 @@ func readHy2Users(path string) ([]int, []string, error) {
 	if err := json.Unmarshal(b, &f); err != nil {
 		return nil, nil, err
 	}
-	var ids []int
-	var passwords []string
-	for i, u := range f.Users {
+	var names, passwords []string
+	for _, u := range f.Users {
 		if u.Enabled && u.Hy2 != nil && u.Hy2.Password != "" {
-			ids = append(ids, i)
+			names = append(names, u.Name)
 			passwords = append(passwords, u.Hy2.Password)
 		}
 	}
-	return ids, passwords, nil
+	return names, passwords, nil
 }
 
 // runHysteria serves a Hysteria2 backend on the front's datagrams.
@@ -101,7 +102,7 @@ func runHysteria(ctx context.Context, c *BackendConfig, conn *packetConn, log *L
 		}
 		defer stop()
 	}
-	service, err := hysteria2.NewService[int](hysteria2.ServiceOptions{
+	service, err := hysteria2.NewService[string](hysteria2.ServiceOptions{
 		ConnectionHook:     live.hook,
 		Context:            ctx,
 		Logger:             nopLogger(),
@@ -120,13 +121,13 @@ func runHysteria(ctx context.Context, c *BackendConfig, conn *packetConn, log *L
 		return err
 	}
 	reload := func() error {
-		ids, passwords, err := readHy2Users(c.UsersFile)
+		names, passwords, err := readHy2Users(c.UsersFile)
 		if err != nil {
 			return err
 		}
 		// The vendored sing-quic swaps the table atomically.
-		service.UpdateUsers(ids, passwords)
-		log.Infof("%d users", len(ids))
+		service.UpdateUsers(names, passwords)
+		log.Infof("%d users", len(names))
 		return nil
 	}
 	if err := reload(); err != nil {
