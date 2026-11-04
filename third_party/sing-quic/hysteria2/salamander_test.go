@@ -19,8 +19,12 @@ func slowXOR(dst, src []byte, key *[blake2b.Size256]byte, off int) {
 func TestSalamanderXOR(t *testing.T) {
 	var key [blake2b.Size256]byte
 	rand.Read(key[:])
-	for _, n := range []int{0, 1, 31, 32, 33, 1452, 2047, 2048, 2049, 5000} {
-		for _, off := range []int{0, 5, 32, 77} {
+	sizes := []int{1452, 2047, 2048, 2049, 5000}
+	for n := range 100 {
+		sizes = append(sizes, n)
+	}
+	for _, n := range sizes {
+		for off := range 70 {
 			src := make([]byte, n)
 			rand.Read(src)
 			want, got := make([]byte, n), make([]byte, n)

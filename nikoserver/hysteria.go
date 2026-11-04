@@ -21,6 +21,7 @@ import (
 	sbtls "github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	qtls "github.com/sagernet/sing-quic"
 	"github.com/sagernet/sing-quic/hysteria"
 	"github.com/sagernet/sing-quic/hysteria2"
 	"github.com/sagernet/sing/common/buf"
@@ -102,7 +103,16 @@ func runHysteria(ctx context.Context, c *BackendConfig, conn *packetConn, log *L
 		}
 		defer stop()
 	}
+	// The front sends with DF set (probeMTU): salamander's 8 bytes of salt
+	// come on top of quic-go's first packets of 1280, so they start 8 bytes
+	// smaller and leave the front at 1280 like every other QUIC on it. Path
+	// MTU discovery then counts only what came through, the salt included.
+	var quicOptions qtls.QUICOptions
+	if salamander != "" {
+		quicOptions.InitialPacketSize = 1280 - 8
+	}
 	service, err := hysteria2.NewService[string](hysteria2.ServiceOptions{
+		QUICOptions:        quicOptions,
 		ConnectionHook:     live.hook,
 		Context:            ctx,
 		Logger:             nopLogger(),
