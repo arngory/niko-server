@@ -18,8 +18,9 @@ import (
 
 // Stats of the Hysteria2 sessions of a backend, for raycontrol's channel
 // probes (its probe-v1, "link"): what the server knows of the connections
-// from one client address. Aggregates only: several people may share an
-// address behind carrier-grade NAT.
+// from one client address. Aggregates only, since several people may share
+// an address behind carrier-grade NAT; asked with a user's name, the
+// sessions of that user from the address one by one as well (own).
 
 // HysteriaStats answers a stats query.
 type HysteriaStats struct {
@@ -36,6 +37,23 @@ type HysteriaStats struct {
 		RateBps     Spread      `json:"rate_bps"`
 		AckRate     FloatSpread `json:"ack_rate"`
 	} `json:"brutal"`
+	// Own are the sessions of the user named in the query (and of its
+	// rotating variants, name-*), one by one; absent without a name.
+	Own []SessionStats `json:"own,omitempty"`
+}
+
+// SessionStats is one session of the asking user.
+type SessionStats struct {
+	RTTus       uint64 `json:"rtt_us"`
+	MinRTTus    uint64 `json:"min_rtt_us"`
+	PacketsSent uint64 `json:"packets_sent"`
+	PacketsLost uint64 `json:"packets_lost"`
+	// Brutal: the rate the server sends at and its acknowledged share;
+	// absent when the client left the rate to the server (BBR).
+	Brutal *struct {
+		RateBps uint64  `json:"rate_bps"`
+		AckRate float64 `json:"ack_rate"`
+	} `json:"brutal,omitempty"`
 }
 
 // Spread is the minimum, median and maximum over the connections.
@@ -75,17 +93,19 @@ type sessions struct {
 }
 
 type session struct {
+	user  string
 	stats func() hysteria2.ConnectionStats
 }
 
 // hook is the service's ConnectionHook.
-func (t *sessions) hook(remote net.Addr, stats func() hysteria2.ConnectionStats, done <-chan struct{}) {
+func (t *sessions) hook(remote net.Addr, user any, stats func() hysteria2.ConnectionStats, done <-chan struct{}) {
 	ap, err := netip.ParseAddrPort(remote.String())
 	if err != nil {
 		return
 	}
 	ip := ap.Addr().Unmap()
-	s := &session{stats: stats}
+	name, _ := user.(string)
+	s := &session{user: name, stats: stats}
 	t.mu.Lock()
 	if t.byIP == nil {
 		t.byIP = map[netip.Addr]map[*session]bool{}
@@ -106,7 +126,13 @@ func (t *sessions) hook(remote net.Addr, stats func() hysteria2.ConnectionStats,
 	}()
 }
 
-func (t *sessions) stats(ip netip.Addr) HysteriaStats {
+// owns reports whether a session's user is name or one of its variants
+// (name-n, name-p while a credential rotates).
+func owns(user, name string) bool {
+	return name != "" && (user == name || strings.HasPrefix(user, name+"-"))
+}
+
+func (t *sessions) stats(ip netip.Addr, name string) HysteriaStats {
 	t.mu.Lock()
 	var list []*session
 	for s := range t.byIP[ip.Unmap()] {
@@ -118,6 +144,17 @@ func (t *sessions) stats(ip netip.Addr) HysteriaStats {
 	var acks []float64
 	for _, s := range list {
 		c := s.stats()
+		if owns(s.user, name) {
+			own := SessionStats{RTTus: uint64(c.SmoothedRTT.Microseconds()), MinRTTus: uint64(c.MinRTT.Microseconds()),
+				PacketsSent: c.PacketsSent, PacketsLost: c.PacketsLost}
+			if c.Brutal {
+				own.Brutal = &struct {
+					RateBps uint64  `json:"rate_bps"`
+					AckRate float64 `json:"ack_rate"`
+				}{c.RateBPS * 8, c.AckRate}
+			}
+			st.Own = append(st.Own, own)
+		}
 		st.Connections++
 		rtts = append(rtts, uint64(c.SmoothedRTT.Microseconds()))
 		if m := uint64(c.MinRTT.Microseconds()); m > 0 && (st.MinRTTus == 0 || m < st.MinRTTus) {
@@ -140,8 +177,9 @@ func (t *sessions) stats(ip netip.Addr) HysteriaStats {
 }
 
 // serveStats answers on a unix socket: a client address on one line in,
-// HysteriaStats as JSON out. The socket's directory keeps it to the
-// service's group (raycontrol's rayd).
+// optionally followed by a space and a user's name, HysteriaStats as JSON
+// out. The socket's directory keeps it to the service's group (raycontrol's
+// rayd).
 func (t *sessions) serveStats(path string, log *Logger) (func(), error) {
 	_ = os.Remove(path)
 	ln, err := net.Listen("unix", path)
@@ -161,12 +199,13 @@ func (t *sessions) serveStats(path string, log *Logger) (func(), error) {
 			go func() {
 				defer c.Close()
 				_ = c.SetDeadline(time.Now().Add(2 * time.Second))
-				line, err := bufio.NewReader(&limitedReader{c, 64}).ReadString('\n')
-				ip, perr := netip.ParseAddr(strings.TrimSpace(line))
+				line, err := bufio.NewReader(&limitedReader{c, 192}).ReadString('\n')
+				addr, name, _ := strings.Cut(strings.TrimSpace(line), " ")
+				ip, perr := netip.ParseAddr(addr)
 				if err != nil || perr != nil {
 					return
 				}
-				_ = json.NewEncoder(c).Encode(t.stats(ip))
+				_ = json.NewEncoder(c).Encode(t.stats(ip, strings.TrimSpace(name)))
 			}()
 		}
 	}()
