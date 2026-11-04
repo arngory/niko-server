@@ -187,13 +187,13 @@ func TestNekoServerHysteria(t *testing.T) {
 	bconn.Write([]byte("brutal"))
 	io.ReadFull(bconn, make([]byte, 6))
 	defer bconn.Close()
-	query := func(ip string) HysteriaStats {
+	query := func(line string) HysteriaStats {
 		c, err := net.Dial("unix", filepath.Join(dir, "hy2-masq-stats.sock"))
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer c.Close()
-		fmt.Fprintln(c, ip)
+		fmt.Fprintln(c, line)
 		var st HysteriaStats
 		if err := json.NewDecoder(c).Decode(&st); err != nil {
 			t.Fatal(err)
@@ -207,6 +207,33 @@ func TestNekoServerHysteria(t *testing.T) {
 	}
 	if other := query("203.0.113.9"); other.Connections != 0 {
 		t.Fatalf("another address: %+v", other)
+	}
+	if st.Own != nil {
+		t.Fatalf("sessions one by one without a name: %+v", st.Own)
+	}
+	// With the user's name: that user's sessions one by one, beside the
+	// aggregates of the address; another user's name sees none of them.
+	own := query("127.0.0.1 u-0")
+	brutal := 0
+	for _, s := range own.Own {
+		if s.RTTus == 0 || s.PacketsSent == 0 {
+			t.Fatalf("own session %+v", s)
+		}
+		if s.Brutal != nil {
+			brutal++
+			if s.Brutal.RateBps != 10*1000*1000 || s.Brutal.AckRate <= 0 || s.Brutal.AckRate > 1 {
+				t.Fatalf("own Brutal %+v", s.Brutal)
+			}
+		}
+	}
+	if len(own.Own) != 2 || brutal != 1 || own.Connections != 2 {
+		t.Fatalf("own sessions %+v", own)
+	}
+	if got := query("127.0.0.1 u-1"); len(got.Own) != 0 || got.Connections != 2 {
+		t.Fatalf("another user sees %+v", got)
+	}
+	if !owns("u7-n", "u7") || !owns("u7", "u7") || owns("u70", "u7") || owns("u7", "") {
+		t.Fatal("owns")
 	}
 
 	ppc, err := pcl.ListenPacket(ctx)
