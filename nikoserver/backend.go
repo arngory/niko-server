@@ -72,7 +72,18 @@ func RunBackend(ctx context.Context, c *BackendConfig, log *Logger) error {
 		if err != nil {
 			return envError("dnstt key %s: %v", c.Options.PrivateKeyFile, err)
 		}
-		err = dnsttserver.Run(key, strings.TrimSuffix(c.Options.Zone, "."), conn, dialInner)
+		// dnsauth-v1: queries signed by the devices' keys (raycontrol S-9).
+		mode, _ := dnsttserver.ParseAuthMode(c.Options.Auth)
+		var auth *dnsttserver.Auth
+		if mode != dnsttserver.AuthOff {
+			auth = &dnsttserver.Auth{Mode: mode}
+			if err := auth.LoadKeys(c.Options.AuthKeysFile); err != nil {
+				return envError("dnstt auth keys %s: %v", c.Options.AuthKeysFile, err)
+			}
+			go auth.WatchKeys(c.Options.AuthKeysFile, 5*time.Second, ctx.Done(), log.Infof)
+			log.Infof("dnstt: queries need the device's tag (dnsauth-v1, %s)", c.Options.Auth)
+		}
+		err = dnsttserver.RunAuth(key, strings.TrimSuffix(c.Options.Zone, "."), conn, dialInner, auth)
 		if ctx.Err() != nil {
 			return nil
 		}

@@ -10,6 +10,7 @@ package nikoserver
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/arngory/niko-server/dnsttserver"
 	"net/netip"
 	"net/url"
 	"os"
@@ -104,6 +105,11 @@ type BackendOptions struct {
 	// dnstt
 	Zone           string `json:"zone,omitempty"`
 	PrivateKeyFile string `json:"private_key_file,omitempty"`
+	// dnstt: dnsauth-v1 (raycontrol docs/spec/dnsauth-v1.md): off,
+	// optional or required, and the devices' keys ("<id> <hex>" per line,
+	// reread when the file changes).
+	Auth         string `json:"auth,omitempty"`
+	AuthKeysFile string `json:"auth_keys_file,omitempty"`
 	// masterdns
 	Zones             []string `json:"zones,omitempty"`
 	EncryptionMethod  *int     `json:"encryption_method,omitempty"`
@@ -290,6 +296,11 @@ func (c *BackendConfig) validate() []ConfigError {
 			e.add("options.zone", "not a DNS name: %q", c.Options.Zone)
 		}
 		checkSocket(&e, "options.private_key_file", c.Options.PrivateKeyFile)
+		if mode, err := dnsttserver.ParseAuthMode(c.Options.Auth); err != nil {
+			e.add("options.auth", "%v", err)
+		} else if mode != dnsttserver.AuthOff {
+			checkSocket(&e, "options.auth_keys_file", c.Options.AuthKeysFile)
+		}
 	case "masterdns":
 		if len(c.Options.Zones) == 0 {
 			e.add("options.zones", "no zones")
@@ -363,6 +374,9 @@ func (c *BackendConfig) validate() []ConfigError {
 	}
 	if c.Kind != "yggdrasil" && (len(c.Options.ExitPorts) > 0 || len(c.Options.Peers) > 0) {
 		e.add("options", "exit_ports and peers are Yggdrasil options")
+	}
+	if c.Kind != "dnstt" && (c.Options.Auth != "" || c.Options.AuthKeysFile != "") {
+		e.add("options", "auth and auth_keys_file are dnstt options")
 	}
 	if c.Kind == "dnstt" || c.Kind == "masterdns" || c.Kind == "yggdrasil" {
 		if c.Inner == "" {
