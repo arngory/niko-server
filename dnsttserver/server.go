@@ -286,7 +286,7 @@ func nextPacket(r *bytes.Reader) ([]byte, error) {
 // the returned dns.Message is nil, it means that there should be no response to
 // this query. If the returned dns.Message has an Rcode() of dns.RcodeNoError,
 // the message is a candidate for for carrying downstream data in a TXT record.
-func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
+func responseFor(query *dns.Message, domain dns.Name, auth *Auth) (*dns.Message, []byte) {
 	resp := &dns.Message{
 		ID:       query.ID,
 		Flags:    0x8000, // QR = 1, RCODE = no error
@@ -398,6 +398,14 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 	}
 	payload = payload[:n]
 
+	// dnsauth-v1 (neko): the tag before anything that is dnstt's own, so a
+	// query without a valid one learns nothing, not even the FORMERR below
+	// for a small payload size: the zone answers as an empty one.
+	if payload, ok = auth.Check(payload); !ok {
+		resp.Flags |= dns.RcodeNameError
+		return resp, nil
+	}
+
 	// We require clients to support EDNS(0) with a minimum payload size;
 	// otherwise we would have to set a small KCP MTU (only around 200
 	// bytes). https://tools.ietf.org/html/rfc6891#section-7 "If there is a
@@ -443,16 +451,7 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 			continue
 		}
 
-		resp, payload := responseFor(&query, domain)
-		// dnsauth-v1 (neko): the tag goes first; without a valid one the
-		// zone answers as an empty one.
-		if resp != nil && resp.Rcode() == dns.RcodeNoError && payload != nil {
-			var ok bool
-			if payload, ok = auth.Check(payload); !ok {
-				resp.Flags |= dns.RcodeNameError
-				payload = nil
-			}
-		}
+		resp, payload := responseFor(&query, domain, auth)
 		// Extract the ClientID from the payload.
 		var clientID turbotunnel.ClientID
 		n = copy(clientID[:], payload)
@@ -678,7 +677,7 @@ func computeMaxEncodedPayload(limit int) int {
 			},
 		},
 	}
-	resp, _ := responseFor(query, dns.Name([][]byte{}))
+	resp, _ := responseFor(query, dns.Name([][]byte{}), nil)
 	// As in sendLoop.
 	resp.Answer = []dns.RR{
 		{
