@@ -428,7 +428,7 @@ type record struct {
 // the incoming DNS queries, and puts them on ttConn's incoming queue. Whenever
 // a query calls for a response, constructs a partial response and passes it to
 // sendLoop over ch.
-func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record) error {
+func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, auth *Auth) error {
 	for {
 		var buf [4096]byte
 		n, addr, err := dnsConn.ReadFrom(buf[:])
@@ -444,6 +444,15 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 		}
 
 		resp, payload := responseFor(&query, domain)
+		// dnsauth-v1 (neko): the tag goes first; without a valid one the
+		// zone answers as an empty one.
+		if resp != nil && resp.Rcode() == dns.RcodeNoError && payload != nil {
+			var ok bool
+			if payload, ok = auth.Check(payload); !ok {
+				resp.Flags |= dns.RcodeNameError
+				payload = nil
+			}
+		}
 		// Extract the ClientID from the payload.
 		var clientID turbotunnel.ClientID
 		n = copy(clientID[:], payload)
@@ -728,14 +737,20 @@ func ReadKey(filename string) ([]byte, error) { return readKeyFromFile(filename)
 // Run serves the tunnel for domain on dnsConn until one of its loops stops; the
 // caller should then exit, as dnstt-server does since v1.20260501.0.
 func Run(privkey []byte, domain string, dnsConn net.PacketConn, upstream Dialer) error {
+	return RunAuth(privkey, domain, dnsConn, upstream, nil)
+}
+
+// RunAuth is Run with dnsauth-v1 (neko): auth checks the tags of queries;
+// nil takes queries without them.
+func RunAuth(privkey []byte, domain string, dnsConn net.PacketConn, upstream Dialer, auth *Auth) error {
 	name, err := dns.ParseName(domain)
 	if err != nil {
 		return fmt.Errorf("invalid domain %+q: %v", domain, err)
 	}
-	return run(privkey, name, upstream, dnsConn)
+	return run(privkey, name, upstream, dnsConn, auth)
 }
 
-func run(privkey []byte, domain dns.Name, upstream Dialer, dnsConn net.PacketConn) error {
+func run(privkey []byte, domain dns.Name, upstream Dialer, dnsConn net.PacketConn, auth *Auth) error {
 	defer dnsConn.Close()
 
 	log.Printf("pubkey %x", noise.PubkeyFromPrivkey(privkey))
@@ -797,7 +812,7 @@ func run(privkey []byte, domain dns.Name, upstream Dialer, dnsConn net.PacketCon
 
 	go func() {
 		defer done()
-		err := recvLoop(domain, dnsConn, ttConn, ch)
+		err := recvLoop(domain, dnsConn, ttConn, ch, auth)
 		close(ch)
 		if err != nil {
 			log.Printf("recvLoop: %v", err)

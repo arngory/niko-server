@@ -43,6 +43,11 @@ func TestNekoServerConfigCheck(t *testing.T) {
 	if errs := checkConfig(t, dnstt); len(errs) > 0 {
 		t.Fatal(errs)
 	}
+	// dnsauth-v1 (raycontrol S-9).
+	authed := strings.Replace(dnstt, `"zone":"t.example.com"`, `"zone":"t.example.com","auth":"optional","auth_keys_file":"/var/lib/raycontrol/rendered/dns/auth.keys"`, 1)
+	if errs := checkConfig(t, authed); len(errs) > 0 {
+		t.Fatal(errs)
+	}
 	masterdns := `{"schema":1,"role":"backend","kind":"masterdns","socket":"/run/niko/mdns/packet.sock","front_uid":9100,
 		"options":{"zones":["v.example.com"],"encryption_method":5,"encryption_key_file":"/run/credentials/niko-mdns.service/encryption.key"},
 		"inner":"/run/niko/inner/vless.sock"}`
@@ -87,6 +92,8 @@ func TestNekoServerConfigCheck(t *testing.T) {
 		"options.encryption_method": strings.Replace(masterdns, `"encryption_method":5`, `"encryption_method":2`, 1),
 		"inner":                     strings.Replace(dnstt, `"inner":"/run/niko/inner/vless.sock"`, `"inner":"relative.sock"`, 1),
 		"kind":                      strings.Replace(dnstt, `"kind":"dnstt"`, `"kind":"naive"`, 1),
+		"options.auth":              strings.Replace(dnstt, `"zone":"t.example.com"`, `"zone":"t.example.com","auth":"strict"`, 1),
+		"options.auth_keys_file":    strings.Replace(dnstt, `"zone":"t.example.com"`, `"zone":"t.example.com","auth":"required"`, 1),
 	} {
 		errs := checkConfig(t, content)
 		found := false
