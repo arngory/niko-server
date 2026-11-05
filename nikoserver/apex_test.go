@@ -5,7 +5,9 @@ package nikoserver
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"os"
+	"strings"
 	"testing"
 
 	"www.bamsoftware.com/git/dnstt.git/dns"
@@ -51,6 +53,28 @@ func TestApex(t *testing.T) {
 		os.WriteFile(dir+"/soa.bin", soaWire, 0o644)
 		os.WriteFile(dir+"/ns.bin", nsWire, 0o644)
 		os.WriteFile(dir+"/nodata.bin", nodataWire, 0o644)
+	}
+
+	// Names too long for the requester's size: TC and no records, never
+	// more than it asked for; with room, all of them.
+	long := make([]string, 8)
+	for i := range long {
+		long[i] = strings.Repeat("n", 60) + "." + strings.Repeat("s", 60) + "." + strings.Repeat("q", 60) + fmt.Sprintf(".example%d.com", i)
+	}
+	big := newApexZone("t.example.com", long, 1)
+	for _, edns := range []int{0, 1232, 4096} {
+		reply, ok := big.answer(probeQuery("t.example.com", 2, edns))
+		if !ok {
+			t.Fatalf("EDNS %d: not answered", edns)
+		}
+		m, err := dns.MessageFromWireFormat(reply)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fits := edns >= 4096
+		if limit := max(512, edns); len(reply) > limit || (m.Flags&0x0200 != 0) == fits || (len(m.Answer) == 8) != fits {
+			t.Fatalf("EDNS %d: %d bytes, flags %#x, %d answers", edns, len(reply), m.Flags, len(m.Answer))
+		}
 	}
 
 	// Left to the backend.

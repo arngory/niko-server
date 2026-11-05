@@ -68,6 +68,7 @@ func (a *apexZone) answer(query []byte) (reply []byte, ok bool) {
 		return nil, false
 	}
 	resp := dns.Message{ID: q.ID, Flags: 0x8400, Question: q.Question}
+	limit := 512 // the requester's size: 512 without OPT (RFC 1035, 6891)
 	for _, rr := range q.Additional {
 		if rr.Type != dns.RRTypeOPT {
 			continue
@@ -76,6 +77,7 @@ func (a *apexZone) answer(query []byte) (reply []byte, ok bool) {
 			return nil, false
 		}
 		resp.Additional = []dns.RR{{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 4096, TTL: 0, Data: []byte{}}}
+		limit = max(limit, int(rr.Class))
 	}
 	name, question := q.Question[0].Name, q.Question[0]
 	soa := dns.RR{Name: name, Type: apexType, Class: dns.ClassIN, TTL: apexTTL, Data: a.soa}
@@ -94,6 +96,15 @@ func (a *apexZone) answer(query []byte) (reply []byte, ok bool) {
 	wire, err := resp.WireFormat()
 	if err != nil {
 		return nil, false
+	}
+	if len(wire) > limit {
+		// Long names that do not fit: TC and no records, for the
+		// resolver to ask again over TCP. Never more than was asked for.
+		resp.Answer, resp.Authority = nil, nil
+		resp.Flags |= 0x0200
+		if wire, err = resp.WireFormat(); err != nil {
+			return nil, false
+		}
 	}
 	return wire, true
 }
