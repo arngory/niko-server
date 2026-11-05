@@ -262,7 +262,9 @@ func (a *Auth) Check(payload []byte) (rest []byte, ok bool) {
 	case tagKnown:
 		return untagged() // no key explained this head before
 	case tagKnownBusy:
-		a.Throttled.Add(1)
+		if a.Mode != AuthOptional {
+			a.Throttled.Add(1) // refused for the budget; optional takes it
+		}
 		return untagged()
 	}
 	a.remember(head)
@@ -295,7 +297,7 @@ const knownRescan = 30 * time.Second
 func (a *Auth) validLocked(payload []byte, head turbotunnel.ClientID) tagResult {
 	keys := a.keys.Load()
 	if keys == nil || len(keys.keys) == 0 {
-		if _, known := a.known(head, time.Now()); known {
+		if _, known := a.known(head, a.clock()); known {
 			return tagKnown
 		}
 		return tagInvalid
@@ -368,13 +370,17 @@ func (a *Auth) validLocked(payload []byte, head turbotunnel.ClientID) tagResult 
 
 // refill brings the budget up to now and returns it with its ceiling. The
 // rate is ScanHMACs, or by default 100000 a second and at least 20 full
-// scans of n devices; two seconds' worth may go at once. A scan may start
+// scans of n devices, never under two full scans; two seconds' worth may go
+// at once. A scan may start
 // while the budget is above zero and leave it below.
 func (a *Auth) refill(now time.Time, n int) (tokens, burst float64) {
 	rate := a.ScanHMACs
 	if rate <= 0 {
 		rate = max(100000, float64(3*n*20))
 	}
+	// Two full scans a second at least: one can go to a copied tag and one
+	// to the genuine query right behind it.
+	rate = max(rate, float64(6*n))
 	burst = 2 * rate
 	if a.last.IsZero() {
 		a.tokens = burst
