@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -220,10 +221,11 @@ func TestAuthScanBudget(t *testing.T) {
 	}
 }
 
-// An old client's untagged ClientID is scanned once: in required mode it is
-// then refused without spending the budget, so a flood of untagged queries
-// (old clients after the switch to required) leaves room for new sessions;
-// in optional mode it is taken, and stays known while the client asks.
+// An old client's untagged ClientID is remembered after a scan. While it is
+// young it is scanned again only above half the budget; then never: a flood
+// of untagged queries (old clients after the switch to required) leaves
+// room for new sessions and costs nothing in the long run. In optional mode
+// it is taken, and stays known while the client asks.
 func TestAuthUnknownHeads(t *testing.T) {
 	var dev [32]byte
 	rand.Read(dev[:])
@@ -240,8 +242,19 @@ func TestAuthUnknownHeads(t *testing.T) {
 	}
 	body := append([]byte("NEWCLIEN"), 0xe0)
 	tag := Tag(&dev, EpochOf(now), body)
-	if _, ok := r.Check(append(tag[:], body...)); !ok || r.Throttled.Load() != 0 {
+	if _, ok := r.Check(append(tag[:], body...)); !ok {
 		t.Fatalf("a new session after an untagged flood: throttled %d", r.Throttled.Load())
+	}
+	// Past the rescan window the old client is free, even with a full
+	// budget.
+	now = now.Add(time.Hour)
+	r.Check(old) // refills
+	before := r.tokens
+	for range 100 {
+		r.Check(old)
+	}
+	if r.tokens != before {
+		t.Fatalf("an old client past the window cost %v HMACs", before-r.tokens)
 	}
 
 	o := &Auth{Mode: AuthOptional, Now: func() time.Time { return now }, ScanHMACs: 0.001}
@@ -261,13 +274,13 @@ func TestAuthUnknownHeads(t *testing.T) {
 			}
 		}
 	}
-	if o.Throttled.Load() != 0 || len(o.unknown)+len(o.unknownPrev) != 1 {
-		t.Fatalf("throttled %d, unknown %d+%d", o.Throttled.Load(), len(o.unknown), len(o.unknownPrev))
+	if len(o.unknown)+len(o.unknownPrev) != 1 {
+		t.Fatalf("unknown %d+%d", len(o.unknown), len(o.unknownPrev))
 	}
 	// Generations turn over while the old client asks: it moves along.
 	for i := range 3 * authCacheMax {
 		o.remember([8]byte{byte(i), byte(i >> 8), byte(i >> 16), 1})
-		if i%1000 == 0 && !o.known([8]byte(old[:8])) {
+		if _, ok := o.known([8]byte(old[:8]), now); i%1000 == 0 && !ok {
 			t.Fatalf("old client forgotten after %d others", i)
 		}
 	}
@@ -376,5 +389,27 @@ func TestAuthCopiedTag(t *testing.T) {
 		if rest, ok := a.Check(n); !ok || !bytes.Equal(rest, n[AuthTagLen:]) {
 			t.Fatalf("mode %d: a new session after a copied tag: ok %v rest %q", mode, ok, rest)
 		}
+	}
+}
+
+// A budget set below one full scan (auth_scan_hmacs < 3 x devices) still
+// scans a copied head again when the budget is full.
+func TestAuthSmallBudgetCopiedTag(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	var keys strings.Builder
+	var dev [32]byte
+	for i := range 50 {
+		rand.Read(dev[:])
+		fmt.Fprintf(&keys, "d%d %s\n", i, hex.EncodeToString(dev[:]))
+	}
+	a := &Auth{Mode: AuthRequired, Now: func() time.Time { return now }, ScanHMACs: 100} // 150 a scan
+	a.SetKeys([]byte(keys.String()))
+	body := append([]byte("SESSION1"), 0xe0)
+	tag := Tag(&dev, EpochOf(now), body)
+	q := append(tag[:], body...)
+	a.Check(append(bytes.Clone(q[:AuthTagLen]), "GARBAGE!"...))
+	now = now.Add(5 * time.Second) // the budget is full again
+	if _, ok := a.Check(q); !ok {
+		t.Fatal("the genuine query after a copied tag, with a full budget")
 	}
 }
