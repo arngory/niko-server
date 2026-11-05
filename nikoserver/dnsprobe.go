@@ -3,49 +3,49 @@
 package nikoserver
 
 import (
-	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base32"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"net/netip"
 	"os"
 	"strings"
 	"sync"
 	"time"
+
+	"www.bamsoftware.com/git/dnstt.git/dns"
 )
 
 // dnsprobe-v1 (raycontrol docs/spec/dnsprobe-v1.md): a client checks a
 // resolver for a DNS tunnel by asking it for one label under the tunnel's
 // zone. With the node's key in it, the front answers itself, before the
 // backend and dnsauth; without, the query is the tunnel's like any other.
+// The answer is built as dnstt builds its own, its TXT data encrypted, so
+// that on the wire it is one more answer of the tunnel.
 const (
 	probeLabelBytes = 24
 	probeLabelLen   = 39 // base32 of 24 bytes, no padding
 	probeVersion    = 1
 	probeSkew       = 2 // minutes either way
-	probeKeep       = 5 // minutes a nonce is remembered
-	probeSeenMax    = 8192
 	probeSourcesMax = 4096
 	// Token buckets: per source /24 or /48, and one for all; a small probe
 	// costs 1, a large one 8.
 	probeRate, probeBurst             = 20, 40
 	probeGlobalRate, probeGlobalBurst = 400, 800
 	probeSmallCost, probeLargeCost    = 1, 8
-	// probeUDPSize is the EDNS size the answers give, and the most a large
-	// one may need.
-	probeUDPSize = 1232
-	probeFillers = 4
-	probeFiller  = 240
+	// The plaintext of an answer: the token, what the node saw, and for a
+	// large probe zeros up to probeLarge bytes.
+	probeTokenLen = 16
+	probeSmall    = probeTokenLen + 2 + 1 + 16
+	probeLarge    = 900
+	// As dnstt answers: TTL and the responder's EDNS size.
+	probeTTL     = 60
+	probeOPTSize = 4096
 )
 
 var probeBase32 = base32.StdEncoding.WithPadding(base32.NoPadding)
-
-// probeFillerString is a large answer's filler: "0123456789" 24 times.
-var probeFillerString = []byte(strings.Repeat("0123456789", probeFiller/10))
 
 type tokenBucket struct {
 	tokens float64
@@ -68,12 +68,15 @@ func (b *tokenBucket) take(cost, rate, burst float64, now time.Time) bool {
 
 type dnsProbe struct {
 	key []byte
+	enc []byte // the keystream's key, from key
 	now func() time.Time
 
-	mu      sync.Mutex
-	seen    map[[8]byte]uint32 // nonce -> minute
-	sources map[netip.Prefix]*tokenBucket
-	global  tokenBucket
+	mu sync.Mutex
+	// The sources' buckets in two generations: a source not seen for a
+	// generation or two is forgotten, so many cannot crowd out the rest.
+	sources, older map[netip.Prefix]*tokenBucket
+	swapped        time.Time
+	global         tokenBucket
 }
 
 // loadProbeKey reads the probe key: 32 bytes in hex.
@@ -90,7 +93,8 @@ func loadProbeKey(path string) (*dnsProbe, error) {
 }
 
 func newDNSProbe(key []byte) *dnsProbe {
-	return &dnsProbe{key: key, now: time.Now, seen: map[[8]byte]uint32{}, sources: map[netip.Prefix]*tokenBucket{}}
+	return &dnsProbe{key: key, enc: probeMAC(key, []byte("dnsprobe-v1 e")), now: time.Now,
+		sources: map[netip.Prefix]*tokenBucket{}, older: map[netip.Prefix]*tokenBucket{}}
 }
 
 func probeMAC(key []byte, parts ...[]byte) []byte {
@@ -114,9 +118,32 @@ func probeLabel(key []byte, zone string, large bool, minute uint32, nonce [8]byt
 	return strings.ToLower(probeBase32.EncodeToString(b[:]))
 }
 
-// probeToken is the first string of an answer to label bytes b.
-func probeToken(key, b []byte) string {
-	return "v1 " + strings.ToLower(probeBase32.EncodeToString(probeMAC(key, []byte("dnsprobe-v1 a"), b)[:16]))
+// probeCrypt XORs p with the keystream of a label's bytes b: blocks of
+// HMAC-SHA256(enc, b ‖ uint32 counter). The same call decrypts.
+func probeCrypt(enc, b, p []byte) {
+	var ctr [4]byte
+	for i := 0; i < len(p); i += sha256.Size {
+		binary.BigEndian.PutUint32(ctr[:], uint32(i/sha256.Size))
+		block := probeMAC(enc, b, ctr[:])
+		for j := 0; j < sha256.Size && i+j < len(p); j++ {
+			p[i+j] ^= block[j]
+		}
+	}
+}
+
+// probePlain is an answer's plaintext: the token, what the node saw (the
+// EDNS size the resolver advertised, 0 for none; whether it randomised the
+// name's case; its address), and zeros up to size.
+func probePlain(key, b []byte, edns int, mixed bool, src netip.Addr, size int) []byte {
+	p := make([]byte, size)
+	copy(p, probeMAC(key, []byte("dnsprobe-v1 a"), b)[:probeTokenLen])
+	binary.BigEndian.PutUint16(p[probeTokenLen:], uint16(edns))
+	if mixed {
+		p[probeTokenLen+2] = 1
+	}
+	a := src.As16()
+	copy(p[probeTokenLen+3:], a[:])
+	return p
 }
 
 // answer handles a query for name (lowercase) in zone from src: probe is
@@ -131,10 +158,7 @@ func (p *dnsProbe) answer(query []byte, name string, questionEnd int, zone strin
 		return nil, false
 	}
 	b, err := probeBase32.DecodeString(strings.ToUpper(label))
-	// The canonical form only: another spelling of the same bytes would be
-	// a fresh label for the same nonce.
-	if err != nil || len(b) != probeLabelBytes || b[0] != probeVersion || b[1] > 1 ||
-		strings.ToLower(probeBase32.EncodeToString(b)) != label {
+	if err != nil || len(b) != probeLabelBytes || b[0] != probeVersion || b[1] > 1 {
 		return nil, false
 	}
 	if !hmac.Equal(b[14:], probeMAC(p.key, []byte("dnsprobe-v1 q"), []byte(zone), b[:14])[:10]) {
@@ -142,66 +166,66 @@ func (p *dnsProbe) answer(query []byte, name string, questionEnd int, zone strin
 	}
 	now := p.now()
 	minute := uint32(now.Unix() / 60)
-	sent := binary.BigEndian.Uint32(b[2:6])
-	if sent+probeSkew < minute || sent > minute+probeSkew {
+	if sent := binary.BigEndian.Uint32(b[2:6]); sent+probeSkew < minute || sent > minute+probeSkew {
 		return nil, false
 	}
+	q, err := dns.MessageFromWireFormat(query)
+	if err != nil || len(q.Question) != 1 {
+		return nil, false
+	}
+	// No replay set: the answer to a label is the same whoever asks, and
+	// on the wire it is one more answer of the tunnel. A censor that
+	// races the client's query to the node learns nothing, and the
+	// client still gets its answer.
 	large := b[1] == 1
 	cost := float64(probeSmallCost)
 	if large {
 		cost = probeLargeCost
 	}
-	var nonce [8]byte
-	copy(nonce[:], b[6:14])
-
-	p.mu.Lock()
-	if !p.remember(nonce, minute) {
-		p.mu.Unlock()
-		return nil, false
-	}
-	allowed := p.allow(src, cost, now)
-	p.mu.Unlock()
-	if !allowed {
+	if !p.allow(src, cost, now) {
 		return nil, true
 	}
-	return probeReply(query, questionEnd, probeToken(p.key, b), probeSeen(query, questionEnd, src), large), true
+	return probeReply(p, q, b, query[13:13+int(query[12])], src, large), true
 }
 
-// probeSeen is the answer's second string: what the node saw of the query,
-// for the client to learn about its resolver: the EDNS size it advertised
-// (0: none), whether it randomised the name's case (0x20), and its
-// address.
-func probeSeen(query []byte, questionEnd int, src netip.Addr) string {
-	mixed := 0
-	// The first label as it came, before lowercasing.
-	if n := int(query[12]); 13+n <= len(query) && bytes.ContainsFunc(query[13:13+n], func(r rune) bool { return r >= 'A' && r <= 'Z' }) {
-		mixed = 1
-	}
-	return fmt.Sprintf("seen edns=%d case=%d from=%s", ednsSize(query, questionEnd), mixed, src.Unmap())
-}
-
-// remember records a nonce, false for one seen within probeKeep minutes or
-// when there is no room: p.mu held.
-func (p *dnsProbe) remember(nonce [8]byte, minute uint32) bool {
-	if _, ok := p.seen[nonce]; ok {
-		return false
-	}
-	if len(p.seen) >= probeSeenMax {
-		for n, m := range p.seen {
-			if m+probeKeep < minute {
-				delete(p.seen, n)
-			}
-		}
-		if len(p.seen) >= probeSeenMax {
-			return false
+// probeReply builds the answer as dnstt does (responseFor, sendLoop): QR
+// and AA, the question as asked, one TXT with TTL 60, and an OPT of 4096
+// when the query had one. A large one that does not fit the requester's
+// size goes out small, as dnstt fits its answers to the requester.
+func probeReply(p *dnsProbe, q dns.Message, b, rawLabel []byte, src netip.Addr, large bool) []byte {
+	edns, hasOPT := 0, false
+	for _, rr := range q.Additional {
+		if rr.Type == dns.RRTypeOPT {
+			edns, hasOPT = int(rr.Class), true
+			break
 		}
 	}
-	p.seen[nonce] = minute
-	return true
+	mixed := strings.ToLower(string(rawLabel)) != string(rawLabel)
+	build := func(size int) []byte {
+		plain := probePlain(p.key, b, edns, mixed, src, size)
+		probeCrypt(p.enc, b, plain)
+		resp := dns.Message{ID: q.ID, Flags: 0x8400, Question: q.Question,
+			Answer: []dns.RR{{Name: q.Question[0].Name, Type: q.Question[0].Type, Class: q.Question[0].Class, TTL: probeTTL,
+				Data: dns.EncodeRDataTXT(plain)}}}
+		if hasOPT {
+			resp.Additional = []dns.RR{{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: probeOPTSize, TTL: 0, Data: []byte{}}}
+		}
+		wire, err := resp.WireFormat()
+		if err != nil {
+			return nil
+		}
+		return wire
+	}
+	if large {
+		if wire := build(probeLarge); wire != nil && len(wire) <= max(edns, 512) {
+			return wire
+		}
+	}
+	return build(probeSmall)
 }
 
 // allow takes the probe's cost from its source's bucket and the global
-// one: p.mu held.
+// one.
 func (p *dnsProbe) allow(src netip.Addr, cost float64, now time.Time) bool {
 	src = src.Unmap()
 	bits := 48
@@ -209,19 +233,16 @@ func (p *dnsProbe) allow(src netip.Addr, cost float64, now time.Time) bool {
 		bits = 24
 	}
 	prefix, _ := src.Prefix(bits)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if now.Sub(p.swapped) > time.Minute || len(p.sources) >= probeSourcesMax {
+		p.older, p.sources, p.swapped = p.sources, map[netip.Prefix]*tokenBucket{}, now
+	}
 	b := p.sources[prefix]
 	if b == nil {
-		if len(p.sources) >= probeSourcesMax {
-			for k, v := range p.sources {
-				if now.Sub(v.last) > time.Minute {
-					delete(p.sources, k)
-				}
-			}
-			if len(p.sources) >= probeSourcesMax {
-				return false
-			}
+		if b = p.older[prefix]; b == nil {
+			b = &tokenBucket{}
 		}
-		b = &tokenBucket{}
 		p.sources[prefix] = b
 	}
 	// The source first: a busy source must not spend the others' share.
@@ -229,63 +250,4 @@ func (p *dnsProbe) allow(src netip.Addr, cost float64, now time.Time) bool {
 		return false
 	}
 	return p.global.take(cost, probeGlobalRate, probeGlobalBurst, now)
-}
-
-// ednsSize is the UDP size the query's OPT record advertises, 0 without
-// one (sizes under 512 count as 512 where the answer is sized).
-func ednsSize(query []byte, questionEnd int) int {
-	if binary.BigEndian.Uint16(query[6:8]) != 0 || binary.BigEndian.Uint16(query[8:10]) != 0 ||
-		binary.BigEndian.Uint16(query[10:12]) == 0 || len(query) < questionEnd+11 {
-		return 0
-	}
-	opt := query[questionEnd:]
-	if opt[0] != 0 || binary.BigEndian.Uint16(opt[1:3]) != 41 {
-		return 0
-	}
-	return int(binary.BigEndian.Uint16(opt[3:5]))
-}
-
-// probeReply answers a probe: the token, and with large the fillers. A
-// large answer the query has no room for goes back empty with TC.
-func probeReply(query []byte, questionEnd int, token, seen string, large bool) []byte {
-	size := ednsSize(query, questionEnd)
-	var rdata []byte
-	for _, s := range []string{token, seen} {
-		rdata = append(rdata, byte(len(s)))
-		rdata = append(rdata, s...)
-	}
-	if large {
-		for range probeFillers {
-			rdata = append(rdata, probeFiller)
-			rdata = append(rdata, probeFillerString...)
-		}
-	}
-	reply := make([]byte, 0, questionEnd+12+len(rdata)+11)
-	reply = append(reply, query[:questionEnd]...)
-	reply[2] = 0x80 | 0x04 | query[2]&0x79 // QR, AA, opcode, RD
-	reply[3] = 0                           // NOERROR
-	binary.BigEndian.PutUint16(reply[4:6], 1)
-	binary.BigEndian.PutUint16(reply[6:8], 1)
-	binary.BigEndian.PutUint16(reply[8:10], 0)
-	binary.BigEndian.PutUint16(reply[10:12], 0)
-	full := len(reply) + 12 + len(rdata)
-	if size > 0 {
-		full += 11
-	}
-	limit := max(size, 512)
-	if full > limit {
-		reply[2] |= 0x02 // TC
-		binary.BigEndian.PutUint16(reply[6:8], 0)
-	} else {
-		reply = append(reply, 0xC0, 0x0C, 0, 16, 0, 1, 0, 0, 0, 0)
-		reply = binary.BigEndian.AppendUint16(reply, uint16(len(rdata)))
-		reply = append(reply, rdata...)
-	}
-	if size > 0 {
-		binary.BigEndian.PutUint16(reply[10:12], 1)
-		reply = append(reply, 0, 0, 41)
-		reply = binary.BigEndian.AppendUint16(reply, probeUDPSize)
-		reply = append(reply, 0, 0, 0, 0, 0, 0)
-	}
-	return reply
 }
