@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -72,6 +73,11 @@ func load(t *testing.T, path string) any {
 
 // startNode runs a front and one backend in process, as raycontrol renders them.
 func startNode(t *testing.T, kind, zone string, options map[string]any) (resolver string) {
+	return startNodeWith(t, kind, zone, options, "")
+}
+
+// startNodeWith is startNode with the front's dnsprobe-v1 key file.
+func startNodeWith(t *testing.T, kind, zone string, options map[string]any, probeKeyFile string) (resolver string) {
 	dir := t.TempDir()
 	uid := os.Getuid()
 	inner := echoInner(t, dir)
@@ -88,7 +94,8 @@ func startNode(t *testing.T, kind, zone string, options map[string]any) (resolve
 	writeJSON(t, frontPath, map[string]any{
 		"schema": 1, "role": "front", "log": map[string]string{"level": "warn"},
 		"backends": map[string]any{"dns": map[string]any{"socket": socket, "mode": "packet", "uid": uid}},
-		"dns":      map[string]any{"listen": []string{resolver}, "zones": []map[string]string{{"zone": zone, "backend": "dns"}}},
+		"dns": map[string]any{"listen": []string{resolver}, "zones": []map[string]string{{"zone": zone, "backend": "dns"}},
+			"probe_key_file": probeKeyFile},
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -222,4 +229,132 @@ func randomBytes(n int) []byte {
 	b := make([]byte, n)
 	rand.Read(b)
 	return b
+}
+
+// smallResolver stands for a resolver that advertises an EDNS size of 512
+// to the node and drops answers larger than that: the queries' OPT gets
+// 512, answers over 512 bytes go nowhere.
+func smallResolver(t *testing.T, node string) string {
+	t.Helper()
+	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pc.Close() })
+	up, err := net.ResolveUDPAddr("udp4", node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, client, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			q := append([]byte(nil), buf[:n]...)
+			// The OPT record is the last 11 bytes of a dnstt query.
+			if n > 11 && q[n-11] == 0 && q[n-10] == 0 && q[n-9] == 41 {
+				q[n-8], q[n-7] = 0x02, 0x00 // 512
+			}
+			go func() {
+				c, err := net.DialUDP("udp4", nil, up)
+				if err != nil {
+					return
+				}
+				defer c.Close()
+				c.Write(q)
+				c.SetReadDeadline(time.Now().Add(5 * time.Second))
+				r := make([]byte, 4096)
+				m, err := c.Read(r)
+				if err != nil || m > 512 {
+					return
+				}
+				pc.WriteTo(r[:m], client)
+			}()
+		}
+	}()
+	return pc.LocalAddr().String()
+}
+
+// A dnstt client through a resolver with EDNS 512: the session gets a
+// small MTU and goes on, slower, where dnstt answered FORMERR before.
+func TestNekoServerDNSTTSmallResolver(t *testing.T) {
+	privkey, err := noise.GeneratePrivkey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyFile := filepath.Join(t.TempDir(), "noise.key")
+	os.WriteFile(keyFile, []byte(hex.EncodeToString(privkey)+"\n"), 0o600)
+	node := startNode(t, "dnstt", "t.example.com", map[string]any{"zone": "t.example.com", "private_key_file": keyFile})
+	parsed, err := dnstt.ParseResolver("udp://" + smallResolver(t, node))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := dnstt.NewClient(dnstt.ClientOptions{
+		Context: context.Background(), Logger: logger.NOP(), Dialer: udpDialer{},
+		Domain: "t.example.com", PubKey: hex.EncodeToString(noise.PubkeyFromPrivkey(privkey)), Resolver: parsed,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	conn, err := client.DialConn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	echoRound(t, conn)
+}
+
+// The front answers dnsprobe-v1 itself, beside a dnstt backend with
+// dnsauth required (a probe never reaches it); a query without the key's
+// MAC goes to the backend as before.
+func TestNekoServerDNSProbe(t *testing.T) {
+	privkey, _ := noise.GeneratePrivkey()
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "noise.key")
+	os.WriteFile(keyFile, []byte(hex.EncodeToString(privkey)+"\n"), 0o600)
+	authFile := filepath.Join(dir, "auth.keys")
+	os.WriteFile(authFile, nil, 0o600)
+	probeKey := bytes.Repeat([]byte{5}, 32)
+	probeFile := filepath.Join(dir, "dnsprobe.key")
+	os.WriteFile(probeFile, []byte(hex.EncodeToString(probeKey)+"\n"), 0o600)
+	zone := "t.example.com"
+	node := startNodeWith(t, "dnstt", zone, map[string]any{"zone": zone, "private_key_file": keyFile,
+		"auth": "required", "auth_keys_file": authFile}, probeFile)
+
+	c, err := net.Dial("udp", node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	query := func(label string, edns int) []byte {
+		c.Write(probeQuery(label+"."+zone, 16, edns))
+		c.SetReadDeadline(time.Now().Add(3 * time.Second))
+		buf := make([]byte, 4096)
+		n, err := c.Read(buf)
+		if err != nil {
+			t.Fatalf("no answer for %s: %v", label, err)
+		}
+		return buf[:n]
+	}
+	minute := uint32(time.Now().Unix() / 60)
+	for _, large := range []bool{false, true} {
+		label := probeLabel(probeKey, zone, large, minute, [8]byte{1, byte(map[bool]int{false: 0, true: 1}[large])})
+		reply := query(label, 1232)
+		_, end, _ := queryName(probeQuery(label+"."+zone, 16, 1232))
+		_, strs := txtStrings(t, reply, end)
+		b, _ := probeBase32.DecodeString(strings.ToUpper(label))
+		if len(strs) < 2 || string(strs[0]) != probeToken(probeKey, b) || !strings.HasPrefix(string(strs[1]), "seen edns=1232 case=0 from=127.0.0.1") ||
+			large != (len(strs) == 6) {
+			t.Fatalf("large %v: %q", large, strs)
+		}
+	}
+	// Another key's label: the backend's answer, NXDOMAIN under dnsauth.
+	label := probeLabel(bytes.Repeat([]byte{6}, 32), zone, false, minute, [8]byte{2})
+	if reply := query(label, 1232); reply[3]&0x0f != 3 {
+		t.Fatalf("a label without the key: rcode %d, want NXDOMAIN from the backend", reply[3]&0x0f)
+	}
 }

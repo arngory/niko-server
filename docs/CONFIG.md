@@ -54,7 +54,8 @@ JSON Schema появится в `arngory/sing-box`, `cmd/niko-server/schema/` в
     "zones": [
       {"zone": "t5x.example.com", "backend": "dnstt"},
       {"zone": "v9c.example.com", "backend": "masterdns"}
-    ]
+    ],
+    "probe_key_file": "/run/credentials/niko-front.service/dnsprobe.key"
   },
   "backends": {
     "xray-reality": {"socket": "/run/niko/xray-reality/reality.sock", "mode": "proxy-v2", "uid": 9110},
@@ -77,6 +78,11 @@ JSON Schema появится в `arngory/sing-box`, `cmd/niko-server/schema/` в
   одна. Фронт обслуживает `dns` (с v0.1), `tcp` (с v0.2) и `udp` (с v0.3).
 - `dns.listen` занимается с SO_REUSEADDR (с v0.8.2): заглушка systemd-resolved на 127.0.0.53:53 и 127.0.0.54:53
   (тоже с SO_REUSEADDR) остаётся, датаграммы на её адреса ядро отдаёт ей, остальные — фронту.
+- `dns.probe_key_file` (необязательно, с v0.8.3): ключ dnsprobe-v1 (raycontrol `docs/spec/dnsprobe-v1.md`), 32 байта
+  в hex. С ним фронт сам отвечает на проверку резолвера клиентом: одна метка base32 под зоной с MAC этого ключа,
+  TXT. Ответ — токен с MAC, что увидела нода (размер EDNS, 0x20, адрес резолвера), у большой пробы ещё около 1 КБ
+  заполнения. Большой ответ — только по EDNS, иначе `TC`; частота ограничена по источнику (/24, /48) и в целом.
+  Запрос без верного MAC, устаревший или повторный идёт в бэкенд зоны как обычно, dnsauth пробу не касается.
 - `udp.routes[]`: в каждом маршруте либо `sni` (имя из ClientHello в QUIC Initial; ClientHello может занимать
   несколько Initial, фронт собирает его), либо `salamander_password_file` (пакет снимается этим паролем и внутри —
   QUIC Initial). Бэкенд — с режимом `packet`, датаграммы идут ему как есть (для salamander — обфусцированными).
@@ -141,7 +147,7 @@ JSON Schema появится в `arngory/sing-box`, `cmd/niko-server/schema/` в
 | `hy2-obfs` | `obfs_password_file` (тот же пароль salamander, что у фронта), `up_mbps`/`down_mbps` как у `hy2-masq`; `probe` как у `hy2-masq` |
 | `naive` | `site` — сокет бэкенда `site` для запросов без авторизации |
 | `doh` | `path_token_file`, `upstream` (DNS-серверы sing-box) |
-| `dnstt` | `zone`, `private_key_file` (hex закрытого ключа X25519, 64 символа и перевод строки, как `dnstt-server -gen-key`); необязательно `auth` (`off`, `optional`, `required`) и `auth_keys_file` — dnsauth-v1 (raycontrol `docs/spec/dnsauth-v1.md`): метка устройства в каждом запросе, без неё `NXDOMAIN`; в файле по строке `<id устройства> <ключ hex>`, перечитывается при изменении; `auth_scan_hmacs` — сколько HMAC в секунду уходит на поиск ключа запроса без известной сессии (0 — по умолчанию: 100 000 или 20 полных переборов, если устройств больше; не меньше двух полных переборов в секунду при любом значении; HMAC ≈ 0,3 мкс, так что по умолчанию это ~3% ядра, а при тысячах устройств — 18 мкс × устройства в секунду) |
+| `dnstt` | `zone`, `private_key_file` (hex закрытого ключа X25519, 64 символа и перевод строки, как `dnstt-server -gen-key`). С v0.8.3 запрос с размером EDNS меньше 1232 (или без EDNS) не получает `FORMERR`: ответы укладываются в размер запрашивающего, а сессия клиента берёт MTU по самому малому размеру, что от него приходил; запрос другого типа, чем TXT, получает `NOERROR` без записей (не `NXDOMAIN`: резолверы с минимизацией QNAME, RFC 9156 и RFC 8020). Необязательно `auth` (`off`, `optional`, `required`) и `auth_keys_file` — dnsauth-v1 (raycontrol `docs/spec/dnsauth-v1.md`): метка устройства в каждом запросе, без неё `NXDOMAIN`; в файле по строке `<id устройства> <ключ hex>`, перечитывается при изменении; `auth_scan_hmacs` — сколько HMAC в секунду уходит на поиск ключа запроса без известной сессии (0 — по умолчанию: 100 000 или 20 полных переборов, если устройств больше; не меньше двух полных переборов в секунду при любом значении; HMAC ≈ 0,3 мкс, так что по умолчанию это ~3% ядра, а при тысячах устройств — 18 мкс × устройства в секунду) |
 | `masterdns` | `zones`, `encryption_method` (только AEAD: 3–5; raycontrol — `5`, AES-256-GCM), `encryption_key_file` (ключ текстом: 32 символа для метода 5) |
 | `yggdrasil` | `private_key_file` — ключ узла (hex: seed 32 байта или ключ 64 байта, как в конфиге yggdrasil-go); `exit_ports` — порты TCP адреса узла, ведущие в `inner`; `peers` (необязательно) — исходящие пиры (`tls://`, `tcp://`, `quic://`, `ws://`, `wss://`), по умолчанию нет: клиенты подключаются напрямую (P-14). Ключи пользователей — `yggdrasil.public_key` в `users_file`. Нужны `tls` (сертификат имени `<y>`) и `inner` |
 | `site` | `root` (каталог сгенерированного сайта), `tls` как выше (сертификат `<r>` для self-steal) |

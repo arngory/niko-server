@@ -84,6 +84,13 @@ func listenDNS(ctx context.Context, network string, addr netip.AddrPort) (*net.U
 
 func runDNSFront(ctx context.Context, c *FrontConfig, log *Logger) error {
 	front := &dnsFront{log: log, zoneBackend: make(map[string]*backendLink), sockets: make(map[netip.AddrPort]*net.UDPConn)}
+	if c.DNS.ProbeKeyFile != "" {
+		probe, err := loadProbeKey(c.DNS.ProbeKeyFile)
+		if err != nil {
+			return envError("dns.probe_key_file %s: %v", c.DNS.ProbeKeyFile, err)
+		}
+		front.probe = probe
+	}
 	for _, listen := range c.DNS.Listen {
 		addr := netip.MustParseAddrPort(listen)
 		network := "udp6"
@@ -141,6 +148,7 @@ func runDNSFront(ctx context.Context, c *FrontConfig, log *Logger) error {
 
 type dnsFront struct {
 	log         *Logger
+	probe       *dnsProbe // dnsprobe-v1, nil without a key
 	zones       []string
 	zoneBackend map[string]*backendLink
 	sockets     map[netip.AddrPort]*net.UDPConn
@@ -175,6 +183,15 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 			continue
 		}
 		client = netip.AddrPortFrom(client.Addr().Unmap(), client.Port())
+		if f.probe != nil {
+			if reply, probe := f.probe.answer(query, name, questionEnd, zone, client.Addr()); probe {
+				if reply != nil {
+					conn.WriteToUDPAddrPort(reply, client)
+				}
+				f.log.Debugf("dnsprobe from %s: %d bytes", client.Addr(), len(reply))
+				continue
+			}
+		}
 		f.zoneBackend[zone].send(encodePacket(message, client, local, query))
 	}
 }
