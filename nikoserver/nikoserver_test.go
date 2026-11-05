@@ -6,13 +6,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -343,18 +344,16 @@ func TestNekoServerDNSProbe(t *testing.T) {
 	minute := uint32(time.Now().Unix() / 60)
 	for _, large := range []bool{false, true} {
 		label := probeLabel(probeKey, zone, large, minute, [8]byte{1, byte(map[bool]int{false: 0, true: 1}[large])})
-		reply := query(label, 1232)
-		_, end, _ := queryName(probeQuery(label+"."+zone, 16, 1232))
-		_, strs := txtStrings(t, reply, end)
-		b, _ := probeBase32.DecodeString(strings.ToUpper(label))
-		if len(strs) < 2 || string(strs[0]) != probeToken(probeKey, b) || !strings.HasPrefix(string(strs[1]), "seen edns=1232 case=0 from=127.0.0.1") ||
-			large != (len(strs) == 6) {
-			t.Fatalf("large %v: %q", large, strs)
+		plain := probeOpen(t, probeKey, label, query(label, 1232), true)
+		if want := map[bool]int{false: probeSmall, true: probeLarge}[large]; len(plain) != want ||
+			binary.BigEndian.Uint16(plain[16:18]) != 1232 || netip.AddrFrom16([16]byte(plain[19:35])).Unmap() != netip.MustParseAddr("127.0.0.1") {
+			t.Fatalf("large %v: %d bytes, % x", large, len(plain), plain[:35])
 		}
 	}
-	// Another key's label: the backend's answer, NXDOMAIN under dnsauth.
+	// Another key's label: the backend's answer, NODATA under dnsauth
+	// (NOERROR with no record).
 	label := probeLabel(bytes.Repeat([]byte{6}, 32), zone, false, minute, [8]byte{2})
-	if reply := query(label, 1232); reply[3]&0x0f != 3 {
-		t.Fatalf("a label without the key: rcode %d, want NXDOMAIN from the backend", reply[3]&0x0f)
+	if reply := query(label, 1232); reply[3]&0x0f != 0 || binary.BigEndian.Uint16(reply[6:8]) != 0 {
+		t.Fatalf("a label without the key: rcode %d, %d answers, want NODATA from the backend", reply[3]&0x0f, binary.BigEndian.Uint16(reply[6:8]))
 	}
 }
