@@ -26,6 +26,10 @@ import (
 	"www.bamsoftware.com/git/dnstt.git/noise"
 )
 
+// echoDelay holds each echo back (TestNekoServerDNSTTRetryingResolver):
+// data that comes while the node holds a poll.
+var echoDelay time.Duration
+
 // echoInner stands in for the inner stage: a unix stream socket that echoes.
 func echoInner(t *testing.T, dir string) string {
 	path := filepath.Join(dir, "inner.sock")
@@ -42,7 +46,21 @@ func echoInner(t *testing.T, dir string) string {
 			}
 			go func() {
 				defer conn.Close()
-				io.Copy(conn, conn)
+				if echoDelay == 0 {
+					io.Copy(conn, conn)
+					return
+				}
+				buf := make([]byte, 32<<10)
+				for {
+					n, err := conn.Read(buf)
+					if err != nil {
+						return
+					}
+					time.Sleep(echoDelay)
+					if _, err := conn.Write(buf[:n]); err != nil {
+						return
+					}
+				}
 			}()
 		}
 	}()
@@ -78,7 +96,17 @@ func startNode(t *testing.T, kind, zone string, options map[string]any) (resolve
 	return startNodeWith(t, kind, zone, options, "")
 }
 
-// startNodeWith is startNode with the front's dnsprobe-v1 key file.
+// nsFor is the zone's NS names as raycontrol renders a dnstt zone with the
+// probe: the front answers its apex.
+func nsFor(probeKeyFile string) []string {
+	if probeKeyFile == "" {
+		return nil
+	}
+	return []string{"ns1.example.com"}
+}
+
+// startNodeWith is startNode with the front's dnsprobe-v1 key file (and
+// the zone's NS names, the front answering its apex).
 func startNodeWith(t *testing.T, kind, zone string, options map[string]any, probeKeyFile string) (resolver string) {
 	dir := t.TempDir()
 	uid := os.Getuid()
@@ -96,7 +124,7 @@ func startNodeWith(t *testing.T, kind, zone string, options map[string]any, prob
 	writeJSON(t, frontPath, map[string]any{
 		"schema": 1, "role": "front", "log": map[string]string{"level": "warn"},
 		"backends": map[string]any{"dns": map[string]any{"socket": socket, "mode": "packet", "uid": uid}},
-		"dns": map[string]any{"listen": []string{resolver}, "zones": []map[string]any{{"zone": zone, "backend": "dns", "probe": probeKeyFile != ""}},
+		"dns": map[string]any{"listen": []string{resolver}, "zones": []map[string]any{{"zone": zone, "backend": "dns", "probe": probeKeyFile != "", "ns": nsFor(probeKeyFile)}},
 			"probe_key_file": probeKeyFile},
 	})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -350,6 +378,17 @@ func TestNekoServerDNSProbe(t *testing.T) {
 			binary.BigEndian.Uint16(plain[16:18]) != 1232 || netip.AddrFrom16([16]byte(plain[19:35])).Unmap() != netip.MustParseAddr("127.0.0.1") {
 			t.Fatalf("large %v: %d bytes, % x", large, len(plain), plain[:35])
 		}
+	}
+	// The apex: SOA from the front, under dnsauth required too.
+	c.Write(probeQuery(zone, 6, 1232))
+	c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buf := make([]byte, 4096)
+	n, err := c.Read(buf)
+	if err != nil {
+		t.Fatalf("apex SOA: %v", err)
+	}
+	if m, err := dns.MessageFromWireFormat(buf[:n]); err != nil || m.Flags != 0x8400 || len(m.Answer) != 1 || m.Answer[0].Type != 6 {
+		t.Fatalf("apex SOA: %+v %v", m, err)
 	}
 	// Another key's label: the backend's answer, NODATA under dnsauth
 	// (NOERROR with no record).
