@@ -52,6 +52,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -436,6 +437,62 @@ type record struct {
 	NoData bool
 }
 
+// answerMemo keeps the data of recent answers by question name (neko). A
+// resolver that hears nothing in time asks again with the same name, the
+// same query of the client's, and takes whichever answer comes first; the
+// other is dropped. Answered with new data, the retry lost what it
+// carried, and KCP had to send it again. Now it gets the first answer's
+// data. Two generations of memoGeneration bound it: an answer is kept 5 to
+// 10 seconds, fewer under a flood. Only sendLoop uses it, from one
+// goroutine.
+type answerMemo struct {
+	cur, prev map[string]memoEntry
+	swapped   time.Time
+}
+
+type memoEntry struct {
+	data []byte // TXT RDATA
+	raw  int    // payload bytes in it
+}
+
+const (
+	memoGeneration = 5 * time.Second
+	memoMax        = 4096 // answers in a generation
+)
+
+func memoKey(rec *record) string {
+	return strings.ToLower(rec.Resp.Question[0].Name.String())
+}
+
+// answer fills rec's answer from the memo, if its name was answered
+// lately. Data that would not fit this requester (a retry through a
+// smaller resolver) is not sent: the answer goes out empty.
+func (m *answerMemo) answer(rec *record) bool {
+	key := memoKey(rec)
+	e, ok := m.cur[key]
+	if !ok {
+		e, ok = m.prev[key]
+	}
+	if !ok {
+		return false
+	}
+	data := e.data
+	if e.raw > encodedPayload(rec.Size) {
+		data = dns.EncodeRDataTXT(nil)
+	}
+	q := rec.Resp.Question[0]
+	rec.Resp.Answer = []dns.RR{{Name: q.Name, Type: q.Type, Class: q.Class, TTL: responseTTL, Data: data}}
+	return true
+}
+
+func (m *answerMemo) remember(rec *record, raw int) {
+	now := time.Now()
+	if m.cur == nil || now.Sub(m.swapped) > memoGeneration || len(m.cur) >= memoMax {
+		m.prev, m.cur, m.swapped = m.cur, make(map[string]memoEntry), now
+	}
+	m.cur[memoKey(rec)] = memoEntry{data: rec.Resp.Answer[0].Data, raw: raw}
+}
+
 // requesterSize is a query's EDNS(0) UDP payload size within 512 and
 // maxUDPPayload (neko): RFC 6891 §6.1.1, "values lower than 512 MUST be
 // treated as equal to 512"; no OPT, 512.
@@ -586,6 +643,7 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 // fit while keeping the total size under maxEncodedPayload, then sends it.
 func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-chan *record) error {
 	var nextRec *record
+	var memo answerMemo
 	for {
 		rec := nextRec
 		nextRec = nil
@@ -598,7 +656,11 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 			}
 		}
 
-		if rec.Resp.Rcode() == dns.RcodeNoError && carriesData(rec.Resp) && !rec.NoData {
+		if rec.Resp.Rcode() == dns.RcodeNoError && carriesData(rec.Resp) && !rec.NoData && memo.answer(rec) {
+			// (neko) A query asked before (a resolver's retry): the
+			// same data as the first answer, which the resolver may
+			// already have taken.
+		} else if rec.Resp.Rcode() == dns.RcodeNoError && carriesData(rec.Resp) && !rec.NoData {
 			// If it's a non-error response, we can fill the Answer
 			// section with downstream packets.
 
@@ -709,6 +771,7 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 			}
 
 			rec.Resp.Answer[0].Data = dns.EncodeRDataTXT(payload.Bytes())
+			memo.remember(rec, payload.Len())
 		}
 
 		buf, err := rec.Resp.WireFormat()

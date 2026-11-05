@@ -26,6 +26,10 @@ import (
 	"www.bamsoftware.com/git/dnstt.git/noise"
 )
 
+// echoDelay holds each echo back (TestNekoServerDNSTTRetryingResolver):
+// data that comes while the node holds a poll.
+var echoDelay time.Duration
+
 // echoInner stands in for the inner stage: a unix stream socket that echoes.
 func echoInner(t *testing.T, dir string) string {
 	path := filepath.Join(dir, "inner.sock")
@@ -42,7 +46,21 @@ func echoInner(t *testing.T, dir string) string {
 			}
 			go func() {
 				defer conn.Close()
-				io.Copy(conn, conn)
+				if echoDelay == 0 {
+					io.Copy(conn, conn)
+					return
+				}
+				buf := make([]byte, 32<<10)
+				for {
+					n, err := conn.Read(buf)
+					if err != nil {
+						return
+					}
+					time.Sleep(echoDelay)
+					if _, err := conn.Write(buf[:n]); err != nil {
+						return
+					}
+				}
 			}()
 		}
 	}()
