@@ -47,12 +47,16 @@ func probeOpen(t *testing.T, key []byte, label string, reply []byte, withOPT boo
 	if withOPT != (len(m.Additional) == 1 && m.Additional[0].Type == dns.RRTypeOPT && m.Additional[0].Class == 4096) {
 		t.Fatalf("OPT %+v (query had one: %v)", m.Additional, withOPT)
 	}
-	plain, err := dns.DecodeRDataTXT(m.Answer[0].Data)
+	data, err := dns.DecodeRDataTXT(m.Answer[0].Data)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(data) < probeNonceLen {
+		t.Fatalf("TXT data of %d bytes", len(data))
+	}
 	b, _ := probeBase32.DecodeString(strings.ToUpper(label))
-	probeCrypt(probeMAC(key, []byte("dnsprobe-v1 e")), b, plain)
+	plain := data[probeNonceLen:]
+	probeCrypt(probeMAC(key, []byte("dnsprobe-v1 e")), b, data[:probeNonceLen], plain)
 	if len(plain) < probeSmall || !bytes.Equal(plain[:probeTokenLen], probeMAC(key, []byte("dnsprobe-v1 a"), b, plain[probeTokenLen:probeSmall])[:probeTokenLen]) {
 		t.Fatalf("token % x", plain[:probeTokenLen])
 	}
@@ -79,13 +83,13 @@ func TestProbeVectors(t *testing.T) {
 	label := probeLabel(key, "t.example.com", false, 29000000, nonce)
 	b, _ := probeBase32.DecodeString(strings.ToUpper(label))
 	plain := probePlain(key, b, 1232, true, netip.MustParseAddr("198.51.100.7"), probeSmall)
-	probeCrypt(probeMAC(key, []byte("dnsprobe-v1 e")), b, plain)
-	t.Logf("label %s, small answer data %x", label, plain)
+	data := probeSeal(newDNSProbe(key), b, plain, [probeNonceLen]byte{0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7})
+	t.Logf("label %s, small answer data %x", label, data)
 	// Worked out apart from this code too (Python, hmac and base64).
 	const wantLabel = "aeaadoubicqkdivduss2nj2inuqqx7vwla4ifvi"
-	const wantData = "42c10f1d94c67a0d8a02d86b2d81e9f1e2733f6dbdb92d439b28a37af4894debbcd0a1"
-	if label != wantLabel || hex.EncodeToString(plain) != wantData {
-		t.Fatalf("vectors changed: label %s, data %x", label, plain)
+	const wantData = "b0b1b2b3b4b5b6b708ef7fc6424b785eb4b2e7c0d6b7839339c69f34cd0f9e0484c8f8e7ff8479a7990d11"
+	if label != wantLabel || hex.EncodeToString(data) != wantData {
+		t.Fatalf("vectors changed: label %s, data %x", label, data)
 	}
 }
 
@@ -138,12 +142,16 @@ func TestProbe(t *testing.T) {
 		}
 	}
 
-	// A replay is answered the same: one more answer of the tunnel.
+	// A replay is answered too, with a nonce and keystream of its own:
+	// the same plaintext, other bytes on the wire.
 	l = label(false, minute)
 	first, _ := ask(t, p, zone, l, 16, 1232, "198.51.100.10")
 	again, probe := ask(t, p, zone, l, 16, 1232, "198.51.100.10")
-	if !probe || !bytes.Equal(first, again) {
-		t.Fatal("a replay answered otherwise")
+	if !probe || again == nil || bytes.Equal(first, again) {
+		t.Fatal("a replay not answered with a fresh nonce")
+	}
+	if !bytes.Equal(probeOpen(t, key, l, first, true), probeOpen(t, key, l, again, true)) {
+		t.Fatal("a replay told otherwise")
 	}
 
 	// Not a probe: for the backend.

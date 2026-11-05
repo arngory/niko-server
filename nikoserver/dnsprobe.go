@@ -4,6 +4,7 @@ package nikoserver
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base32"
 	"encoding/binary"
@@ -15,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/arngory/niko-server/dnsttserver"
 	"www.bamsoftware.com/git/dnstt.git/dns"
 )
 
@@ -36,10 +38,12 @@ const (
 	probeGlobalRate, probeGlobalBurst = 400, 800
 	probeSmallCost, probeLargeCost    = 1, 8
 	// The plaintext of an answer: the token, what the node saw, and for a
-	// large probe zeros up to probeLarge bytes.
+	// large probe zeros up to probeLarge bytes. On the wire it follows a
+	// random nonce of the answer's own.
 	probeTokenLen = 16
 	probeSmall    = probeTokenLen + 2 + 1 + 16
 	probeLarge    = 900
+	probeNonceLen = 8
 	// As dnstt answers: TTL and the responder's EDNS size.
 	probeTTL     = 60
 	probeOPTSize = 4096
@@ -118,13 +122,16 @@ func probeLabel(key []byte, zone string, large bool, minute uint32, nonce [8]byt
 	return strings.ToLower(probeBase32.EncodeToString(b[:]))
 }
 
-// probeCrypt XORs p with the keystream of a label's bytes b: blocks of
-// HMAC-SHA256(enc, b ‖ uint32 counter). The same call decrypts.
-func probeCrypt(enc, b, p []byte) {
+// probeCrypt XORs p with the keystream of a label's bytes b and an
+// answer's nonce: blocks of HMAC-SHA256(enc, b ‖ nonce ‖ uint32 counter).
+// The same call decrypts. The nonce makes each answer's keystream its own:
+// one who replays the label from an address of theirs learns nothing of
+// another answer's plaintext.
+func probeCrypt(enc, b, nonce, p []byte) {
 	var ctr [4]byte
 	for i := 0; i < len(p); i += sha256.Size {
 		binary.BigEndian.PutUint32(ctr[:], uint32(i/sha256.Size))
-		block := probeMAC(enc, b, ctr[:])
+		block := probeMAC(enc, b, nonce, ctr[:])
 		for j := 0; j < sha256.Size && i+j < len(p); j++ {
 			p[i+j] ^= block[j]
 		}
@@ -186,14 +193,26 @@ func (p *dnsProbe) answer(query []byte, name string, questionEnd int, zone strin
 	if !p.allow(src, cost, now) {
 		return nil, true
 	}
-	return probeReply(p, q, b, query[13:13+int(query[12])], src, large), true
+	var nonce [probeNonceLen]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return nil, true
+	}
+	return probeReply(p, q, b, query[13:13+int(query[12])], src, large, nonce), true
+}
+
+// probeSeal is an answer's TXT data: the nonce, then the plaintext
+// encrypted.
+func probeSeal(p *dnsProbe, b, plain []byte, nonce [probeNonceLen]byte) []byte {
+	probeCrypt(p.enc, b, nonce[:], plain)
+	return append(nonce[:], plain...)
 }
 
 // probeReply builds the answer as dnstt does (responseFor, sendLoop): QR
 // and AA, the question as asked, one TXT with TTL 60, and an OPT of 4096
-// when the query had one. A large one that does not fit the requester's
-// size goes out small, as dnstt fits its answers to the requester.
-func probeReply(p *dnsProbe, q dns.Message, b, rawLabel []byte, src netip.Addr, large bool) []byte {
+// when the query had one. A large one goes out only when dnstt could carry
+// as much TXT data to this requester; else the small one, as dnstt fits its
+// answers to the requester.
+func probeReply(p *dnsProbe, q dns.Message, b, rawLabel []byte, src netip.Addr, large bool, nonce [probeNonceLen]byte) []byte {
 	edns, hasOPT := 0, false
 	for _, rr := range q.Additional {
 		if rr.Type == dns.RRTypeOPT {
@@ -203,11 +222,10 @@ func probeReply(p *dnsProbe, q dns.Message, b, rawLabel []byte, src netip.Addr, 
 	}
 	mixed := strings.ToLower(string(rawLabel)) != string(rawLabel)
 	build := func(size int) []byte {
-		plain := probePlain(p.key, b, edns, mixed, src, size)
-		probeCrypt(p.enc, b, plain)
+		data := probeSeal(p, b, probePlain(p.key, b, edns, mixed, src, size), nonce)
 		resp := dns.Message{ID: q.ID, Flags: 0x8400, Question: q.Question,
 			Answer: []dns.RR{{Name: q.Question[0].Name, Type: q.Question[0].Type, Class: q.Question[0].Class, TTL: probeTTL,
-				Data: dns.EncodeRDataTXT(plain)}}}
+				Data: dns.EncodeRDataTXT(data)}}}
 		if hasOPT {
 			resp.Additional = []dns.RR{{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: probeOPTSize, TTL: 0, Data: []byte{}}}
 		}
@@ -217,10 +235,8 @@ func probeReply(p *dnsProbe, q dns.Message, b, rawLabel []byte, src netip.Addr, 
 		}
 		return wire
 	}
-	if large {
-		if wire := build(probeLarge); wire != nil && len(wire) <= max(edns, 512) {
-			return wire
-		}
+	if large && probeNonceLen+probeLarge <= dnsttserver.MaxTXTData(max(edns, 512)) {
+		return build(probeLarge)
 	}
 	return build(probeSmall)
 }

@@ -95,7 +95,7 @@ func startNodeWith(t *testing.T, kind, zone string, options map[string]any, prob
 	writeJSON(t, frontPath, map[string]any{
 		"schema": 1, "role": "front", "log": map[string]string{"level": "warn"},
 		"backends": map[string]any{"dns": map[string]any{"socket": socket, "mode": "packet", "uid": uid}},
-		"dns": map[string]any{"listen": []string{resolver}, "zones": []map[string]string{{"zone": zone, "backend": "dns"}},
+		"dns": map[string]any{"listen": []string{resolver}, "zones": []map[string]any{{"zone": zone, "backend": "dns", "probe": probeKeyFile != ""}},
 			"probe_key_file": probeKeyFile},
 	})
 	ctx, cancel := context.WithCancel(context.Background())

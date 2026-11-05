@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/xtaci/kcp-go/v5"
 	"net"
 	"strings"
 	"testing"
@@ -266,31 +265,24 @@ func TestRequesterSizes(t *testing.T) {
 	}
 }
 
-// A live session gets a smaller MTU when a smaller requester comes after
-// it was accepted (a client that moves to another resolver).
-func TestSessionMTULowered(t *testing.T) {
-	ln, err := kcp.ListenWithOptions("127.0.0.1:0", nil, 0, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	conn, err := kcp.DialWithOptions(ln.Addr().String(), nil, 0, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
+// A session's MTU is set when KCP accepts it, from the smallest requester
+// its client has come through so far; a session never seen gets the full
+// one.
+func TestSessionMTU(t *testing.T) {
 	var sizes clientSizes
 	id := turbotunnel.ClientID{9}
 	full := encodedPayload(maxUDPPayload) - 2
-	sizes.note(id, 1232)
-	sizes.track(id, conn, full)
-	sizes.note(id, 512)
-	if s := sizes.sessions[id]; s == nil || s.mtu != encodedPayload(512)-2 {
-		t.Fatalf("live session MTU %+v, want %d", s, encodedPayload(512)-2)
+	if m := sessionMTU(full, &sizes, id); m != encodedPayload(maxUDPPayload)-2 {
+		t.Fatalf("unseen client: MTU %d", m)
 	}
-	sizes.untrack(id, conn)
-	if sizes.sessions[id] != nil {
-		t.Fatal("session still tracked")
+	sizes.note(id, 1232)
+	sizes.note(id, 512)
+	sizes.note(id, 1232)
+	if m := sessionMTU(full, &sizes, id); m != encodedPayload(512)-2 {
+		t.Fatalf("MTU %d, want %d", m, encodedPayload(512)-2)
+	}
+	if m := sessionMTU(full, nil, id); m != full {
+		t.Fatalf("without sizes: MTU %d", m)
 	}
 }
 
@@ -579,6 +571,50 @@ func TestSendLoopOversizeWaits(t *testing.T) {
 		}
 	default:
 		t.Fatal("the large packet is gone, not stashed")
+	}
+	close(ch)
+}
+
+// The stash holds a packet too large for this requester; a packet that
+// does not fit what is left of the answer but fits the next takes its
+// place, so it is not lost behind one that cannot go.
+func TestSendLoopStashSwap(t *testing.T) {
+	tt := turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, time.Minute)
+	defer tt.Close()
+	id := turbotunnel.ClientID{8}
+	limit := encodedPayload(512)
+	big := bytes.Repeat([]byte{1}, encodedPayload(maxUDPPayload)-2)
+	first := bytes.Repeat([]byte{2}, limit-2-10)
+	next := bytes.Repeat([]byte{3}, 20)
+	if !tt.Stash(big, id) {
+		t.Fatal("stash")
+	}
+	tt.WriteTo(first, id)
+	tt.WriteTo(next, id)
+	out := make(chan []byte, 4)
+	ch := make(chan *record, 1)
+	go sendLoop(capture{out: out}, tt, ch)
+	zone, _ := dns.ParseName("x.t.example.com")
+	ch <- &record{Resp: &dns.Message{ID: 1, Flags: 0x8400, Question: []dns.Question{{Name: zone, Type: dns.RRTypeTXT, Class: dns.ClassIN}}},
+		Addr: turbotunnel.DummyAddr{}, ClientID: id, Size: 512}
+	var wire []byte
+	select {
+	case wire = <-out:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no answer")
+	}
+	m, _ := dns.MessageFromWireFormat(wire)
+	data, _ := dns.DecodeRDataTXT(m.Answer[0].Data)
+	if !bytes.Equal(data, append([]byte{byte(len(first) >> 8), byte(len(first))}, first...)) {
+		t.Fatalf("answer data of %d bytes, want the first packet", len(data))
+	}
+	select {
+	case p := <-tt.Unstash(id):
+		if !bytes.Equal(p, next) {
+			t.Fatalf("stashed %d bytes, want the next packet", len(p))
+		}
+	default:
+		t.Fatal("nothing stashed")
 	}
 	close(ch)
 }
