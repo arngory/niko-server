@@ -206,7 +206,7 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream Dialer) error 
 
 // acceptSessions listens for incoming KCP connections and passes them to
 // acceptStreams.
-func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream Dialer) error {
+func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream Dialer, sizes *clientSizes) error {
 	for {
 		conn, err := ln.AcceptKCP()
 		if err != nil {
@@ -228,7 +228,11 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream Dialer) 
 			1, // nc=1 => congestion window off
 		)
 		conn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
-		if rc := conn.SetMtu(mtu); !rc {
+		m := sessionMTU(mtu, sizes, conn.RemoteAddr())
+		if m < mtu {
+			log.Printf("session %08x: MTU %d for a requester payload size under %d", conn.GetConv(), m, maxUDPPayload)
+		}
+		if rc := conn.SetMtu(m); !rc {
 			panic(rc)
 		}
 		go func() {
@@ -377,13 +381,11 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth) (*dns.Message,
 	}
 
 	if question.Type != dns.RRTypeTXT {
-		// We only support QTYPE == TXT.
-		resp.Flags |= dns.RcodeNameError
-		// No log message here; it's common for recursive resolvers to
-		// send NS or A queries when the client only asked for a TXT. I
-		// suspect this is related to QNAME minimization, but I'm not
-		// sure. https://tools.ietf.org/html/rfc7816
-		// log.Printf("NXDOMAIN: QTYPE %d != TXT", question.Type)
+		// (neko) Only TXT carries data, but another type gets NOERROR
+		// with no answer (NODATA), not NXDOMAIN: a resolver minimising
+		// QNAMEs (RFC 9156) asks for the names above the tunnel's with A
+		// or NS, and one that takes NXDOMAIN as "nothing below"
+		// (RFC 8020) then gave up on the whole query.
 		return resp, nil
 	}
 
@@ -391,9 +393,8 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth) (*dns.Message,
 	payload := make([]byte, base32Encoding.DecodedLen(len(encoded)))
 	n, err := base32Encoding.Decode(payload, encoded)
 	if err != nil {
-		// Base32 error, make like the name doesn't exist.
-		resp.Flags |= dns.RcodeNameError
-		log.Printf("NXDOMAIN: base32 decoding: %v", err)
+		// Base32 error: (neko) no data at this name, as for any query
+		// the tunnel does not take (recvLoop).
 		return resp, nil
 	}
 	payload = payload[:n]
@@ -402,23 +403,21 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth) (*dns.Message,
 	// query without a valid one learns nothing, not even the FORMERR below
 	// for a small payload size: the zone answers as an empty one.
 	if payload, ok = auth.Check(payload); !ok {
-		resp.Flags |= dns.RcodeNameError
 		return resp, nil
 	}
 
-	// We require clients to support EDNS(0) with a minimum payload size;
-	// otherwise we would have to set a small KCP MTU (only around 200
-	// bytes). https://tools.ietf.org/html/rfc6891#section-7 "If there is a
-	// problem with processing the OPT record itself, such as an option
-	// value that is badly formatted or that includes out-of-range values, a
-	// FORMERR MUST be returned."
-	if payloadSize < maxUDPPayload {
-		resp.Flags |= dns.RcodeFormatError
-		log.Printf("FORMERR: requester payload size %d is too small (minimum %d)", payloadSize, maxUDPPayload)
-		return resp, nil
-	}
-
+	// (neko) A requester payload size under maxUDPPayload is no FORMERR
+	// any more: resolvers that advertise 512 or 1220 broke the tunnel. The
+	// session of such a client gets a smaller KCP MTU instead (sessionMTU),
+	// and its answers are sized for the requester (sendLoop): slower, not
+	// dead.
 	return resp, payload
+}
+
+// carriesData reports whether a NOERROR response may carry downstream data:
+// an answer to one TXT question (neko: other types get NODATA).
+func carriesData(resp *dns.Message) bool {
+	return len(resp.Question) == 1 && resp.Question[0].Type == dns.RRTypeTXT
 }
 
 // record represents a DNS message appropriate for a response to a previously
@@ -430,13 +429,106 @@ type record struct {
 	Resp     *dns.Message
 	Addr     net.Addr
 	ClientID turbotunnel.ClientID
+	// Size is the requester's UDP payload size, 512 to maxUDPPayload
+	// (neko): the answer stays within it.
+	Size int
+	// NoData: the query carried no ClientID, the answer no record.
+	NoData bool
+}
+
+// requesterSize is a query's EDNS(0) UDP payload size within 512 and
+// maxUDPPayload (neko): RFC 6891 §6.1.1, "values lower than 512 MUST be
+// treated as equal to 512"; no OPT, 512.
+func requesterSize(query *dns.Message) int {
+	size := 512
+	for _, rr := range query.Additional {
+		if rr.Type == dns.RRTypeOPT {
+			size = int(rr.Class)
+			break
+		}
+	}
+	return min(max(size, 512), maxUDPPayload)
+}
+
+// encodedPayloads[size-512] is computeMaxEncodedPayload(size) for the
+// requester sizes from 512 to maxUDPPayload, worked out once (neko).
+var (
+	encodedPayloadsOnce sync.Once
+	encodedPayloads     []int
+)
+
+// encodedPayload is the most TXT data an answer to a requester of this
+// size may carry, for a query with the longest name.
+func encodedPayload(size int) int {
+	encodedPayloadsOnce.Do(func() {
+		encodedPayloads = make([]int, maxUDPPayload-512+1)
+		for s := range encodedPayloads {
+			encodedPayloads[s] = computeMaxEncodedPayload(s + 512)
+		}
+	})
+	return encodedPayloads[min(max(size, 512), maxUDPPayload)-512]
+}
+
+// clientSizes remembers the smallest requester size each client's queries
+// came with (neko): a session's KCP MTU is set from it when KCP accepts
+// it, so its packets fit the answers of the resolvers it goes through. The
+// MTU of a live session is never changed: KCP panics on segments queued at
+// the old size. A smaller requester later gets the packets that fit, the
+// others wait (sendLoop). Two generations bound the map: a client not heard
+// from for a generation or two is forgotten, never refused.
+type clientSizes struct {
+	mu        sync.Mutex
+	cur, prev map[turbotunnel.ClientID]int
+}
+
+// clientSizesMax is the clients of a generation.
+const clientSizesMax = 16384
+
+func (c *clientSizes) note(id turbotunnel.ClientID, size int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cur == nil {
+		c.cur = map[turbotunnel.ClientID]int{}
+	}
+	old, ok := c.cur[id]
+	if !ok {
+		if old, ok = c.prev[id]; !ok && len(c.cur) >= clientSizesMax {
+			c.prev, c.cur = c.cur, map[turbotunnel.ClientID]int{}
+		}
+	}
+	if ok && old < size {
+		size = old
+	}
+	c.cur[id] = size
+}
+
+func (c *clientSizes) get(id turbotunnel.ClientID) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if s, ok := c.cur[id]; ok {
+		return s
+	}
+	if s, ok := c.prev[id]; ok {
+		return s
+	}
+	return maxUDPPayload
+}
+
+// sessionMTU is the KCP MTU of a client's session: the most a packet may
+// be to fit the answers to its smallest requester.
+func sessionMTU(mtu int, sizes *clientSizes, addr net.Addr) int {
+	id, ok := addr.(turbotunnel.ClientID)
+	if !ok || sizes == nil {
+		return mtu
+	}
+	return min(mtu, encodedPayload(sizes.get(id))-2)
 }
 
 // recvLoop repeatedly calls dnsConn.ReadFrom, extracts the packets contained in
 // the incoming DNS queries, and puts them on ttConn's incoming queue. Whenever
 // a query calls for a response, constructs a partial response and passes it to
 // sendLoop over ch.
-func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, auth *Auth) error {
+func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, auth *Auth, sizes *clientSizes) error {
 	for {
 		var buf [4096]byte
 		n, addr, err := dnsConn.ReadFrom(buf[:])
@@ -452,11 +544,15 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 		}
 
 		resp, payload := responseFor(&query, domain, auth)
+		size := requesterSize(&query)
 		// Extract the ClientID from the payload.
 		var clientID turbotunnel.ClientID
 		n = copy(clientID[:], payload)
 		payload = payload[n:]
 		if n == len(clientID) {
+			// Before KCP sees the packets: a new session takes its
+			// MTU from it.
+			sizes.note(clientID, size)
 			// Discard padding and pull out the packets contained in
 			// the payload.
 			r := bytes.NewReader(payload)
@@ -468,17 +564,16 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 				// Feed the incoming packet to KCP.
 				ttConn.QueueIncoming(p, clientID)
 			}
-		} else {
-			// Payload is not long enough to contain a ClientID.
-			if resp != nil && resp.Rcode() == dns.RcodeNoError {
-				resp.Flags |= dns.RcodeNameError
-				log.Printf("NXDOMAIN: %d bytes are too short to contain a ClientID", n)
-			}
 		}
+		// (neko) Without a ClientID (another type, bad base32, no valid
+		// dnsauth tag, too short) the answer is NOERROR with no record:
+		// the same for every name and type the tunnel does not take, so a
+		// scanner learns nothing, and a resolver minimising QNAMEs goes on.
+		noData := n != len(clientID)
 		// If a response is called for, pass it to sendLoop via the channel.
 		if resp != nil {
 			select {
-			case ch <- &record{resp, addr, clientID}:
+			case ch <- &record{resp, addr, clientID, size, noData}:
 			default:
 			}
 		}
@@ -489,7 +584,7 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 // response, it sends on the network immediately. Those that represent a
 // response capable of carrying data, it packs full of as many packets as will
 // fit while keeping the total size under maxEncodedPayload, then sends it.
-func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-chan *record, maxEncodedPayload int) error {
+func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-chan *record) error {
 	var nextRec *record
 	for {
 		rec := nextRec
@@ -503,7 +598,7 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 			}
 		}
 
-		if rec.Resp.Rcode() == dns.RcodeNoError && len(rec.Resp.Question) == 1 {
+		if rec.Resp.Rcode() == dns.RcodeNoError && carriesData(rec.Resp) && !rec.NoData {
 			// If it's a non-error response, we can fill the Answer
 			// section with downstream packets.
 
@@ -520,16 +615,25 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 			}
 
 			var payload bytes.Buffer
-			limit := maxEncodedPayload
+			// (neko) Within the requester's size, not the global one.
+			limit := encodedPayload(rec.Size)
 			// We loop and bundle as many packets from OutgoingQueue
 			// into the response as will fit. Any packet that would
 			// overflow the capacity of the DNS response, we stash
 			// to be bundled into a future response.
 			timer := time.NewTimer(maxResponseDelay)
 			timerExpired := false
+			// (neko) Once a stashed packet does not fit this
+			// requester at all, it stays stashed and the answer
+			// takes what fits from the queue: ACKs and the
+			// session's newer, smaller packets go on.
+			skipStash := false
 			for {
 				var p []byte
 				unstash := ttConn.Unstash(rec.ClientID)
+				if skipStash {
+					unstash = nil // a nil channel is never ready
+				}
 				outgoing := ttConn.OutgoingQueue(rec.ClientID)
 				// Prioritize taking a packet first from the
 				// stash, then from the outgoing queue, then
@@ -568,18 +672,32 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 					break
 				}
 
-				limit -= 2 + len(p)
-				if payload.Len() == 0 {
-					// No packet length check for the first
-					// packet; if it's too large, we allow
-					// it to be truncated and dropped by the
-					// receiver.
-				} else if limit < 0 {
+				if 2+len(p) > limit {
 					// Stash this packet to send in the next
-					// response.
-					ttConn.Stash(p, rec.ClientID)
-					break
+					// response. (neko) The first packet too,
+					// instead of being truncated and lost.
+					if !ttConn.Stash(p, rec.ClientID) && skipStash && 2+len(p) <= encodedPayload(rec.Size) {
+						// The stash holds a packet no answer to
+						// this requester can carry, and this one
+						// fits the next: it goes first, the other
+						// is dropped, and KCP sends it again.
+						select {
+						case <-ttConn.Unstash(rec.ClientID):
+						default:
+						}
+						ttConn.Stash(p, rec.ClientID)
+					}
+					if payload.Len() > 0 {
+						break // this answer is full
+					}
+					// Larger than any answer to this requester
+					// (a session that began through a larger
+					// resolver): it waits for a larger one,
+					// the rest goes on.
+					skipStash = true
+					continue
 				}
+				limit -= 2 + len(p)
 				if int(uint16(len(p))) != len(p) {
 					panic(len(p))
 				}
@@ -600,9 +718,9 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 		}
 		// Truncate if necessary.
 		// https://tools.ietf.org/html/rfc1035#section-4.1.1
-		if len(buf) > maxUDPPayload {
-			log.Printf("truncating response of %d bytes to max of %d", len(buf), maxUDPPayload)
-			buf = buf[:maxUDPPayload]
+		if size := min(max(rec.Size, 512), maxUDPPayload); len(buf) > size {
+			log.Printf("truncating response of %d bytes to max of %d", len(buf), size)
+			buf = buf[:size]
 			buf[2] |= 0x02 // TC = 1
 		}
 
@@ -772,6 +890,9 @@ func run(privkey []byte, domain dns.Name, upstream Dialer, dnsConn net.PacketCon
 	}
 	log.Printf("effective MTU %d", mtu)
 
+	// The smallest requester size of each client (neko).
+	sizes := &clientSizes{}
+
 	// Start up the virtual PacketConn for turbotunnel.
 	ttConn := turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, idleTimeout*2)
 	ln, err := kcp.ServeConn(nil, 0, 0, ttConn)
@@ -788,7 +909,7 @@ func run(privkey []byte, domain dns.Name, upstream Dialer, dnsConn net.PacketCon
 
 	go func() {
 		defer done()
-		err := acceptSessions(ln, privkey, mtu, upstream)
+		err := acceptSessions(ln, privkey, mtu, upstream, sizes)
 		if err != nil {
 			log.Printf("acceptSessions: %v", err)
 		}
@@ -803,7 +924,7 @@ func run(privkey []byte, domain dns.Name, upstream Dialer, dnsConn net.PacketCon
 	// another response that needs to be sent.
 	go func() {
 		defer done()
-		err := sendLoop(dnsConn, ttConn, ch, maxEncodedPayload)
+		err := sendLoop(dnsConn, ttConn, ch)
 		if err != nil {
 			log.Printf("sendLoop: %v", err)
 		}
@@ -811,7 +932,7 @@ func run(privkey []byte, domain dns.Name, upstream Dialer, dnsConn net.PacketCon
 
 	go func() {
 		defer done()
-		err := recvLoop(domain, dnsConn, ttConn, ch, auth)
+		err := recvLoop(domain, dnsConn, ttConn, ch, auth, sizes)
 		close(ch)
 		if err != nil {
 			log.Printf("recvLoop: %v", err)
@@ -833,3 +954,8 @@ func GenerateKeypair() (private, public string, err error) {
 	}
 	return noise.EncodeKey(privkey), noise.EncodeKey(noise.PubkeyFromPrivkey(privkey)), nil
 }
+
+// MaxTXTData is the most TXT data dnstt puts in an answer to a requester
+// of this EDNS size (512 for none): the DNS front's probe answers keep
+// within it, as the tunnel's own do (neko).
+func MaxTXTData(size int) int { return encodedPayload(size) }

@@ -83,7 +83,18 @@ func listenDNS(ctx context.Context, network string, addr netip.AddrPort) (*net.U
 }
 
 func runDNSFront(ctx context.Context, c *FrontConfig, log *Logger) error {
-	front := &dnsFront{log: log, zoneBackend: make(map[string]*backendLink), sockets: make(map[netip.AddrPort]*net.UDPConn)}
+	front := &dnsFront{log: log, zoneBackend: make(map[string]*backendLink), sockets: make(map[netip.AddrPort]*net.UDPConn),
+		probeZones: map[string]bool{}}
+	if c.DNS.ProbeKeyFile != "" {
+		// Without the key the front answers no probes, and goes on: the
+		// tunnels, TCP and UDP 443 must not stop for a resolver check.
+		// Probes then reach the backend like any query of the tunnel.
+		if probe, err := loadProbeKey(c.DNS.ProbeKeyFile); err != nil {
+			log.Warnf("dns.probe_key_file %s: %v; dnsprobe-v1 off", c.DNS.ProbeKeyFile, err)
+		} else {
+			front.probe = probe
+		}
+	}
 	for _, listen := range c.DNS.Listen {
 		addr := netip.MustParseAddrPort(listen)
 		network := "udp6"
@@ -118,6 +129,9 @@ func runDNSFront(ctx context.Context, c *FrontConfig, log *Logger) error {
 		zone := strings.ToLower(strings.TrimSuffix(z.Zone, "."))
 		front.zones = append(front.zones, zone)
 		front.zoneBackend[zone] = links[z.Backend]
+		if z.Probe {
+			front.probeZones[zone] = true
+		}
 	}
 	for _, link := range links {
 		go link.run(ctx)
@@ -141,6 +155,8 @@ func runDNSFront(ctx context.Context, c *FrontConfig, log *Logger) error {
 
 type dnsFront struct {
 	log         *Logger
+	probe       *dnsProbe       // dnsprobe-v1, nil without a key
+	probeZones  map[string]bool // the zones it answers in
 	zones       []string
 	zoneBackend map[string]*backendLink
 	sockets     map[netip.AddrPort]*net.UDPConn
@@ -175,6 +191,15 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 			continue
 		}
 		client = netip.AddrPortFrom(client.Addr().Unmap(), client.Port())
+		if f.probe != nil && f.probeZones[zone] {
+			if reply, probe := f.probe.answer(query, name, questionEnd, zone, client.Addr()); probe {
+				if reply != nil {
+					conn.WriteToUDPAddrPort(reply, client)
+				}
+				f.log.Debugf("dnsprobe from %s: %d bytes", client.Addr(), len(reply))
+				continue
+			}
+		}
 		f.zoneBackend[zone].send(encodePacket(message, client, local, query))
 	}
 }

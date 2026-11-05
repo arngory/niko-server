@@ -49,11 +49,19 @@ type BackendRef struct {
 type DNSZone struct {
 	Zone    string `json:"zone"`
 	Backend string `json:"backend"`
+	// Probe: the front answers dnsprobe-v1 in this zone (with
+	// dns.probe_key_file). For dnstt zones: the answers are built as
+	// dnstt's.
+	Probe bool `json:"probe,omitempty"`
 }
 
 type FrontDNS struct {
 	Listen []string  `json:"listen"`
 	Zones  []DNSZone `json:"zones"`
+	// ProbeKeyFile: the key of dnsprobe-v1 (raycontrol
+	// docs/spec/dnsprobe-v1.md), 32 bytes in hex. With it the front answers
+	// a client's check of a resolver itself, before the zone's backend.
+	ProbeKeyFile string `json:"probe_key_file,omitempty"`
 }
 
 // TCPRoute sends TLS connections with one of these server names, or
@@ -266,6 +274,9 @@ func (c *FrontConfig) validate() []ConfigError {
 	if len(c.DNS.Zones) == 0 {
 		e.add("dns.zones", "no zones")
 	}
+	if c.DNS.ProbeKeyFile != "" {
+		checkSocket(&e, "dns.probe_key_file", c.DNS.ProbeKeyFile)
+	}
 	seen := map[string]bool{}
 	for i, z := range c.DNS.Zones {
 		path := fmt.Sprintf("dns.zones[%d]", i)
@@ -282,6 +293,9 @@ func (c *FrontConfig) validate() []ConfigError {
 			e.add(path+".backend", "no backend %q in backends", z.Backend)
 		} else if b.Mode != "packet" {
 			e.add(path+".backend", "backend %q must have mode packet", z.Backend)
+		}
+		if z.Probe && c.DNS.ProbeKeyFile == "" {
+			e.add(path+".probe", "needs dns.probe_key_file")
 		}
 	}
 	return e
