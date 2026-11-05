@@ -92,11 +92,11 @@ type Auth struct {
 	// ClientID -> device id of its last valid tag, in two generations: a
 	// full cache becomes the previous one instead of being dropped.
 	cache, prev map[turbotunnel.ClientID]string
-	// The first 8 bytes of queries no key explained: an old client's
-	// ClientID, taken as untagged in optional mode and refused in required
-	// mode without another scan. A tagged query starts with a fresh tag,
-	// so it never matches one.
-	unknown, unknownPrev map[turbotunnel.ClientID]struct{}
+	// The first 8 bytes of queries no key explained, with when they were
+	// first seen: an old client's ClientID, taken as untagged in optional
+	// mode and refused in required mode. A tagged query starts with a fresh
+	// tag, so it matches one only if someone copied the tag (validLocked).
+	unknown, unknownPrev map[turbotunnel.ClientID]time.Time
 	tokens               float64
 	last                 time.Time
 	scratch              tagScratch
@@ -261,6 +261,9 @@ func (a *Auth) Check(payload []byte) (rest []byte, ok bool) {
 		return nil, false
 	case tagKnown:
 		return untagged() // no key explained this head before
+	case tagKnownBusy:
+		a.Throttled.Add(1)
+		return untagged()
 	}
 	a.remember(head)
 	return untagged()
@@ -273,20 +276,26 @@ const (
 	tagValid               // a key's tag
 	tagThrottled           // not looked at: over the budget
 	tagKnown               // the head of a query no key explained before
+	tagKnownBusy           // the same, not looked at again: over half the budget
 )
+
+// knownRescan is how long a remembered head is looked at again: long enough
+// for a copied tag and the genuine query, which come close together; an old
+// client's ClientID, which lives for minutes or hours, is then free.
+const knownRescan = 30 * time.Second
 
 // validLocked checks a tag: first against the keys of the session its
 // ClientID names, if it is cached, so a session's queries, retransmits
 // included, pass whatever else came with the same first bytes; then, if
 // the head is not one no key explained before, against all the keys within
-// the budget. A remembered head is scanned anyway while at least half the
-// budget is left: someone who copies a new session's tag into garbage
-// cannot get the session's first query refused unless the node is under
-// load.
+// the budget. A head remembered less than knownRescan ago is scanned again
+// while more than half the budget is left (always with a full one):
+// someone who copies a new session's tag into garbage cannot get the
+// session's first query refused unless the node is under load.
 func (a *Auth) validLocked(payload []byte, head turbotunnel.ClientID) tagResult {
 	keys := a.keys.Load()
 	if keys == nil || len(keys.keys) == 0 {
-		if a.known(head) {
+		if _, known := a.known(head, time.Now()); known {
 			return tagKnown
 		}
 		return tagInvalid
@@ -326,11 +335,14 @@ func (a *Auth) validLocked(payload []byte, head turbotunnel.ClientID) tagResult 
 			}
 		}
 	}
-	known := a.known(head)
+	seen, known := a.known(head, now)
 	tokens, burst := a.refill(now, len(keys.keys))
+	scan := float64(3 * len(keys.keys))
 	switch {
-	case known && tokens-float64(3*len(keys.keys)) < burst/2:
-		return tagKnown // a remembered head never takes the lower half
+	case known && now.Sub(seen) >= knownRescan:
+		return tagKnown
+	case known && tokens < min(burst, burst/2+scan):
+		return tagKnownBusy // a remembered head never takes the lower half
 	case tokens <= 0:
 		return tagThrottled
 	}
@@ -387,23 +399,32 @@ func (a *Auth) cacheSession(cid turbotunnel.ClientID, id string) {
 	a.cache[cid] = id
 }
 
-// known reports whether no key explained a query that began with head; a
-// hit in the previous generation moves to the current one, so an old
-// client that keeps asking stays.
-func (a *Auth) known(head turbotunnel.ClientID) bool {
-	if _, ok := a.unknown[head]; ok {
-		return true
+// known reports whether no key explained a query that began with head, and
+// since when; a hit in the previous generation moves to the current one, so
+// an old client that keeps asking stays.
+func (a *Auth) known(head turbotunnel.ClientID, now time.Time) (time.Time, bool) {
+	if seen, ok := a.unknown[head]; ok {
+		return seen, true
 	}
-	if _, ok := a.unknownPrev[head]; ok {
-		a.remember(head)
-		return true
+	if seen, ok := a.unknownPrev[head]; ok {
+		a.rememberAt(head, seen)
+		return seen, true
 	}
-	return false
+	return now, false
 }
 
-func (a *Auth) remember(head turbotunnel.ClientID) {
+func (a *Auth) remember(head turbotunnel.ClientID) { a.rememberAt(head, a.clock()) }
+
+func (a *Auth) rememberAt(head turbotunnel.ClientID, seen time.Time) {
 	if a.unknown == nil || len(a.unknown) >= authCacheMax {
-		a.unknownPrev, a.unknown = a.unknown, map[turbotunnel.ClientID]struct{}{}
+		a.unknownPrev, a.unknown = a.unknown, map[turbotunnel.ClientID]time.Time{}
 	}
-	a.unknown[head] = struct{}{}
+	a.unknown[head] = seen
+}
+
+func (a *Auth) clock() time.Time {
+	if a.Now != nil {
+		return a.Now()
+	}
+	return time.Now()
 }
