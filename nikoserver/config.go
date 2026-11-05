@@ -294,6 +294,9 @@ func (c *FrontConfig) validate() []ConfigError {
 		} else if b.Mode != "packet" {
 			e.add(path+".backend", "backend %q must have mode packet", z.Backend)
 		}
+		if z.Probe && c.DNS.ProbeKeyFile == "" {
+			e.add(path+".probe", "needs dns.probe_key_file")
+		}
 	}
 	return e
 }

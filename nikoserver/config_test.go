@@ -27,6 +27,11 @@ func TestNekoServerConfigCheck(t *testing.T) {
 	if errs := checkConfig(t, front); len(errs) > 0 {
 		t.Fatal(errs)
 	}
+	// dnsprobe-v1 in the dnstt zone (v0.8.3).
+	probed := strings.Replace(front, `"backend":"dns"}]`, `"backend":"dns","probe":true}],"probe_key_file":"/run/niko/front/dnsprobe.key"`, 1)
+	if errs := checkConfig(t, probed); len(errs) > 0 {
+		t.Fatal(errs)
+	}
 	// R2: tcpmux, as raycontrol renders it with the front on TCP 443.
 	tcpFront := `{"schema":1,"role":"front","log":{"level":"warn"},
 		"backends":{"reality":{"socket":"/run/niko/reality/reality.sock","mode":"proxy-v2","uid":9111},
@@ -88,6 +93,7 @@ func TestNekoServerConfigCheck(t *testing.T) {
 		"tcp.routes[1].sni[0]":      strings.Replace(tcpFront, `"sni":["n.example.com"]`, `"sni":["R.example.com."]`, 1),
 		"udp.routes":                strings.Replace(front, `"dns":{"listen"`, `"udp":{"listen":["0.0.0.0:443"]},"dns":{"listen"`, 1),
 		"dns.zones[0].backend":      strings.Replace(front, `"backend":"dns"}]`, `"backend":"nope"}]`, 1),
+		"dns.zones[0].probe":        strings.Replace(front, `"backend":"dns"}]`, `"backend":"dns","probe":true}]`, 1),
 		"dns.listen[1]":             strings.Replace(front, `"[::]:53"`, `"localhost:53"`, 1),
 		"options.encryption_method": strings.Replace(masterdns, `"encryption_method":5`, `"encryption_method":2`, 1),
 		"inner":                     strings.Replace(dnstt, `"inner":"/run/niko/inner/vless.sock"`, `"inner":"relative.sock"`, 1),
