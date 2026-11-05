@@ -133,16 +133,17 @@ func probeCrypt(enc, b, p []byte) {
 
 // probePlain is an answer's plaintext: the token, what the node saw (the
 // EDNS size the resolver advertised, 0 for none; whether it randomised the
-// name's case; its address), and zeros up to size.
+// name's case; its address), and zeros up to size. The token covers what
+// the node saw too: a resolver cannot change it unseen.
 func probePlain(key, b []byte, edns int, mixed bool, src netip.Addr, size int) []byte {
 	p := make([]byte, size)
-	copy(p, probeMAC(key, []byte("dnsprobe-v1 a"), b)[:probeTokenLen])
 	binary.BigEndian.PutUint16(p[probeTokenLen:], uint16(edns))
 	if mixed {
 		p[probeTokenLen+2] = 1
 	}
 	a := src.As16()
 	copy(p[probeTokenLen+3:], a[:])
+	copy(p, probeMAC(key, []byte("dnsprobe-v1 a"), b, p[probeTokenLen:probeSmall])[:probeTokenLen])
 	return p
 }
 
