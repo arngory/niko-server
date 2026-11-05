@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"www.bamsoftware.com/git/dnstt.git/dns"
+	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
 )
 
 func TestAuth(t *testing.T) {
@@ -120,9 +121,10 @@ func TestAuthServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	var askSized func(payload []byte, edns uint16) uint16
-	ask := func(payload []byte) uint16 { return askSized(payload, 4096) }
-	askSized = func(payload []byte, edns uint16) uint16 {
+	// The rcode and the number of answer records.
+	var askSized func(payload []byte, edns uint16) (uint16, int)
+	ask := func(payload []byte) (uint16, int) { return askSized(payload, 4096) }
+	askSized = func(payload []byte, edns uint16) (uint16, int) {
 		t.Helper()
 		enc := []byte(strings.ToLower(base32Encoding.EncodeToString(payload)))
 		var labels [][]byte
@@ -154,29 +156,133 @@ func TestAuthServer(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return r.Rcode()
+		return r.Rcode(), len(r.Answer)
 	}
+	// Without a valid tag: NOERROR with no record (neko), as for every name
+	// and type the tunnel does not take; with one, the tunnel's TXT.
 	body := append([]byte("CLIENTID"), 0xe0) // a ClientID, no packets
-	if rc := ask(body); rc != dns.RcodeNameError {
-		t.Fatalf("untagged query: rcode %d, want NXDOMAIN", rc)
+	if rc, an := ask(body); rc != dns.RcodeNoError || an != 0 {
+		t.Fatalf("untagged query: rcode %d, %d answers, want NODATA", rc, an)
 	}
 	tag := Tag(&dev, EpochOf(time.Now()), body)
-	if rc := ask(append(tag[:], body...)); rc != dns.RcodeNoError {
-		t.Fatalf("tagged query: rcode %d, want NOERROR", rc)
+	if rc, an := ask(append(tag[:], body...)); rc != dns.RcodeNoError || an != 1 {
+		t.Fatalf("tagged query: rcode %d, %d answers, want the tunnel's TXT", rc, an)
 	}
 	var other [32]byte
 	tag = Tag(&other, EpochOf(time.Now()), body)
-	if rc := ask(append(tag[:], body...)); rc != dns.RcodeNameError {
-		t.Fatalf("query tagged by another key: rcode %d, want NXDOMAIN", rc)
+	if rc, an := ask(append(tag[:], body...)); rc != dns.RcodeNoError || an != 0 {
+		t.Fatalf("query tagged by another key: rcode %d, %d answers, want NODATA", rc, an)
 	}
-	// A probe with a small EDNS size learns nothing either: NXDOMAIN, not
+	// A probe with a small EDNS size learns nothing either: NODATA, not
 	// dnstt's FORMERR for a payload size under its minimum.
-	if rc := askSized(body, 512); rc != dns.RcodeNameError {
-		t.Fatalf("untagged query with EDNS 512: rcode %d, want NXDOMAIN", rc)
+	if rc, an := askSized(body, 512); rc != dns.RcodeNoError || an != 0 {
+		t.Fatalf("untagged query with EDNS 512: rcode %d, %d answers, want NODATA", rc, an)
 	}
+	// A tagged one with EDNS 512 is served (neko): its session gets a
+	// smaller MTU, where dnstt answered FORMERR.
 	tag = Tag(&dev, EpochOf(time.Now()), body)
-	if rc := askSized(append(tag[:], body...), 512); rc != dns.RcodeFormatError {
-		t.Fatalf("tagged query with EDNS 512: rcode %d, want FORMERR", rc)
+	if rc, an := askSized(append(tag[:], body...), 512); rc != dns.RcodeNoError || an != 1 {
+		t.Fatalf("tagged query with EDNS 512: rcode %d, %d answers, want the tunnel's TXT", rc, an)
+	}
+	// Bad base32 and a payload too short for a ClientID: NODATA too.
+	for _, label := range []string{"!!", "aa"} {
+		n, _ := dns.ParseName(label + ".t.example.com")
+		q := dns.Message{ID: 8, Flags: 0x0100, Question: []dns.Question{{Name: n, Type: dns.RRTypeTXT, Class: dns.ClassIN}}}
+		b, _ := q.WireFormat()
+		c.Write(b)
+		buf := make([]byte, 4096)
+		k, err := c.Read(buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r, _ := dns.MessageFromWireFormat(buf[:k]); r.Rcode() != dns.RcodeNoError || len(r.Answer) != 0 {
+			t.Fatalf("%s: rcode %d, %d answers, want NODATA", label, r.Rcode(), len(r.Answer))
+		}
+	}
+}
+
+// Another type than TXT gets NODATA, not NXDOMAIN (neko): a resolver
+// minimising QNAMEs asks for the names above with A or NS, and one that
+// takes NXDOMAIN as "nothing below" (RFC 8020) gave up on the tunnel.
+func TestNoDataForOtherTypes(t *testing.T) {
+	zone, _ := dns.ParseName("t.example.com")
+	for _, name := range []string{"t.example.com", "aaaa.t.example.com", "x.y.t.example.com"} {
+		n, _ := dns.ParseName(name)
+		for _, qtype := range []uint16{1 /* A */, 2 /* NS */, 28 /* AAAA */} {
+			q := &dns.Message{ID: 1, Flags: 0x0100, Question: []dns.Question{{Name: n, Type: qtype, Class: dns.ClassIN}},
+				Additional: []dns.RR{{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 1232}}}
+			resp, payload := responseFor(q, zone, nil)
+			if resp == nil || resp.Rcode() != dns.RcodeNoError || resp.Flags&0x0400 == 0 || payload != nil || carriesData(resp) {
+				t.Errorf("%s type %d: %+v", name, qtype, resp)
+			}
+		}
+	}
+	// TXT still carries data.
+	n, _ := dns.ParseName("aaaaaaaaaaaaaaaa.t.example.com")
+	q := &dns.Message{ID: 1, Flags: 0x0100, Question: []dns.Question{{Name: n, Type: dns.RRTypeTXT, Class: dns.ClassIN}},
+		Additional: []dns.RR{{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 1232}}}
+	if resp, _ := responseFor(q, zone, nil); resp == nil || !carriesData(resp) {
+		t.Errorf("TXT: %+v", resp)
+	}
+}
+
+// Answers fit the requester: the most data for EDNS 512 leaves a usable
+// MTU, and a client's smallest size sets its session's MTU.
+func TestRequesterSizes(t *testing.T) {
+	if e := encodedPayload(512); e-2 < 80 || e >= encodedPayload(maxUDPPayload) {
+		t.Fatalf("encoded payload for 512: %d (for %d: %d)", e, maxUDPPayload, encodedPayload(maxUDPPayload))
+	}
+	if encodedPayload(100) != encodedPayload(512) || encodedPayload(4096) != encodedPayload(maxUDPPayload) {
+		t.Fatal("sizes outside 512..maxUDPPayload not clamped")
+	}
+	var sizes clientSizes
+	id := turbotunnel.ClientID{1}
+	sizes.note(id, 1232)
+	sizes.note(id, 512)
+	sizes.note(id, 1232)
+	mtu := encodedPayload(maxUDPPayload) - 2
+	if got := sessionMTU(mtu, &sizes, id); got != encodedPayload(512)-2 {
+		t.Fatalf("session MTU %d after a 512 requester, want %d", got, encodedPayload(512)-2)
+	}
+	if got := sessionMTU(mtu, &sizes, turbotunnel.ClientID{2}); got != mtu {
+		t.Fatalf("an unknown client: %d, want %d", got, mtu)
+	}
+	// Two generations: a client heard from lately survives a flood of new
+	// ones; nobody is refused for want of room.
+	for i := range 2*clientSizesMax - 1 {
+		var other turbotunnel.ClientID
+		binary.BigEndian.PutUint64(other[:], uint64(i)+100)
+		sizes.note(other, 1232)
+		if i == clientSizesMax/2 {
+			sizes.note(id, 1232) // still heard from
+		}
+	}
+	if got := sizes.get(id); got != 512 {
+		t.Fatalf("a recent client after a flood: %d, want 512", got)
+	}
+	if n := len(sizes.cur) + len(sizes.prev); n > 2*clientSizesMax {
+		t.Fatalf("%d clients kept", n)
+	}
+}
+
+// A session's MTU is set when KCP accepts it, from the smallest requester
+// its client has come through so far; a session never seen gets the full
+// one.
+func TestSessionMTU(t *testing.T) {
+	var sizes clientSizes
+	id := turbotunnel.ClientID{9}
+	full := encodedPayload(maxUDPPayload) - 2
+	if m := sessionMTU(full, &sizes, id); m != encodedPayload(maxUDPPayload)-2 {
+		t.Fatalf("unseen client: MTU %d", m)
+	}
+	sizes.note(id, 1232)
+	sizes.note(id, 512)
+	sizes.note(id, 1232)
+	if m := sessionMTU(full, &sizes, id); m != encodedPayload(512)-2 {
+		t.Fatalf("MTU %d, want %d", m, encodedPayload(512)-2)
+	}
+	if m := sessionMTU(full, nil, id); m != full {
+		t.Fatalf("without sizes: MTU %d", m)
 	}
 }
 
@@ -412,4 +518,103 @@ func TestAuthSmallBudgetCopiedTag(t *testing.T) {
 	if _, ok := a.Check(q); !ok {
 		t.Fatal("the genuine query after a copied tag")
 	}
+}
+
+// capture is a PacketConn that keeps what is written to it.
+type capture struct {
+	net.PacketConn
+	out chan []byte
+}
+
+func (c capture) WriteTo(p []byte, _ net.Addr) (int, error) {
+	c.out <- append([]byte(nil), p...)
+	return len(p), nil
+}
+
+// A packet too large for every answer to this requester (a session older
+// than its smaller resolver) waits in the stash; the answer takes the
+// smaller packets behind it, ACKs among them, instead of going out empty.
+func TestSendLoopOversizeWaits(t *testing.T) {
+	tt := turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, time.Minute)
+	defer tt.Close()
+	id := turbotunnel.ClientID{7}
+	big := bytes.Repeat([]byte{1}, encodedPayload(maxUDPPayload)-2)
+	small := []byte("ack")
+	if !tt.Stash(big, id) {
+		t.Fatal("stash")
+	}
+	tt.WriteTo(small, id)
+	out := make(chan []byte, 4)
+	ch := make(chan *record, 1)
+	go sendLoop(capture{out: out}, tt, ch)
+	zone, _ := dns.ParseName("x.t.example.com")
+	ch <- &record{Resp: &dns.Message{ID: 1, Flags: 0x8400, Question: []dns.Question{{Name: zone, Type: dns.RRTypeTXT, Class: dns.ClassIN}}},
+		Addr: turbotunnel.DummyAddr{}, ClientID: id, Size: 512}
+	var wire []byte
+	select {
+	case wire = <-out:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no answer")
+	}
+	if len(wire) > 512 {
+		t.Fatalf("answer of %d bytes to a 512 requester", len(wire))
+	}
+	m, _ := dns.MessageFromWireFormat(wire)
+	data, _ := dns.DecodeRDataTXT(m.Answer[0].Data)
+	if !bytes.Equal(data, append([]byte{0, 3}, small...)) {
+		t.Fatalf("answer data %q, want the small packet", data)
+	}
+	select {
+	case p := <-tt.Unstash(id):
+		if !bytes.Equal(p, big) {
+			t.Fatal("another packet stashed")
+		}
+	default:
+		t.Fatal("the large packet is gone, not stashed")
+	}
+	close(ch)
+}
+
+// The stash holds a packet too large for this requester; a packet that
+// does not fit what is left of the answer but fits the next takes its
+// place, so it is not lost behind one that cannot go.
+func TestSendLoopStashSwap(t *testing.T) {
+	tt := turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, time.Minute)
+	defer tt.Close()
+	id := turbotunnel.ClientID{8}
+	limit := encodedPayload(512)
+	big := bytes.Repeat([]byte{1}, encodedPayload(maxUDPPayload)-2)
+	first := bytes.Repeat([]byte{2}, limit-2-10)
+	next := bytes.Repeat([]byte{3}, 20)
+	if !tt.Stash(big, id) {
+		t.Fatal("stash")
+	}
+	tt.WriteTo(first, id)
+	tt.WriteTo(next, id)
+	out := make(chan []byte, 4)
+	ch := make(chan *record, 1)
+	go sendLoop(capture{out: out}, tt, ch)
+	zone, _ := dns.ParseName("x.t.example.com")
+	ch <- &record{Resp: &dns.Message{ID: 1, Flags: 0x8400, Question: []dns.Question{{Name: zone, Type: dns.RRTypeTXT, Class: dns.ClassIN}}},
+		Addr: turbotunnel.DummyAddr{}, ClientID: id, Size: 512}
+	var wire []byte
+	select {
+	case wire = <-out:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no answer")
+	}
+	m, _ := dns.MessageFromWireFormat(wire)
+	data, _ := dns.DecodeRDataTXT(m.Answer[0].Data)
+	if !bytes.Equal(data, append([]byte{byte(len(first) >> 8), byte(len(first))}, first...)) {
+		t.Fatalf("answer data of %d bytes, want the first packet", len(data))
+	}
+	select {
+	case p := <-tt.Unstash(id):
+		if !bytes.Equal(p, next) {
+			t.Fatalf("stashed %d bytes, want the next packet", len(p))
+		}
+	default:
+		t.Fatal("nothing stashed")
+	}
+	close(ch)
 }
