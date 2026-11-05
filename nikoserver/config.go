@@ -54,6 +54,10 @@ type DNSZone struct {
 type FrontDNS struct {
 	Listen []string  `json:"listen"`
 	Zones  []DNSZone `json:"zones"`
+	// ProbeKeyFile: the key of dnsprobe-v1 (raycontrol
+	// docs/spec/dnsprobe-v1.md), 32 bytes in hex. With it the front answers
+	// a client's check of a resolver itself, before the zone's backend.
+	ProbeKeyFile string `json:"probe_key_file,omitempty"`
 }
 
 // TCPRoute sends TLS connections with one of these server names, or
@@ -265,6 +269,9 @@ func (c *FrontConfig) validate() []ConfigError {
 	}
 	if len(c.DNS.Zones) == 0 {
 		e.add("dns.zones", "no zones")
+	}
+	if c.DNS.ProbeKeyFile != "" {
+		checkSocket(&e, "dns.probe_key_file", c.DNS.ProbeKeyFile)
 	}
 	seen := map[string]bool{}
 	for i, z := range c.DNS.Zones {

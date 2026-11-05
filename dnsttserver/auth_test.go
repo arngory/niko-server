@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"www.bamsoftware.com/git/dnstt.git/dns"
+	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
 )
 
 func TestAuth(t *testing.T) {
@@ -174,9 +175,60 @@ func TestAuthServer(t *testing.T) {
 	if rc := askSized(body, 512); rc != dns.RcodeNameError {
 		t.Fatalf("untagged query with EDNS 512: rcode %d, want NXDOMAIN", rc)
 	}
+	// A tagged one with EDNS 512 is served (neko): its session gets a
+	// smaller MTU, where dnstt answered FORMERR.
 	tag = Tag(&dev, EpochOf(time.Now()), body)
-	if rc := askSized(append(tag[:], body...), 512); rc != dns.RcodeFormatError {
-		t.Fatalf("tagged query with EDNS 512: rcode %d, want FORMERR", rc)
+	if rc := askSized(append(tag[:], body...), 512); rc != dns.RcodeNoError {
+		t.Fatalf("tagged query with EDNS 512: rcode %d, want NOERROR", rc)
+	}
+}
+
+// Another type than TXT gets NODATA, not NXDOMAIN (neko): a resolver
+// minimising QNAMEs asks for the names above with A or NS, and one that
+// takes NXDOMAIN as "nothing below" (RFC 8020) gave up on the tunnel.
+func TestNoDataForOtherTypes(t *testing.T) {
+	zone, _ := dns.ParseName("t.example.com")
+	for _, name := range []string{"t.example.com", "aaaa.t.example.com", "x.y.t.example.com"} {
+		n, _ := dns.ParseName(name)
+		for _, qtype := range []uint16{1 /* A */, 2 /* NS */, 28 /* AAAA */} {
+			q := &dns.Message{ID: 1, Flags: 0x0100, Question: []dns.Question{{Name: n, Type: qtype, Class: dns.ClassIN}},
+				Additional: []dns.RR{{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 1232}}}
+			resp, payload := responseFor(q, zone, nil)
+			if resp == nil || resp.Rcode() != dns.RcodeNoError || resp.Flags&0x0400 == 0 || payload != nil || carriesData(resp) {
+				t.Errorf("%s type %d: %+v", name, qtype, resp)
+			}
+		}
+	}
+	// TXT still carries data.
+	n, _ := dns.ParseName("aaaaaaaaaaaaaaaa.t.example.com")
+	q := &dns.Message{ID: 1, Flags: 0x0100, Question: []dns.Question{{Name: n, Type: dns.RRTypeTXT, Class: dns.ClassIN}},
+		Additional: []dns.RR{{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 1232}}}
+	if resp, _ := responseFor(q, zone, nil); resp == nil || !carriesData(resp) {
+		t.Errorf("TXT: %+v", resp)
+	}
+}
+
+// Answers fit the requester: the most data for EDNS 512 leaves a usable
+// MTU, and a client's smallest size sets its session's MTU.
+func TestRequesterSizes(t *testing.T) {
+	if e := encodedPayload(512); e-2 < 80 || e >= encodedPayload(maxUDPPayload) {
+		t.Fatalf("encoded payload for 512: %d (for %d: %d)", e, maxUDPPayload, encodedPayload(maxUDPPayload))
+	}
+	if encodedPayload(100) != encodedPayload(512) || encodedPayload(4096) != encodedPayload(maxUDPPayload) {
+		t.Fatal("sizes outside 512..maxUDPPayload not clamped")
+	}
+	var sizes clientSizes
+	id := turbotunnel.ClientID{1}
+	now := time.Now()
+	sizes.note(id, 1232, now)
+	sizes.note(id, 512, now)
+	sizes.note(id, 1232, now)
+	mtu := encodedPayload(maxUDPPayload) - 2
+	if got := sessionMTU(mtu, &sizes, id); got != encodedPayload(512)-2 {
+		t.Fatalf("session MTU %d after a 512 requester, want %d", got, encodedPayload(512)-2)
+	}
+	if got := sessionMTU(mtu, &sizes, turbotunnel.ClientID{2}); got != mtu {
+		t.Fatalf("an unknown client: %d, want %d", got, mtu)
 	}
 }
 
