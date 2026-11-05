@@ -71,6 +71,9 @@ func readHy2Users(path string) ([]string, []string, error) {
 }
 
 // runHysteria serves a Hysteria2 backend on the front's datagrams.
+// hysteriaIdle is the Hysteria2 listener's QUIC idle timeout.
+const hysteriaIdle = 60 * time.Second
+
 func runHysteria(ctx context.Context, c *BackendConfig, conn *packetConn, log *Logger, dial dialFunc) error {
 	tlsConfig, err := sbtls.NewServer(ctx, nopLogger(), option.InboundTLSOptions{
 		Enabled:          true,
@@ -107,7 +110,11 @@ func runHysteria(ctx context.Context, c *BackendConfig, conn *packetConn, log *L
 	// come on top of quic-go's first packets of 1280, so they start 8 bytes
 	// smaller and leave the front at 1280 like every other QUIC on it. Path
 	// MTU discovery then counts only what came through, the salt included.
-	var quicOptions qtls.QUICOptions
+	// 60 s idle rather than Hysteria's 30: quic-go pings at min(the
+	// client's keepalive, idle/2), so a client asking for 25 s (Niko 1.28)
+	// gets 25 s and not 15, which saves its battery. A dead connection
+	// without keepalives is closed 30 s later than before.
+	quicOptions := qtls.QUICOptions{IdleTimeout: hysteriaIdle}
 	if salamander != "" {
 		quicOptions.InitialPacketSize = 1280 - 8
 	}
