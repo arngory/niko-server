@@ -52,7 +52,6 @@ import (
 	"log"
 	"net"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -435,16 +434,21 @@ type record struct {
 	Size int
 	// NoData: the query carried no ClientID, the answer no record.
 	NoData bool
+	// Key is the query's payload (neko): a retry's is the same, however
+	// its name was cased or split into labels (answerMemo).
+	Key string
 }
 
-// answerMemo keeps the data of recent answers by question name (neko). A
-// resolver that hears nothing in time asks again with the same name, the
-// same query of the client's, and takes whichever answer comes first; the
-// other is dropped. Answered with new data, the retry lost what it
-// carried, and KCP had to send it again. Now it gets the first answer's
-// data. Two generations of memoGeneration bound it: an answer is kept 5 to
-// 10 seconds, fewer under a flood. Only sendLoop uses it, from one
-// goroutine.
+// answerMemo keeps the data of recent answers by query payload (neko). A
+// resolver that hears nothing in time asks again, the same query of the
+// client's, and takes whichever answer comes first; the other is dropped.
+// Answered with new data, the retry lost what it carried, and KCP had to
+// send it again. Now it gets the first answer's data, and so does any
+// copy of the query, however its name is cased or split: it takes nothing
+// of the client's next data. The payload carries the client's random
+// padding, so the client never repeats one. Two generations of
+// memoGeneration bound it: an answer is kept 5 to 10 seconds, fewer under
+// a flood. Only sendLoop uses it, from one goroutine.
 type answerMemo struct {
 	cur, prev map[string]memoEntry
 	swapped   time.Time
@@ -460,18 +464,28 @@ const (
 	memoMax        = 4096 // answers in a generation
 )
 
-func memoKey(rec *record) string {
-	return strings.ToLower(rec.Resp.Question[0].Name.String())
+// age turns the generations over by the clock: what is older than two
+// generations is gone even when no answer came meanwhile.
+func (m *answerMemo) age(now time.Time) {
+	switch since := now.Sub(m.swapped); {
+	case m.cur == nil || since > 2*memoGeneration:
+		m.prev, m.cur, m.swapped = nil, make(map[string]memoEntry), now
+	case since > memoGeneration || len(m.cur) >= memoMax:
+		m.prev, m.cur, m.swapped = m.cur, make(map[string]memoEntry), now
+	}
 }
 
-// answer fills rec's answer from the memo, if its name was answered
+// answer fills rec's answer from the memo, if its query was answered
 // lately. Data that would not fit this requester (a retry through a
 // smaller resolver) is not sent: the answer goes out empty.
 func (m *answerMemo) answer(rec *record) bool {
-	key := memoKey(rec)
-	e, ok := m.cur[key]
+	if rec.Key == "" {
+		return false
+	}
+	m.age(time.Now())
+	e, ok := m.cur[rec.Key]
 	if !ok {
-		e, ok = m.prev[key]
+		e, ok = m.prev[rec.Key]
 	}
 	if !ok {
 		return false
@@ -486,11 +500,11 @@ func (m *answerMemo) answer(rec *record) bool {
 }
 
 func (m *answerMemo) remember(rec *record, raw int) {
-	now := time.Now()
-	if m.cur == nil || now.Sub(m.swapped) > memoGeneration || len(m.cur) >= memoMax {
-		m.prev, m.cur, m.swapped = m.cur, make(map[string]memoEntry), now
+	if rec.Key == "" {
+		return
 	}
-	m.cur[memoKey(rec)] = memoEntry{data: rec.Resp.Answer[0].Data, raw: raw}
+	m.age(time.Now())
+	m.cur[rec.Key] = memoEntry{data: rec.Resp.Answer[0].Data, raw: raw}
 }
 
 // requesterSize is a query's EDNS(0) UDP payload size within 512 and
@@ -602,6 +616,7 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 
 		resp, payload := responseFor(&query, domain, auth)
 		size := requesterSize(&query)
+		key := string(payload)
 		// Extract the ClientID from the payload.
 		var clientID turbotunnel.ClientID
 		n = copy(clientID[:], payload)
@@ -630,7 +645,7 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 		// If a response is called for, pass it to sendLoop via the channel.
 		if resp != nil {
 			select {
-			case ch <- &record{resp, addr, clientID, size, noData}:
+			case ch <- &record{resp, addr, clientID, size, noData, key}:
 			default:
 			}
 		}
