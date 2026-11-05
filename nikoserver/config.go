@@ -49,6 +49,10 @@ type BackendRef struct {
 type DNSZone struct {
 	Zone    string `json:"zone"`
 	Backend string `json:"backend"`
+	// Probe: the front answers dnsprobe-v1 in this zone (with
+	// dns.probe_key_file). For dnstt zones: the answers are built as
+	// dnstt's.
+	Probe bool `json:"probe,omitempty"`
 }
 
 type FrontDNS struct {

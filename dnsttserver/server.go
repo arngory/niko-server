@@ -235,16 +235,9 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream Dialer, 
 		if rc := conn.SetMtu(m); !rc {
 			panic(rc)
 		}
-		id, tracked := conn.RemoteAddr().(turbotunnel.ClientID)
-		if tracked && sizes != nil {
-			sizes.track(id, conn, m)
-		}
 		go func() {
 			defer func() {
 				log.Printf("end session %08x", conn.GetConv())
-				if tracked && sizes != nil {
-					sizes.untrack(id, conn)
-				}
 				conn.Close()
 			}()
 			err := acceptStreams(conn, privkey, upstream)
@@ -478,19 +471,14 @@ func encodedPayload(size int) int {
 
 // clientSizes remembers the smallest requester size each client's queries
 // came with (neko): a session's KCP MTU is set from it when KCP accepts
-// it, and lowered when a smaller requester comes later, so its packets fit
-// the answers of every resolver it goes through. Two generations bound it:
-// a client not heard from for a generation or two is forgotten, never
-// refused.
+// it, so its packets fit the answers of the resolvers it goes through. The
+// MTU of a live session is never changed: KCP panics on segments queued at
+// the old size. A smaller requester later gets the packets that fit, the
+// others wait (sendLoop). Two generations bound the map: a client not heard
+// from for a generation or two is forgotten, never refused.
 type clientSizes struct {
 	mu        sync.Mutex
 	cur, prev map[turbotunnel.ClientID]int
-	sessions  map[turbotunnel.ClientID]*liveSession
-}
-
-type liveSession struct {
-	conn *kcp.UDPSession
-	mtu  int
 }
 
 // clientSizesMax is the clients of a generation.
@@ -500,7 +488,7 @@ func (c *clientSizes) note(id turbotunnel.ClientID, size int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.cur == nil {
-		c.cur, c.sessions = map[turbotunnel.ClientID]int{}, map[turbotunnel.ClientID]*liveSession{}
+		c.cur = map[turbotunnel.ClientID]int{}
 	}
 	old, ok := c.cur[id]
 	if !ok {
@@ -512,15 +500,6 @@ func (c *clientSizes) note(id turbotunnel.ClientID, size int) {
 		size = old
 	}
 	c.cur[id] = size
-	// A live session whose packets are too large for this requester: its
-	// new ones get smaller. The ones in flight keep their size and wait for
-	// an answer with room (sendLoop).
-	if s := c.sessions[id]; s != nil {
-		if m := encodedPayload(size) - 2; m < s.mtu && s.conn.SetMtu(m) {
-			log.Printf("session %08x: MTU %d for a requester payload size of %d", s.conn.GetConv(), m, size)
-			s.mtu = m
-		}
-	}
 }
 
 func (c *clientSizes) get(id turbotunnel.ClientID) int {
@@ -533,24 +512,6 @@ func (c *clientSizes) get(id turbotunnel.ClientID) int {
 		return s
 	}
 	return maxUDPPayload
-}
-
-// track follows a client's session while it lives (untrack), for note.
-func (c *clientSizes) track(id turbotunnel.ClientID, conn *kcp.UDPSession, mtu int) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.sessions == nil {
-		c.cur, c.sessions = map[turbotunnel.ClientID]int{}, map[turbotunnel.ClientID]*liveSession{}
-	}
-	c.sessions[id] = &liveSession{conn, mtu}
-}
-
-func (c *clientSizes) untrack(id turbotunnel.ClientID, conn *kcp.UDPSession) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if s := c.sessions[id]; s != nil && s.conn == conn {
-		delete(c.sessions, id)
-	}
 }
 
 // sessionMTU is the KCP MTU of a client's session: the most a packet may
@@ -674,7 +635,6 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 					unstash = nil // a nil channel is never ready
 				}
 				outgoing := ttConn.OutgoingQueue(rec.ClientID)
-				fromStash := false
 				// Prioritize taking a packet first from the
 				// stash, then from the outgoing queue, then
 				// finally check for the expiration of the timer
@@ -682,16 +642,13 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 				// query that we must respond to).
 				select {
 				case p = <-unstash:
-					fromStash = true
 				default:
 					select {
 					case p = <-unstash:
-						fromStash = true
 					case p = <-outgoing:
 					default:
 						select {
 						case p = <-unstash:
-							fromStash = true
 						case p = <-outgoing:
 						case <-timer.C:
 							timerExpired = true
@@ -719,18 +676,24 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 					// Stash this packet to send in the next
 					// response. (neko) The first packet too,
 					// instead of being truncated and lost.
-					stashed := ttConn.Stash(p, rec.ClientID)
+					if !ttConn.Stash(p, rec.ClientID) && skipStash && 2+len(p) <= encodedPayload(rec.Size) {
+						// The stash holds a packet no answer to
+						// this requester can carry, and this one
+						// fits the next: it goes first, the other
+						// is dropped, and KCP sends it again.
+						select {
+						case <-ttConn.Unstash(rec.ClientID):
+						default:
+						}
+						ttConn.Stash(p, rec.ClientID)
+					}
 					if payload.Len() > 0 {
 						break // this answer is full
 					}
 					// Larger than any answer to this requester
-					// (a session older than its smaller
+					// (a session that began through a larger
 					// resolver): it waits for a larger one,
-					// the rest goes on. With the stash taken,
-					// it is dropped, and KCP sends it again.
-					if !stashed && fromStash {
-						log.Printf("dropping a stashed packet of %d bytes", len(p))
-					}
+					// the rest goes on.
 					skipStash = true
 					continue
 				}
@@ -991,3 +954,8 @@ func GenerateKeypair() (private, public string, err error) {
 	}
 	return noise.EncodeKey(privkey), noise.EncodeKey(noise.PubkeyFromPrivkey(privkey)), nil
 }
+
+// MaxTXTData is the most TXT data dnstt puts in an answer to a requester
+// of this EDNS size (512 for none): the DNS front's probe answers keep
+// within it, as the tunnel's own do (neko).
+func MaxTXTData(size int) int { return encodedPayload(size) }
