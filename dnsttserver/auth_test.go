@@ -202,8 +202,10 @@ func TestAuthScanBudget(t *testing.T) {
 	for i := range byte(10) {
 		a.Check(garbage(i))
 	}
-	if th := a.Throttled.Load(); th != 9 { // one scan left for garbage
-		t.Fatalf("throttled %d, want 9", th)
+	// The first query cost 1 HMAC (the key's tag of this epoch): 5 left,
+	// enough for two scans of garbage before the budget is spent.
+	if th := a.Throttled.Load(); th != 8 {
+		t.Fatalf("throttled %d, want 8", th)
 	}
 	// The known session needs no scan, and a reload of the same keys keeps it.
 	a.SetKeys([]byte("d1 " + hex.EncodeToString(dev[:])))
@@ -335,5 +337,44 @@ func TestTagVector(t *testing.T) {
 	e := EpochOf(time.Unix(1767268800, 0))
 	if tag := Tag(&key, e, payload); e != 2945448 || hex.EncodeToString(tag[:]) != "67e1435d89134138" {
 		t.Fatalf("epoch %d tag %x", e, tag)
+	}
+}
+
+// Someone who sees a query on the way copies its tag into garbage: the head
+// is remembered, but the session's own queries, the resolver's retransmit
+// included, still pass; so does a new session's first query while the node
+// has budget to spare.
+func TestAuthCopiedTag(t *testing.T) {
+	var dev [32]byte
+	rand.Read(dev[:])
+	now := time.Unix(1_800_000_000, 0)
+	for _, mode := range []AuthMode{AuthRequired, AuthOptional} {
+		a := &Auth{Mode: mode, Now: func() time.Time { return now }}
+		a.SetKeys([]byte("d1 " + hex.EncodeToString(dev[:])))
+		query := func(cid string, n byte) []byte {
+			body := append([]byte(cid), 0xe0, n)
+			tag := Tag(&dev, EpochOf(now), body)
+			return append(tag[:], body...)
+		}
+		poison := func(q []byte) { a.Check(append(bytes.Clone(q[:AuthTagLen]), "GARBAGE!"...)) }
+
+		// An established session.
+		if _, ok := a.Check(query("SESSION1", 0)); !ok {
+			t.Fatal("first query refused")
+		}
+		q := query("SESSION1", 1)
+		if rest, ok := a.Check(q); !ok || !bytes.Equal(rest, q[AuthTagLen:]) {
+			t.Fatalf("mode %d: query refused", mode)
+		}
+		poison(q)
+		if rest, ok := a.Check(q); !ok || !bytes.Equal(rest, q[AuthTagLen:]) {
+			t.Fatalf("mode %d: the retransmit after a copied tag: ok %v rest %q", mode, ok, rest)
+		}
+		// A new session's first query, copied before it arrives.
+		n := query("SESSION2", 0)
+		poison(n)
+		if rest, ok := a.Check(n); !ok || !bytes.Equal(rest, n[AuthTagLen:]) {
+			t.Fatalf("mode %d: a new session after a copied tag: ok %v rest %q", mode, ok, rest)
+		}
 	}
 }

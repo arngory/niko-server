@@ -82,7 +82,8 @@ type Auth struct {
 	// ScanHMACs bounds the HMACs a second spent on full scans of the keys
 	// (a query no cached session explains; up to 3 per device each), so
 	// garbage cannot take the tunnel's one reader; two seconds' worth may
-	// go at once. Zero: 100000, a few percent of a core.
+	// go at once. Zero: 100000 (a few percent of a core), or 20 full scans
+	// a second if the devices are more than that allows.
 	ScanHMACs float64
 
 	keys atomic.Pointer[authKeys]
@@ -248,10 +249,7 @@ func (a *Auth) Check(payload []byte) (rest []byte, ok bool) {
 	}
 	var head turbotunnel.ClientID
 	copy(head[:], payload)
-	if a.known(head) {
-		return untagged()
-	}
-	switch a.validLocked(payload) {
+	switch a.validLocked(payload, head) {
 	case tagValid:
 		a.Valid.Add(1)
 		return payload[AuthTagLen:], true
@@ -261,6 +259,8 @@ func (a *Auth) Check(payload []byte) (rest []byte, ok bool) {
 		a.Throttled.Add(1)
 		a.Refused.Add(1)
 		return nil, false
+	case tagKnown:
+		return untagged() // no key explained this head before
 	}
 	a.remember(head)
 	return untagged()
@@ -269,14 +269,26 @@ func (a *Auth) Check(payload []byte) (rest []byte, ok bool) {
 type tagResult int
 
 const (
-	tagInvalid tagResult = iota
-	tagValid
-	tagThrottled
+	tagInvalid   tagResult = iota
+	tagValid               // a key's tag
+	tagThrottled           // not looked at: over the budget
+	tagKnown               // the head of a query no key explained before
 )
 
-func (a *Auth) validLocked(payload []byte) tagResult {
+// validLocked checks a tag: first against the keys of the session its
+// ClientID names, if it is cached, so a session's queries, retransmits
+// included, pass whatever else came with the same first bytes; then, if
+// the head is not one no key explained before, against all the keys within
+// the budget. A remembered head is scanned anyway while at least half the
+// budget is left: someone who copies a new session's tag into garbage
+// cannot get the session's first query refused unless the node is under
+// load.
+func (a *Auth) validLocked(payload []byte, head turbotunnel.ClientID) tagResult {
 	keys := a.keys.Load()
 	if keys == nil || len(keys.keys) == 0 {
+		if a.known(head) {
+			return tagKnown
+		}
 		return tagInvalid
 	}
 	var tag [AuthTagLen]byte
@@ -291,7 +303,9 @@ func (a *Auth) validLocked(payload []byte) tagResult {
 	e := EpochOf(now)
 	epochs := [3]uint32{e, e - 1, e + 1}
 	var t [AuthTagLen]byte
+	hmacs := 0
 	match := func(i int, epoch uint32) bool {
+		hmacs++
 		tagWith(keys.macs[i], epoch, body, &a.scratch, &t)
 		return hmac.Equal(t[:], tag[:])
 	}
@@ -312,11 +326,17 @@ func (a *Auth) validLocked(payload []byte) tagResult {
 			}
 		}
 	}
-	// All the others, within the budget: the current epoch first, where a
-	// client's tag nearly always is.
-	if !a.spend(now, 3*(len(keys.keys)-len(tried))) {
+	known := a.known(head)
+	tokens, burst := a.refill(now, len(keys.keys))
+	switch {
+	case known && tokens-float64(3*len(keys.keys)) < burst/2:
+		return tagKnown // a remembered head never takes the lower half
+	case tokens <= 0:
 		return tagThrottled
 	}
+	// All the others: the current epoch first, where a client's tag nearly
+	// always is. Only the HMACs done are charged.
+	defer func() { a.tokens -= float64(hmacs) }()
 	for _, epoch := range epochs {
 		for i := range keys.keys {
 			if slices.Contains(tried, i) {
@@ -328,28 +348,29 @@ func (a *Auth) validLocked(payload []byte) tagResult {
 			}
 		}
 	}
+	if known {
+		return tagKnown
+	}
 	return tagInvalid
 }
 
-// spend takes the HMACs of a full scan from the budget.
-func (a *Auth) spend(now time.Time, hmacs int) bool {
+// refill brings the budget up to now and returns it with its ceiling. The
+// rate is ScanHMACs, or by default 100000 a second and at least 20 full
+// scans of n devices; two seconds' worth may go at once. A scan may start
+// while the budget is above zero and leave it below.
+func (a *Auth) refill(now time.Time, n int) (tokens, burst float64) {
 	rate := a.ScanHMACs
 	if rate <= 0 {
-		rate = 100000
+		rate = max(100000, float64(3*n*20))
 	}
-	// Room for one scan at least, however many devices there are.
-	burst := max(2*rate, float64(hmacs))
+	burst = 2 * rate
 	if a.last.IsZero() {
 		a.tokens = burst
 	} else if d := now.Sub(a.last).Seconds(); d > 0 {
 		a.tokens = min(burst, a.tokens+d*rate)
 	}
 	a.last = now
-	if a.tokens < float64(hmacs) {
-		return false
-	}
-	a.tokens -= float64(hmacs)
-	return true
+	return a.tokens, burst
 }
 
 // cacheSession remembers the device a session's tag was valid for.

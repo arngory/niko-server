@@ -76,7 +76,7 @@ func RunBackend(ctx context.Context, c *BackendConfig, log *Logger) error {
 		mode, _ := dnsttserver.ParseAuthMode(c.Options.Auth)
 		var auth *dnsttserver.Auth
 		if mode != dnsttserver.AuthOff {
-			auth = &dnsttserver.Auth{Mode: mode}
+			auth = &dnsttserver.Auth{Mode: mode, ScanHMACs: float64(c.Options.AuthScanHMACs)}
 			if err := auth.LoadKeys(c.Options.AuthKeysFile); err != nil {
 				return envError("dnstt auth keys %s: %v", c.Options.AuthKeysFile, err)
 			}
