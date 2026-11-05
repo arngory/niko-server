@@ -75,6 +75,8 @@ JSON Schema появится в `arngory/sing-box`, `cmd/niko-server/schema/` в
 - Маршрут без бэкенда в `backends` — ошибка `check`.
 - Секции `tcp`, `udp`, `dns` необязательны: нет маршрутов — нет секции, фронт этот порт не слушает. Нужна хотя бы
   одна. Фронт обслуживает `dns` (с v0.1), `tcp` (с v0.2) и `udp` (с v0.3).
+- `dns.listen` занимается с SO_REUSEADDR (с v0.8.2): заглушка systemd-resolved на 127.0.0.53:53 и 127.0.0.54:53
+  (тоже с SO_REUSEADDR) остаётся, датаграммы на её адреса ядро отдаёт ей, остальные — фронту.
 - `udp.routes[]`: в каждом маршруте либо `sni` (имя из ClientHello в QUIC Initial; ClientHello может занимать
   несколько Initial, фронт собирает его), либо `salamander_password_file` (пакет снимается этим паролем и внутри —
   QUIC Initial). Бэкенд — с режимом `packet`, датаграммы идут ему как есть (для salamander — обфусцированными).
