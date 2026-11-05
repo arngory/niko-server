@@ -247,3 +247,19 @@ func BenchmarkAuthGarbage(b *testing.B) {
 		a.Check(q)
 	}
 }
+
+// The client's vector (Niko, T2): K for device key 11 x 32, node 33 x 16,
+// service 3 (dnsauth-v1 §2), the payload 00..17 at 1767268800.
+func TestTagVector(t *testing.T) {
+	k, _ := hex.DecodeString("2f9bd5e6fc2ef3f56206998eee87f2d4b798a66c3c846ef34eff2f2647599bd5")
+	var key [32]byte
+	copy(key[:], k)
+	payload := make([]byte, 0x18)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	e := EpochOf(time.Unix(1767268800, 0))
+	if tag := Tag(&key, e, payload); e != 2945448 || hex.EncodeToString(tag[:]) != "67e1435d89134138" {
+		t.Fatalf("epoch %d tag %x", e, tag)
+	}
+}
