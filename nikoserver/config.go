@@ -110,6 +110,10 @@ type BackendOptions struct {
 	// reread when the file changes).
 	Auth         string `json:"auth,omitempty"`
 	AuthKeysFile string `json:"auth_keys_file,omitempty"`
+	// AuthScanHMACs bounds the HMACs a second spent on finding the key of
+	// a query no session explains (dnsttserver.Auth.ScanHMACs); 0: the
+	// default, 100000 or 20 full scans a second.
+	AuthScanHMACs int `json:"auth_scan_hmacs,omitempty"`
 	// masterdns
 	Zones             []string `json:"zones,omitempty"`
 	EncryptionMethod  *int     `json:"encryption_method,omitempty"`
@@ -375,8 +379,11 @@ func (c *BackendConfig) validate() []ConfigError {
 	if c.Kind != "yggdrasil" && (len(c.Options.ExitPorts) > 0 || len(c.Options.Peers) > 0) {
 		e.add("options", "exit_ports and peers are Yggdrasil options")
 	}
-	if c.Kind != "dnstt" && (c.Options.Auth != "" || c.Options.AuthKeysFile != "") {
-		e.add("options", "auth and auth_keys_file are dnstt options")
+	if c.Options.AuthScanHMACs < 0 {
+		e.add("options.auth_scan_hmacs", "not below 0")
+	}
+	if c.Kind != "dnstt" && (c.Options.Auth != "" || c.Options.AuthKeysFile != "" || c.Options.AuthScanHMACs != 0) {
+		e.add("options", "auth, auth_keys_file and auth_scan_hmacs are dnstt options")
 	}
 	if c.Kind == "dnstt" || c.Kind == "masterdns" || c.Kind == "yggdrasil" {
 		if c.Inner == "" {

@@ -267,8 +267,35 @@ func salamanderOpen(password, datagram []byte) ([]byte, bool) {
 	if len(datagram) <= 8 {
 		return nil, false
 	}
-	key := blake2b.Sum256(append(append([]byte(nil), password...), datagram[:8]...))
+	key := salamanderKey(password, datagram[:8])
 	out := make([]byte, len(datagram)-8)
 	hysteria2.SalamanderXOR(out, datagram[8:], &key, 0)
 	return out, true
+}
+
+// salamanderInitial reports whether a datagram is a QUIC Initial under
+// salamander with this password: only the 7 bytes that tell are opened, on
+// the stack, so a garbage datagram costs one key and no copy.
+func salamanderInitial(password, datagram []byte) bool {
+	if len(datagram) < 8+7 {
+		return false
+	}
+	key := salamanderKey(password, datagram[:8])
+	var head [7]byte
+	for i := range head {
+		head[i] = datagram[8+i] ^ key[i]
+	}
+	return isQUICInitial(head[:])
+}
+
+// salamanderKey is BLAKE2b-256(password || salt), without an allocation for
+// a password of up to 120 bytes.
+func salamanderKey(password, salt []byte) [blake2b.Size256]byte {
+	var in [128]byte
+	if len(password)+len(salt) <= len(in) {
+		n := copy(in[:], password)
+		n += copy(in[n:], salt)
+		return blake2b.Sum256(in[:n])
+	}
+	return blake2b.Sum256(append(password[:len(password):len(password)], salt...))
 }
