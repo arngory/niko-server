@@ -3,6 +3,7 @@ package dnsttserver
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"net"
@@ -29,23 +30,27 @@ func TestAuth(t *testing.T) {
 		return append(tag[:], body...)
 	}
 
-	for name, c := range map[string]struct {
+	// In order: a query whose tag failed is remembered, so a copy of
+	// alice's tag with the body tampered with comes after alice's own.
+	for _, c := range []struct {
+		name    string
 		payload []byte
 		mode    AuthMode
 		ok      bool
 		rest    []byte
 	}{
-		"alice":                  {signed(&alice, now), AuthRequired, true, body},
-		"bob, the epoch before":  {signed(&bob, now.Add(-AuthEpoch)), AuthRequired, true, body},
-		"alice, the epoch after": {signed(&alice, now.Add(AuthEpoch)), AuthRequired, true, body},
-		"alice, two epochs late": {signed(&alice, now.Add(-2*AuthEpoch)), AuthRequired, false, nil},
-		"untagged, required":     {body, AuthRequired, false, nil},
-		"untagged, optional":     {body, AuthOptional, true, body},
-		"tagged, optional":       {signed(&bob, now), AuthOptional, true, body},
-		"untagged, off":          {body, AuthOff, true, body},
-		"short":                  {[]byte("short"), AuthRequired, false, nil},
-		"tampered after the tag": {append(signed(&alice, now)[:len(body)+AuthTagLen-1], 'X'), AuthRequired, false, nil},
+		{"alice", signed(&alice, now), AuthRequired, true, body},
+		{"bob, the epoch before", signed(&bob, now.Add(-AuthEpoch)), AuthRequired, true, body},
+		{"alice, the epoch after", signed(&alice, now.Add(AuthEpoch)), AuthRequired, true, body},
+		{"alice, two epochs late", signed(&alice, now.Add(-2*AuthEpoch)), AuthRequired, false, nil},
+		{"untagged, required", body, AuthRequired, false, nil},
+		{"untagged, optional", body, AuthOptional, true, body},
+		{"tagged, optional", signed(&bob, now), AuthOptional, true, body},
+		{"untagged, off", body, AuthOff, true, body},
+		{"short", []byte("short"), AuthRequired, false, nil},
+		{"tampered after the tag", append(signed(&alice, now)[:len(body)+AuthTagLen-1], 'X'), AuthRequired, false, nil},
 	} {
+		name := c.name
 		a.Mode = c.mode
 		rest, ok := a.Check(c.payload)
 		if ok != c.ok || !bytes.Equal(rest, c.rest) {
@@ -174,13 +179,14 @@ func TestAuthServer(t *testing.T) {
 	}
 }
 
-// Full scans of the keys have a budget: garbage beyond it is refused
-// unread, while sessions already known go on; the budget refills.
+// Full scans of the keys have a budget in HMACs: garbage beyond it is
+// refused unread, while sessions already known go on; the budget refills.
 func TestAuthScanBudget(t *testing.T) {
 	var dev [32]byte
 	rand.Read(dev[:])
 	now := time.Unix(1_800_000_000, 0)
-	a := &Auth{Mode: AuthRequired, Now: func() time.Time { return now }, ScanRate: 1, ScanBurst: 3}
+	// One device: 3 HMACs a scan; 3 a second, 6 at once.
+	a := &Auth{Mode: AuthRequired, Now: func() time.Time { return now }, ScanHMACs: 3}
 	if err := a.SetKeys([]byte("d1 " + hex.EncodeToString(dev[:]))); err != nil {
 		t.Fatal(err)
 	}
@@ -191,14 +197,13 @@ func TestAuthScanBudget(t *testing.T) {
 		t.Fatal("first tagged query refused")
 	}
 	garbage := func(i byte) []byte {
-		g := append([]byte{i, 1, 2, 3, 4, 5, 6, 7}, "OTHERCID\xe0"...)
-		return g
+		return append([]byte{i, 1, 2, 3, 4, 5, 6, 7}, "OTHERCID\xe0"...)
 	}
 	for i := range byte(10) {
 		a.Check(garbage(i))
 	}
-	if th := a.Throttled.Load(); th != 8 { // 3 - 1 tokens left for garbage
-		t.Fatalf("throttled %d, want 8", th)
+	if th := a.Throttled.Load(); th != 9 { // one scan left for garbage
+		t.Fatalf("throttled %d, want 9", th)
 	}
 	// The known session needs no scan, and a reload of the same keys keeps it.
 	a.SetKeys([]byte("d1 " + hex.EncodeToString(dev[:])))
@@ -211,18 +216,85 @@ func TestAuthScanBudget(t *testing.T) {
 	if a.Throttled.Load() != before {
 		t.Fatal("the budget did not refill")
 	}
+}
 
-	// Optional mode: an old client's untagged ClientID is scanned once.
-	o := &Auth{Mode: AuthOptional, Now: func() time.Time { return now }, ScanRate: 0.001, ScanBurst: 1}
-	o.SetKeys([]byte("d1 " + hex.EncodeToString(dev[:])))
+// An old client's untagged ClientID is scanned once: in required mode it is
+// then refused without spending the budget, so a flood of untagged queries
+// (old clients after the switch to required) leaves room for new sessions;
+// in optional mode it is taken, and stays known while the client asks.
+func TestAuthUnknownHeads(t *testing.T) {
+	var dev [32]byte
+	rand.Read(dev[:])
+	now := time.Unix(1_800_000_000, 0)
+	keys := []byte("d1 " + hex.EncodeToString(dev[:]))
 	old := append([]byte("OLDCLIEN"), "\xe0 packets of an old client"...)
-	for range 5 {
-		if rest, ok := o.Check(old); !ok || !bytes.Equal(rest, old) {
-			t.Fatalf("untagged query in optional mode: %v", ok)
+
+	r := &Auth{Mode: AuthRequired, Now: func() time.Time { return now }, ScanHMACs: 3}
+	r.SetKeys(keys)
+	for range 100 {
+		if _, ok := r.Check(old); ok {
+			t.Fatal("untagged query taken in required mode")
 		}
 	}
-	if o.Throttled.Load() != 0 || o.Untagged.Load() != 5 {
-		t.Fatalf("throttled %d untagged %d", o.Throttled.Load(), o.Untagged.Load())
+	body := append([]byte("NEWCLIEN"), 0xe0)
+	tag := Tag(&dev, EpochOf(now), body)
+	if _, ok := r.Check(append(tag[:], body...)); !ok || r.Throttled.Load() != 0 {
+		t.Fatalf("a new session after an untagged flood: throttled %d", r.Throttled.Load())
+	}
+
+	o := &Auth{Mode: AuthOptional, Now: func() time.Time { return now }, ScanHMACs: 0.001}
+	o.SetKeys(keys)
+	if rest, ok := o.Check(old); !ok || !bytes.Equal(rest, old) {
+		t.Fatal("untagged query refused in optional mode")
+	}
+	// Short payloads cost nothing and are not remembered: they cannot push
+	// the old client out. The old client keeps asking through it all.
+	for i := range 3 * authCacheMax {
+		var short [12]byte
+		binary.BigEndian.PutUint64(short[:], uint64(i))
+		o.Check(short[:])
+		if i%1000 == 0 {
+			if _, ok := o.Check(old); !ok {
+				t.Fatalf("old client refused after %d short queries", i)
+			}
+		}
+	}
+	if o.Throttled.Load() != 0 || len(o.unknown)+len(o.unknownPrev) != 1 {
+		t.Fatalf("throttled %d, unknown %d+%d", o.Throttled.Load(), len(o.unknown), len(o.unknownPrev))
+	}
+	// Generations turn over while the old client asks: it moves along.
+	for i := range 3 * authCacheMax {
+		o.remember([8]byte{byte(i), byte(i >> 8), byte(i >> 16), 1})
+		if i%1000 == 0 && !o.known([8]byte(old[:8])) {
+			t.Fatalf("old client forgotten after %d others", i)
+		}
+	}
+}
+
+// A device id with two keys (one being replaced): a session on either is
+// checked on the cached path, without a scan.
+func TestAuthTwoKeysOneID(t *testing.T) {
+	var k1, k2 [32]byte
+	rand.Read(k1[:])
+	rand.Read(k2[:])
+	now := time.Unix(1_800_000_000, 0)
+	a := &Auth{Mode: AuthRequired, Now: func() time.Time { return now }, ScanHMACs: 6}
+	a.SetKeys([]byte("d1 " + hex.EncodeToString(k1[:]) + "\nd1 " + hex.EncodeToString(k2[:])))
+	body := append([]byte("SESSION1"), 0xe0)
+	signed := func(k *[32]byte) []byte {
+		tag := Tag(k, EpochOf(now), body)
+		return append(tag[:], body...)
+	}
+	if _, ok := a.Check(signed(&k1)); !ok {
+		t.Fatal("first key refused")
+	}
+	for range 20 {
+		if _, ok := a.Check(signed(&k1)); !ok {
+			t.Fatal("first key refused on the cached path")
+		}
+	}
+	if a.Throttled.Load() != 0 {
+		t.Fatalf("throttled %d: the cached path scanned", a.Throttled.Load())
 	}
 }
 
@@ -235,15 +307,17 @@ func BenchmarkAuthGarbage(b *testing.B) {
 		rand.Read(k[:])
 		keys.WriteString("d" + strings.Repeat("x", i%7) + hex.EncodeToString(k[:4]) + " " + hex.EncodeToString(k[:]) + "\n")
 	}
-	a := &Auth{Mode: AuthRequired, ScanRate: 1e12, ScanBurst: 1e12}
+	a := &Auth{Mode: AuthRequired, ScanHMACs: 1e12}
 	if err := a.SetKeys([]byte(keys.String())); err != nil {
 		b.Fatal(err)
 	}
 	q := make([]byte, 120)
 	rand.Read(q)
 	b.ReportAllocs()
+	var n uint64
 	for b.Loop() {
-		q[0]++
+		n++ // a new head every time: a full scan each
+		binary.BigEndian.PutUint64(q, n)
 		a.Check(q)
 	}
 }
