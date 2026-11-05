@@ -53,7 +53,7 @@ func probeOpen(t *testing.T, key []byte, label string, reply []byte, withOPT boo
 	}
 	b, _ := probeBase32.DecodeString(strings.ToUpper(label))
 	probeCrypt(probeMAC(key, []byte("dnsprobe-v1 e")), b, plain)
-	if !bytes.Equal(plain[:probeTokenLen], probeMAC(key, []byte("dnsprobe-v1 a"), b)[:probeTokenLen]) {
+	if len(plain) < probeSmall || !bytes.Equal(plain[:probeTokenLen], probeMAC(key, []byte("dnsprobe-v1 a"), b, plain[probeTokenLen:probeSmall])[:probeTokenLen]) {
 		t.Fatalf("token % x", plain[:probeTokenLen])
 	}
 	return plain
@@ -83,7 +83,7 @@ func TestProbeVectors(t *testing.T) {
 	t.Logf("label %s, small answer data %x", label, plain)
 	// Worked out apart from this code too (Python, hmac and base64).
 	const wantLabel = "aeaadoubicqkdivduss2nj2inuqqx7vwla4ifvi"
-	const wantData = "a07d634d249e5a0a5a74642fcb05000be2733f6dbdb92d439b28a37af4894debbcd0a1"
+	const wantData = "42c10f1d94c67a0d8a02d86b2d81e9f1e2733f6dbdb92d439b28a37af4894debbcd0a1"
 	if label != wantLabel || hex.EncodeToString(plain) != wantData {
 		t.Fatalf("vectors changed: label %s, data %x", label, plain)
 	}
