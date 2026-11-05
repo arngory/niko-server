@@ -84,7 +84,7 @@ func listenDNS(ctx context.Context, network string, addr netip.AddrPort) (*net.U
 
 func runDNSFront(ctx context.Context, c *FrontConfig, log *Logger) error {
 	front := &dnsFront{log: log, zoneBackend: make(map[string]*backendLink), sockets: make(map[netip.AddrPort]*net.UDPConn),
-		probeZones: map[string]bool{}}
+		probeZones: map[string]bool{}, apex: map[string]*apexZone{}}
 	if c.DNS.ProbeKeyFile != "" {
 		// Without the key the front answers no probes, and goes on: the
 		// tunnels, TCP and UDP 443 must not stop for a resolver check.
@@ -119,6 +119,7 @@ func runDNSFront(ctx context.Context, c *FrontConfig, log *Logger) error {
 		inDNS[z.Backend] = true
 	}
 	links := make(map[string]*backendLink)
+	serial := apexSerial()
 	for name, ref := range c.Backends {
 		if ref.Mode != "packet" || !inDNS[name] {
 			continue
@@ -131,6 +132,9 @@ func runDNSFront(ctx context.Context, c *FrontConfig, log *Logger) error {
 		front.zoneBackend[zone] = links[z.Backend]
 		if z.Probe {
 			front.probeZones[zone] = true
+		}
+		if len(z.NS) > 0 {
+			front.apex[zone] = newApexZone(zone, z.NS, serial)
 		}
 	}
 	for _, link := range links {
@@ -157,6 +161,7 @@ type dnsFront struct {
 	log         *Logger
 	probe       *dnsProbe       // dnsprobe-v1, nil without a key
 	probeZones  map[string]bool // the zones it answers in
+	apex        map[string]*apexZone
 	zones       []string
 	zoneBackend map[string]*backendLink
 	sockets     map[netip.AddrPort]*net.UDPConn
@@ -191,6 +196,12 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 			continue
 		}
 		client = netip.AddrPortFrom(client.Addr().Unmap(), client.Port())
+		if a := f.apex[zone]; a != nil && name == zone {
+			if reply, ok := a.answer(query); ok {
+				conn.WriteToUDPAddrPort(reply, client)
+				continue
+			}
+		}
 		if f.probe != nil && f.probeZones[zone] {
 			if reply, probe := f.probe.answer(query, name, questionEnd, zone, client.Addr()); probe {
 				if reply != nil {

@@ -52,7 +52,7 @@ JSON Schema появится в `arngory/sing-box`, `cmd/niko-server/schema/` в
   "dns": {
     "listen": ["0.0.0.0:53", "[::]:53"],
     "zones": [
-      {"zone": "t5x.example.com", "backend": "dnstt", "probe": true},
+      {"zone": "t5x.example.com", "backend": "dnstt", "probe": true, "ns": ["xk2.example.com"]},
       {"zone": "v9c.example.com", "backend": "masterdns"}
     ],
     "probe_key_file": "/run/credentials/niko-front.service/dnsprobe.key"
@@ -88,6 +88,11 @@ JSON Schema появится в `arngory/sing-box`, `cmd/niko-server/schema/` в
   не касается. Если файл ключа не читается, фронт пишет предупреждение и работает без проб: туннели, TCP и UDP 443
   не останавливаются. `"probe": true` без `dns.probe_key_file` — ошибка `check`. Снаружи ответ пробы — ответ dnstt по форме, но его данные не кадры KCP: тот, кто разбирает кадры
   dnstt в ответах, отличит пробу, но он и туннель уже видит.
+- `dns.zones[].ns` (необязательно, с v0.9.0): имена, на которые делегирована зона (до 8), первое — основное в SOA.
+  С ними фронт сам отвечает на вершине зоны: SOA и NS — записями (TTL 300), на любой другой тип — `NOERROR` без
+  записей и с SOA в authority (TTL 60, RFC 2308). Часть резолверов без SOA и NS у вершины делегированной зоны давала
+  `SERVFAIL`. Ответ собран как ответ dnstt (QR и AA, вопрос как пришёл, OPT 4096, если он был в запросе), поэтому `ns`
+  ставится только зонам dnstt. Запрос не класса IN, не QUERY или с версией EDNS не 0 идёт в бэкенд, как раньше.
 - `udp.routes[]`: в каждом маршруте либо `sni` (имя из ClientHello в QUIC Initial; ClientHello может занимать
   несколько Initial, фронт собирает его), либо `salamander_password_file` (пакет снимается этим паролем и внутри —
   QUIC Initial). Бэкенд — с режимом `packet`, датаграммы идут ему как есть (для salamander — обфусцированными).

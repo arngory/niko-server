@@ -53,6 +53,10 @@ type DNSZone struct {
 	// dns.probe_key_file). For dnstt zones: the answers are built as
 	// dnstt's.
 	Probe bool `json:"probe,omitempty"`
+	// NS: the names the zone is delegated to. With them the front answers
+	// SOA and NS at the zone's apex itself (dnstt zones: the answers are
+	// built as dnstt's), the first being the SOA's primary.
+	NS []string `json:"ns,omitempty"`
 }
 
 type FrontDNS struct {
@@ -296,6 +300,14 @@ func (c *FrontConfig) validate() []ConfigError {
 		}
 		if z.Probe && c.DNS.ProbeKeyFile == "" {
 			e.add(path+".probe", "needs dns.probe_key_file")
+		}
+		if len(z.NS) > 8 {
+			e.add(path+".ns", "at most 8 names")
+		}
+		for j, ns := range z.NS {
+			if n := strings.ToLower(strings.TrimSuffix(ns, ".")); !dnsName.MatchString(n) || len(n) > 253 {
+				e.add(fmt.Sprintf("%s.ns[%d]", path, j), "not a DNS name: %q", ns)
+			}
 		}
 	}
 	return e
