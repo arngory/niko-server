@@ -3,8 +3,10 @@ package dnsttserver
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -29,23 +31,27 @@ func TestAuth(t *testing.T) {
 		return append(tag[:], body...)
 	}
 
-	for name, c := range map[string]struct {
+	// In order: a query whose tag failed is remembered, so a copy of
+	// alice's tag with the body tampered with comes after alice's own.
+	for _, c := range []struct {
+		name    string
 		payload []byte
 		mode    AuthMode
 		ok      bool
 		rest    []byte
 	}{
-		"alice":                  {signed(&alice, now), AuthRequired, true, body},
-		"bob, the epoch before":  {signed(&bob, now.Add(-AuthEpoch)), AuthRequired, true, body},
-		"alice, the epoch after": {signed(&alice, now.Add(AuthEpoch)), AuthRequired, true, body},
-		"alice, two epochs late": {signed(&alice, now.Add(-2*AuthEpoch)), AuthRequired, false, nil},
-		"untagged, required":     {body, AuthRequired, false, nil},
-		"untagged, optional":     {body, AuthOptional, true, body},
-		"tagged, optional":       {signed(&bob, now), AuthOptional, true, body},
-		"untagged, off":          {body, AuthOff, true, body},
-		"short":                  {[]byte("short"), AuthRequired, false, nil},
-		"tampered after the tag": {append(signed(&alice, now)[:len(body)+AuthTagLen-1], 'X'), AuthRequired, false, nil},
+		{"alice", signed(&alice, now), AuthRequired, true, body},
+		{"bob, the epoch before", signed(&bob, now.Add(-AuthEpoch)), AuthRequired, true, body},
+		{"alice, the epoch after", signed(&alice, now.Add(AuthEpoch)), AuthRequired, true, body},
+		{"alice, two epochs late", signed(&alice, now.Add(-2*AuthEpoch)), AuthRequired, false, nil},
+		{"untagged, required", body, AuthRequired, false, nil},
+		{"untagged, optional", body, AuthOptional, true, body},
+		{"tagged, optional", signed(&bob, now), AuthOptional, true, body},
+		{"untagged, off", body, AuthOff, true, body},
+		{"short", []byte("short"), AuthRequired, false, nil},
+		{"tampered after the tag", append(signed(&alice, now)[:len(body)+AuthTagLen-1], 'X'), AuthRequired, false, nil},
 	} {
+		name := c.name
 		a.Mode = c.mode
 		rest, ok := a.Check(c.payload)
 		if ok != c.ok || !bytes.Equal(rest, c.rest) {
@@ -114,7 +120,9 @@ func TestAuthServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	ask := func(payload []byte) uint16 {
+	var askSized func(payload []byte, edns uint16) uint16
+	ask := func(payload []byte) uint16 { return askSized(payload, 4096) }
+	askSized = func(payload []byte, edns uint16) uint16 {
 		t.Helper()
 		enc := []byte(strings.ToLower(base32Encoding.EncodeToString(payload)))
 		var labels [][]byte
@@ -128,7 +136,7 @@ func TestAuthServer(t *testing.T) {
 			t.Fatal(err)
 		}
 		q := dns.Message{ID: 7, Flags: 0x0100, Question: []dns.Question{{Name: name, Type: dns.RRTypeTXT, Class: dns.ClassIN}},
-			Additional: []dns.RR{{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 4096, TTL: 0, Data: []byte{}}}}
+			Additional: []dns.RR{{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: edns, TTL: 0, Data: []byte{}}}}
 		b, err := q.WireFormat()
 		if err != nil {
 			t.Fatal(err)
@@ -160,5 +168,248 @@ func TestAuthServer(t *testing.T) {
 	tag = Tag(&other, EpochOf(time.Now()), body)
 	if rc := ask(append(tag[:], body...)); rc != dns.RcodeNameError {
 		t.Fatalf("query tagged by another key: rcode %d, want NXDOMAIN", rc)
+	}
+	// A probe with a small EDNS size learns nothing either: NXDOMAIN, not
+	// dnstt's FORMERR for a payload size under its minimum.
+	if rc := askSized(body, 512); rc != dns.RcodeNameError {
+		t.Fatalf("untagged query with EDNS 512: rcode %d, want NXDOMAIN", rc)
+	}
+	tag = Tag(&dev, EpochOf(time.Now()), body)
+	if rc := askSized(append(tag[:], body...), 512); rc != dns.RcodeFormatError {
+		t.Fatalf("tagged query with EDNS 512: rcode %d, want FORMERR", rc)
+	}
+}
+
+// Full scans of the keys have a budget in HMACs: garbage beyond it is
+// refused unread, while sessions already known go on; the budget refills.
+func TestAuthScanBudget(t *testing.T) {
+	var dev [32]byte
+	rand.Read(dev[:])
+	now := time.Unix(1_800_000_000, 0)
+	// One device: 3 HMACs a scan; 6 a second (two scans at least), 12 at once.
+	a := &Auth{Mode: AuthRequired, Now: func() time.Time { return now }, ScanHMACs: 3}
+	if err := a.SetKeys([]byte("d1 " + hex.EncodeToString(dev[:]))); err != nil {
+		t.Fatal(err)
+	}
+	body := append([]byte("CLIENTID"), 0xe0)
+	tag := Tag(&dev, EpochOf(now), body)
+	good := append(tag[:], body...)
+	if _, ok := a.Check(good); !ok { // a scan: the session is known from now on
+		t.Fatal("first tagged query refused")
+	}
+	garbage := func(i byte) []byte {
+		return append([]byte{i, 1, 2, 3, 4, 5, 6, 7}, "OTHERCID\xe0"...)
+	}
+	for i := range byte(10) {
+		a.Check(garbage(i))
+	}
+	// The first query cost 1 HMAC (the key's tag of this epoch): 11 left,
+	// enough for four scans of garbage before the budget is spent.
+	if th := a.Throttled.Load(); th != 6 {
+		t.Fatalf("throttled %d, want 6", th)
+	}
+	// The known session needs no scan, and a reload of the same keys keeps it.
+	a.SetKeys([]byte("d1 " + hex.EncodeToString(dev[:])))
+	if _, ok := a.Check(good); !ok {
+		t.Fatal("known session refused over the budget")
+	}
+	now = now.Add(2 * time.Second)
+	before := a.Throttled.Load()
+	a.Check(garbage(99))
+	if a.Throttled.Load() != before {
+		t.Fatal("the budget did not refill")
+	}
+}
+
+// An old client's untagged ClientID is remembered after a scan. While it is
+// young it is scanned again only above half the budget; then never: a flood
+// of untagged queries (old clients after the switch to required) leaves
+// room for new sessions and costs nothing in the long run. In optional mode
+// it is taken, and stays known while the client asks.
+func TestAuthUnknownHeads(t *testing.T) {
+	var dev [32]byte
+	rand.Read(dev[:])
+	now := time.Unix(1_800_000_000, 0)
+	keys := []byte("d1 " + hex.EncodeToString(dev[:]))
+	old := append([]byte("OLDCLIEN"), "\xe0 packets of an old client"...)
+
+	r := &Auth{Mode: AuthRequired, Now: func() time.Time { return now }, ScanHMACs: 3}
+	r.SetKeys(keys)
+	for range 100 {
+		if _, ok := r.Check(old); ok {
+			t.Fatal("untagged query taken in required mode")
+		}
+	}
+	body := append([]byte("NEWCLIEN"), 0xe0)
+	tag := Tag(&dev, EpochOf(now), body)
+	if _, ok := r.Check(append(tag[:], body...)); !ok {
+		t.Fatalf("a new session after an untagged flood: throttled %d", r.Throttled.Load())
+	}
+	// Past the rescan window the old client is free, even with a full
+	// budget.
+	now = now.Add(time.Hour)
+	r.Check(old) // refills
+	before := r.tokens
+	for range 100 {
+		r.Check(old)
+	}
+	if r.tokens != before {
+		t.Fatalf("an old client past the window cost %v HMACs", before-r.tokens)
+	}
+
+	o := &Auth{Mode: AuthOptional, Now: func() time.Time { return now }, ScanHMACs: 0.001}
+	o.SetKeys(keys)
+	if rest, ok := o.Check(old); !ok || !bytes.Equal(rest, old) {
+		t.Fatal("untagged query refused in optional mode")
+	}
+	// Short payloads cost nothing and are not remembered: they cannot push
+	// the old client out. The old client keeps asking through it all.
+	for i := range 3 * authCacheMax {
+		var short [12]byte
+		binary.BigEndian.PutUint64(short[:], uint64(i))
+		o.Check(short[:])
+		if i%1000 == 0 {
+			if _, ok := o.Check(old); !ok {
+				t.Fatalf("old client refused after %d short queries", i)
+			}
+		}
+	}
+	if len(o.unknown)+len(o.unknownPrev) != 1 {
+		t.Fatalf("unknown %d+%d", len(o.unknown), len(o.unknownPrev))
+	}
+	// Generations turn over while the old client asks: it moves along.
+	for i := range 3 * authCacheMax {
+		o.remember([8]byte{byte(i), byte(i >> 8), byte(i >> 16), 1})
+		if _, ok := o.known([8]byte(old[:8]), now); i%1000 == 0 && !ok {
+			t.Fatalf("old client forgotten after %d others", i)
+		}
+	}
+}
+
+// A device id with two keys (one being replaced): a session on either is
+// checked on the cached path, without a scan.
+func TestAuthTwoKeysOneID(t *testing.T) {
+	var k1, k2 [32]byte
+	rand.Read(k1[:])
+	rand.Read(k2[:])
+	now := time.Unix(1_800_000_000, 0)
+	a := &Auth{Mode: AuthRequired, Now: func() time.Time { return now }, ScanHMACs: 6}
+	a.SetKeys([]byte("d1 " + hex.EncodeToString(k1[:]) + "\nd1 " + hex.EncodeToString(k2[:])))
+	body := append([]byte("SESSION1"), 0xe0)
+	signed := func(k *[32]byte) []byte {
+		tag := Tag(k, EpochOf(now), body)
+		return append(tag[:], body...)
+	}
+	if _, ok := a.Check(signed(&k1)); !ok {
+		t.Fatal("first key refused")
+	}
+	for range 20 {
+		if _, ok := a.Check(signed(&k1)); !ok {
+			t.Fatal("first key refused on the cached path")
+		}
+	}
+	if a.Throttled.Load() != 0 {
+		t.Fatalf("throttled %d: the cached path scanned", a.Throttled.Load())
+	}
+}
+
+// What a garbage query costs with 100 devices: 3 HMACs a device, no
+// allocation per HMAC.
+func BenchmarkAuthGarbage(b *testing.B) {
+	var keys strings.Builder
+	for i := range 100 {
+		var k [32]byte
+		rand.Read(k[:])
+		keys.WriteString("d" + strings.Repeat("x", i%7) + hex.EncodeToString(k[:4]) + " " + hex.EncodeToString(k[:]) + "\n")
+	}
+	a := &Auth{Mode: AuthRequired, ScanHMACs: 1e12}
+	if err := a.SetKeys([]byte(keys.String())); err != nil {
+		b.Fatal(err)
+	}
+	q := make([]byte, 120)
+	rand.Read(q)
+	b.ReportAllocs()
+	var n uint64
+	for b.Loop() {
+		n++ // a new head every time: a full scan each
+		binary.BigEndian.PutUint64(q, n)
+		a.Check(q)
+	}
+}
+
+// The client's vector (Niko, T2): K for device key 11 x 32, node 33 x 16,
+// service 3 (dnsauth-v1 §2), the payload 00..17 at 1767268800.
+func TestTagVector(t *testing.T) {
+	k, _ := hex.DecodeString("2f9bd5e6fc2ef3f56206998eee87f2d4b798a66c3c846ef34eff2f2647599bd5")
+	var key [32]byte
+	copy(key[:], k)
+	payload := make([]byte, 0x18)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	e := EpochOf(time.Unix(1767268800, 0))
+	if tag := Tag(&key, e, payload); e != 2945448 || hex.EncodeToString(tag[:]) != "67e1435d89134138" {
+		t.Fatalf("epoch %d tag %x", e, tag)
+	}
+}
+
+// Someone who sees a query on the way copies its tag into garbage: the head
+// is remembered, but the session's own queries, the resolver's retransmit
+// included, still pass; so does a new session's first query while the node
+// has budget to spare.
+func TestAuthCopiedTag(t *testing.T) {
+	var dev [32]byte
+	rand.Read(dev[:])
+	now := time.Unix(1_800_000_000, 0)
+	for _, mode := range []AuthMode{AuthRequired, AuthOptional} {
+		a := &Auth{Mode: mode, Now: func() time.Time { return now }}
+		a.SetKeys([]byte("d1 " + hex.EncodeToString(dev[:])))
+		query := func(cid string, n byte) []byte {
+			body := append([]byte(cid), 0xe0, n)
+			tag := Tag(&dev, EpochOf(now), body)
+			return append(tag[:], body...)
+		}
+		poison := func(q []byte) { a.Check(append(bytes.Clone(q[:AuthTagLen]), "GARBAGE!"...)) }
+
+		// An established session.
+		if _, ok := a.Check(query("SESSION1", 0)); !ok {
+			t.Fatal("first query refused")
+		}
+		q := query("SESSION1", 1)
+		if rest, ok := a.Check(q); !ok || !bytes.Equal(rest, q[AuthTagLen:]) {
+			t.Fatalf("mode %d: query refused", mode)
+		}
+		poison(q)
+		if rest, ok := a.Check(q); !ok || !bytes.Equal(rest, q[AuthTagLen:]) {
+			t.Fatalf("mode %d: the retransmit after a copied tag: ok %v rest %q", mode, ok, rest)
+		}
+		// A new session's first query, copied before it arrives.
+		n := query("SESSION2", 0)
+		poison(n)
+		if rest, ok := a.Check(n); !ok || !bytes.Equal(rest, n[AuthTagLen:]) {
+			t.Fatalf("mode %d: a new session after a copied tag: ok %v rest %q", mode, ok, rest)
+		}
+	}
+}
+
+// A budget set below two full scans (auth_scan_hmacs < 6 x devices) is
+// raised to two, so the genuine query right behind a copied tag is scanned.
+func TestAuthSmallBudgetCopiedTag(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	var keys strings.Builder
+	var dev [32]byte
+	for i := range 50 {
+		rand.Read(dev[:])
+		fmt.Fprintf(&keys, "d%d %s\n", i, hex.EncodeToString(dev[:]))
+	}
+	a := &Auth{Mode: AuthRequired, Now: func() time.Time { return now }, ScanHMACs: 100} // 150 a scan
+	a.SetKeys([]byte(keys.String()))
+	body := append([]byte("SESSION1"), 0xe0)
+	tag := Tag(&dev, EpochOf(now), body)
+	q := append(tag[:], body...)
+	a.Check(append(bytes.Clone(q[:AuthTagLen]), "GARBAGE!"...))
+	now = now.Add(10 * time.Millisecond) // the genuine query right behind
+	if _, ok := a.Check(q); !ok {
+		t.Fatal("the genuine query after a copied tag")
 	}
 }
