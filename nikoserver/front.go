@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -59,6 +60,28 @@ func RunFront(ctx context.Context, c *FrontConfig, log *Logger) error {
 	return first
 }
 
+// listenDNS binds a DNS front socket with SO_REUSEADDR: systemd-resolved
+// holds 127.0.0.53:53 and 127.0.0.54:53 with it too, so the wildcard and
+// its stub share the port, the kernel giving each socket the datagrams to
+// its own address (the most specific bind wins). Another socket without
+// SO_REUSEADDR still cannot take the port.
+func listenDNS(ctx context.Context, network string, addr netip.AddrPort) (*net.UDPConn, error) {
+	lc := net.ListenConfig{Control: func(_, _ string, c syscall.RawConn) error {
+		var serr error
+		if err := c.Control(func(fd uintptr) {
+			serr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+		}); err != nil {
+			return err
+		}
+		return serr
+	}}
+	pc, err := lc.ListenPacket(ctx, network, addr.String())
+	if err != nil {
+		return nil, err
+	}
+	return pc.(*net.UDPConn), nil
+}
+
 func runDNSFront(ctx context.Context, c *FrontConfig, log *Logger) error {
 	front := &dnsFront{log: log, zoneBackend: make(map[string]*backendLink), sockets: make(map[netip.AddrPort]*net.UDPConn)}
 	for _, listen := range c.DNS.Listen {
@@ -68,7 +91,7 @@ func runDNSFront(ctx context.Context, c *FrontConfig, log *Logger) error {
 			network = "udp4"
 		}
 		// udp6 sets IPV6_V6ONLY, so 0.0.0.0:53 and [::]:53 can both be bound
-		conn, err := net.ListenUDP(network, net.UDPAddrFromAddrPort(addr))
+		conn, err := listenDNS(ctx, network, addr)
 		if err != nil {
 			front.closeAll()
 			return envError("listen %s: %v", listen, err)
