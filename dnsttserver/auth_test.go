@@ -186,7 +186,7 @@ func TestAuthScanBudget(t *testing.T) {
 	var dev [32]byte
 	rand.Read(dev[:])
 	now := time.Unix(1_800_000_000, 0)
-	// One device: 3 HMACs a scan; 3 a second, 6 at once.
+	// One device: 3 HMACs a scan; 6 a second (two scans at least), 12 at once.
 	a := &Auth{Mode: AuthRequired, Now: func() time.Time { return now }, ScanHMACs: 3}
 	if err := a.SetKeys([]byte("d1 " + hex.EncodeToString(dev[:]))); err != nil {
 		t.Fatal(err)
@@ -203,10 +203,10 @@ func TestAuthScanBudget(t *testing.T) {
 	for i := range byte(10) {
 		a.Check(garbage(i))
 	}
-	// The first query cost 1 HMAC (the key's tag of this epoch): 5 left,
-	// enough for two scans of garbage before the budget is spent.
-	if th := a.Throttled.Load(); th != 8 {
-		t.Fatalf("throttled %d, want 8", th)
+	// The first query cost 1 HMAC (the key's tag of this epoch): 11 left,
+	// enough for four scans of garbage before the budget is spent.
+	if th := a.Throttled.Load(); th != 6 {
+		t.Fatalf("throttled %d, want 6", th)
 	}
 	// The known session needs no scan, and a reload of the same keys keeps it.
 	a.SetKeys([]byte("d1 " + hex.EncodeToString(dev[:])))
@@ -392,8 +392,8 @@ func TestAuthCopiedTag(t *testing.T) {
 	}
 }
 
-// A budget set below one full scan (auth_scan_hmacs < 3 x devices) still
-// scans a copied head again when the budget is full.
+// A budget set below two full scans (auth_scan_hmacs < 6 x devices) is
+// raised to two, so the genuine query right behind a copied tag is scanned.
 func TestAuthSmallBudgetCopiedTag(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	var keys strings.Builder
@@ -408,8 +408,8 @@ func TestAuthSmallBudgetCopiedTag(t *testing.T) {
 	tag := Tag(&dev, EpochOf(now), body)
 	q := append(tag[:], body...)
 	a.Check(append(bytes.Clone(q[:AuthTagLen]), "GARBAGE!"...))
-	now = now.Add(5 * time.Second) // the budget is full again
+	now = now.Add(10 * time.Millisecond) // the genuine query right behind
 	if _, ok := a.Check(q); !ok {
-		t.Fatal("the genuine query after a copied tag, with a full budget")
+		t.Fatal("the genuine query after a copied tag")
 	}
 }
