@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"hash"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -64,11 +65,12 @@ type authKey struct {
 
 // authKeys is one generation of the keys: the HMAC of each key made once
 // (Reset brings it back to the key, without hmac.New per query), and the
-// index by device id for the cached sessions.
+// keys of each device id for the cached sessions (an id may come twice,
+// e.g. while a key is replaced).
 type authKeys struct {
 	keys []authKey
 	macs []hash.Hash
-	byID map[string]int
+	byID map[string][]int
 }
 
 // Auth checks the tags of queries against the keys of the devices allowed
@@ -77,11 +79,11 @@ type authKeys struct {
 type Auth struct {
 	Mode AuthMode
 	Now  func() time.Time // time.Now when nil
-	// ScanRate and ScanBurst bound the full scans of the keys (a query no
-	// cached session explains) per second: each costs up to 3 HMACs per
-	// device, and garbage queries must not take the tunnel's one reader.
-	// Zero: 50 a second, bursts of 200.
-	ScanRate, ScanBurst float64
+	// ScanHMACs bounds the HMACs a second spent on full scans of the keys
+	// (a query no cached session explains; up to 3 per device each), so
+	// garbage cannot take the tunnel's one reader; two seconds' worth may
+	// go at once. Zero: 100000, a few percent of a core.
+	ScanHMACs float64
 
 	keys atomic.Pointer[authKeys]
 
@@ -89,12 +91,14 @@ type Auth struct {
 	// ClientID -> device id of its last valid tag, in two generations: a
 	// full cache becomes the previous one instead of being dropped.
 	cache, prev map[turbotunnel.ClientID]string
-	// Untagged ClientIDs (optional mode): an old client's queries skip the
-	// scan. A tagged query starts with a fresh tag, so never matches.
-	untagged, untaggedPrev map[turbotunnel.ClientID]struct{}
-	tokens                 float64
-	last                   time.Time
-	scratch                tagScratch
+	// The first 8 bytes of queries no key explained: an old client's
+	// ClientID, taken as untagged in optional mode and refused in required
+	// mode without another scan. A tagged query starts with a fresh tag,
+	// so it never matches one.
+	unknown, unknownPrev map[turbotunnel.ClientID]struct{}
+	tokens               float64
+	last                 time.Time
+	scratch              tagScratch
 
 	// Counters for the log: queries with a valid tag, untagged ones taken
 	// (optional), refused ones, and of those refused without a scan over
@@ -106,7 +110,7 @@ type Auth struct {
 // and lines starting with # are skipped. Cached sessions stay: a session
 // whose device is gone no longer finds its key and is refused.
 func (a *Auth) SetKeys(text []byte) error {
-	k := &authKeys{byID: map[string]int{}}
+	k := &authKeys{byID: map[string][]int{}}
 	sc := bufio.NewScanner(bytes.NewReader(text))
 	for line := 1; sc.Scan(); line++ {
 		f := strings.Fields(sc.Text())
@@ -122,7 +126,7 @@ func (a *Auth) SetKeys(text []byte) error {
 		}
 		ak := authKey{id: f[0]}
 		copy(ak.key[:], b)
-		k.byID[ak.id] = len(k.keys)
+		k.byID[ak.id] = append(k.byID[ak.id], len(k.keys))
 		k.keys = append(k.keys, ak)
 		k.macs = append(k.macs, hmac.New(sha256.New, ak.key[:]))
 	}
@@ -231,32 +235,35 @@ func (a *Auth) Check(payload []byte) (rest []byte, ok bool) {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	untagged := func() ([]byte, bool) {
+		if a.Mode == AuthOptional {
+			a.Untagged.Add(1)
+			return payload, true
+		}
+		a.Refused.Add(1)
+		return nil, false
+	}
+	if len(payload) < AuthTagLen+len(turbotunnel.ClientID{}) {
+		return untagged() // too short for a tag; nothing to remember
+	}
 	var head turbotunnel.ClientID
 	copy(head[:], payload)
-	if a.Mode == AuthOptional && a.isUntagged(head) {
-		a.Untagged.Add(1)
-		return payload, true
+	if a.known(head) {
+		return untagged()
 	}
-	if len(payload) >= AuthTagLen+len(turbotunnel.ClientID{}) {
-		switch a.validLocked(payload) {
-		case tagValid:
-			a.Valid.Add(1)
-			return payload[AuthTagLen:], true
-		case tagThrottled:
-			// Not looked at: refused even in optional mode, since a tagged
-			// query read as untagged would feed the session garbage.
-			a.Throttled.Add(1)
-			a.Refused.Add(1)
-			return nil, false
-		}
+	switch a.validLocked(payload) {
+	case tagValid:
+		a.Valid.Add(1)
+		return payload[AuthTagLen:], true
+	case tagThrottled:
+		// Not looked at: refused even in optional mode, since a tagged
+		// query read as untagged would feed the session garbage.
+		a.Throttled.Add(1)
+		a.Refused.Add(1)
+		return nil, false
 	}
-	if a.Mode == AuthOptional {
-		a.Untagged.Add(1)
-		a.remember(&a.untagged, &a.untaggedPrev, head)
-		return payload, true
-	}
-	a.Refused.Add(1)
-	return nil, false
+	a.remember(head)
+	return untagged()
 }
 
 type tagResult int
@@ -288,28 +295,35 @@ func (a *Auth) validLocked(payload []byte) tagResult {
 		tagWith(keys.macs[i], epoch, body, &a.scratch, &t)
 		return hmac.Equal(t[:], tag[:])
 	}
-	// The key this session signed with last.
+	// The keys this session signed with last.
 	id, cached := a.cache[cid]
 	if !cached {
 		id, cached = a.prev[cid]
 	}
-	if i, ok := keys.byID[id]; cached && ok {
+	tried := keys.byID[id]
+	if !cached {
+		tried = nil
+	}
+	for _, i := range tried {
 		for _, epoch := range epochs {
 			if match(i, epoch) {
-				a.remember2(cid, id)
+				a.cacheSession(cid, id)
 				return tagValid
 			}
 		}
 	}
-	// All of them, within the budget: the current epoch first, where a
+	// All the others, within the budget: the current epoch first, where a
 	// client's tag nearly always is.
-	if !a.spend(now) {
+	if !a.spend(now, 3*(len(keys.keys)-len(tried))) {
 		return tagThrottled
 	}
 	for _, epoch := range epochs {
 		for i := range keys.keys {
+			if slices.Contains(tried, i) {
+				continue
+			}
 			if match(i, epoch) {
-				a.remember2(cid, keys.keys[i].id)
+				a.cacheSession(cid, keys.keys[i].id)
 				return tagValid
 			}
 		}
@@ -317,30 +331,33 @@ func (a *Auth) validLocked(payload []byte) tagResult {
 	return tagInvalid
 }
 
-// spend takes a full scan from the budget.
-func (a *Auth) spend(now time.Time) bool {
-	rate, burst := a.ScanRate, a.ScanBurst
+// spend takes the HMACs of a full scan from the budget.
+func (a *Auth) spend(now time.Time, hmacs int) bool {
+	rate := a.ScanHMACs
 	if rate <= 0 {
-		rate = 50
+		rate = 100000
 	}
-	if burst <= 0 {
-		burst = 200
-	}
+	// Room for one scan at least, however many devices there are.
+	burst := max(2*rate, float64(hmacs))
 	if a.last.IsZero() {
 		a.tokens = burst
 	} else if d := now.Sub(a.last).Seconds(); d > 0 {
 		a.tokens = min(burst, a.tokens+d*rate)
 	}
 	a.last = now
-	if a.tokens < 1 {
+	if a.tokens < float64(hmacs) {
 		return false
 	}
-	a.tokens--
+	a.tokens -= float64(hmacs)
 	return true
 }
 
-func (a *Auth) remember2(cid turbotunnel.ClientID, id string) {
-	if a.cache[cid] == id {
+// cacheSession remembers the device a session's tag was valid for.
+func (a *Auth) cacheSession(cid turbotunnel.ClientID, id string) {
+	if old, ok := a.cache[cid]; ok {
+		if old != id {
+			a.cache[cid] = id
+		}
 		return
 	}
 	if a.cache == nil || len(a.cache) >= authCacheMax {
@@ -349,17 +366,23 @@ func (a *Auth) remember2(cid turbotunnel.ClientID, id string) {
 	a.cache[cid] = id
 }
 
-func (a *Auth) isUntagged(cid turbotunnel.ClientID) bool {
-	if _, ok := a.untagged[cid]; ok {
+// known reports whether no key explained a query that began with head; a
+// hit in the previous generation moves to the current one, so an old
+// client that keeps asking stays.
+func (a *Auth) known(head turbotunnel.ClientID) bool {
+	if _, ok := a.unknown[head]; ok {
 		return true
 	}
-	_, ok := a.untaggedPrev[cid]
-	return ok
+	if _, ok := a.unknownPrev[head]; ok {
+		a.remember(head)
+		return true
+	}
+	return false
 }
 
-func (a *Auth) remember(cur, prev *map[turbotunnel.ClientID]struct{}, cid turbotunnel.ClientID) {
-	if *cur == nil || len(*cur) >= authCacheMax {
-		*prev, *cur = *cur, map[turbotunnel.ClientID]struct{}{}
+func (a *Auth) remember(head turbotunnel.ClientID) {
+	if a.unknown == nil || len(a.unknown) >= authCacheMax {
+		a.unknownPrev, a.unknown = a.unknown, map[turbotunnel.ClientID]struct{}{}
 	}
-	(*cur)[cid] = struct{}{}
+	a.unknown[head] = struct{}{}
 }
