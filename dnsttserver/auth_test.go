@@ -618,3 +618,52 @@ func TestSendLoopStashSwap(t *testing.T) {
 	}
 	close(ch)
 }
+
+// A resolver's retry, the same name in another case, gets the first
+// answer's data, not the next packet; a retry through a smaller requester
+// that cannot carry it gets an empty answer; another name, the next
+// packet.
+func TestSendLoopMemo(t *testing.T) {
+	tt := turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, time.Minute)
+	defer tt.Close()
+	id := turbotunnel.ClientID{6}
+	first := bytes.Repeat([]byte{1}, encodedPayload(1232)-2-10)
+	next := bytes.Repeat([]byte{2}, 300)
+	tt.WriteTo(first, id)
+	tt.WriteTo(next, id)
+	out := make(chan []byte, 8)
+	ch := make(chan *record, 8)
+	go sendLoop(capture{out: out}, tt, ch)
+	ask := func(name string, size int) []byte {
+		t.Helper()
+		q, _ := dns.ParseName(name)
+		ch <- &record{Resp: &dns.Message{ID: 1, Flags: 0x8400, Question: []dns.Question{{Name: q, Type: dns.RRTypeTXT, Class: dns.ClassIN}}},
+			Addr: turbotunnel.DummyAddr{}, ClientID: id, Size: size}
+		select {
+		case wire := <-out:
+			m, err := dns.MessageFromWireFormat(wire)
+			if err != nil || len(m.Answer) != 1 {
+				t.Fatalf("%s: %+v %v", name, m, err)
+			}
+			data, _ := dns.DecodeRDataTXT(m.Answer[0].Data)
+			return data
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: no answer", name)
+			return nil
+		}
+	}
+	framed := func(p []byte) []byte { return append([]byte{byte(len(p) >> 8), byte(len(p))}, p...) }
+	if got := ask("abcd.t.example.com", 1232); !bytes.Equal(got, framed(first)) {
+		t.Fatalf("first answer: %d bytes", len(got))
+	}
+	if got := ask("ABcD.t.example.com", 1232); !bytes.Equal(got, framed(first)) {
+		t.Fatalf("retry: %d bytes, want the first answer's", len(got))
+	}
+	if got := ask("abcd.t.example.com", 512); len(got) != 0 {
+		t.Fatalf("retry through a 512 requester: %d bytes, want none", len(got))
+	}
+	if got := ask("efgh.t.example.com", 1232); !bytes.Equal(got, framed(next)) {
+		t.Fatalf("another name: %d bytes, want the next packet", len(got))
+	}
+	close(ch)
+}
