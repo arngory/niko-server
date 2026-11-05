@@ -86,11 +86,14 @@ func runDNSFront(ctx context.Context, c *FrontConfig, log *Logger) error {
 	front := &dnsFront{log: log, zoneBackend: make(map[string]*backendLink), sockets: make(map[netip.AddrPort]*net.UDPConn),
 		probeZones: map[string]bool{}}
 	if c.DNS.ProbeKeyFile != "" {
-		probe, err := loadProbeKey(c.DNS.ProbeKeyFile)
-		if err != nil {
-			return envError("dns.probe_key_file %s: %v", c.DNS.ProbeKeyFile, err)
+		// Without the key the front answers no probes, and goes on: the
+		// tunnels, TCP and UDP 443 must not stop for a resolver check.
+		// Probes then reach the backend like any query of the tunnel.
+		if probe, err := loadProbeKey(c.DNS.ProbeKeyFile); err != nil {
+			log.Warnf("dns.probe_key_file %s: %v; dnsprobe-v1 off", c.DNS.ProbeKeyFile, err)
+		} else {
+			front.probe = probe
 		}
-		front.probe = probe
 	}
 	for _, listen := range c.DNS.Listen {
 		addr := netip.MustParseAddrPort(listen)

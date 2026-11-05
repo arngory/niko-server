@@ -22,6 +22,7 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 
 	mdvembed "masterdnsvpn-go/embed"
+	"www.bamsoftware.com/git/dnstt.git/dns"
 	"www.bamsoftware.com/git/dnstt.git/noise"
 )
 
@@ -355,5 +356,42 @@ func TestNekoServerDNSProbe(t *testing.T) {
 	label := probeLabel(bytes.Repeat([]byte{6}, 32), zone, false, minute, [8]byte{2})
 	if reply := query(label, 1232); reply[3]&0x0f != 0 || binary.BigEndian.Uint16(reply[6:8]) != 0 {
 		t.Fatalf("a label without the key: rcode %d, %d answers, want NODATA from the backend", reply[3]&0x0f, binary.BigEndian.Uint16(reply[6:8]))
+	}
+}
+
+// A probe key the front cannot read: no probes, and the front goes on,
+// probes reaching the backend like any query of the tunnel.
+func TestNekoServerDNSProbeKeyMissing(t *testing.T) {
+	privkey, _ := noise.GeneratePrivkey()
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "noise.key")
+	os.WriteFile(keyFile, []byte(hex.EncodeToString(privkey)+"\n"), 0o600)
+	probeKey := bytes.Repeat([]byte{5}, 32)
+	zone := "t.example.com"
+	node := startNodeWith(t, "dnstt", zone, map[string]any{"zone": zone, "private_key_file": keyFile},
+		filepath.Join(dir, "missing", "dnsprobe.key"))
+	c, err := net.Dial("udp", node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	label := probeLabel(probeKey, zone, false, uint32(time.Now().Unix()/60), [8]byte{3})
+	c.Write(probeQuery(label+"."+zone, 16, 1232))
+	c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	reply := make([]byte, 4096)
+	n, err := c.Read(reply)
+	if err != nil {
+		t.Fatalf("no answer with the probe key missing: %v", err)
+	}
+	// The backend's answer (dnstt's, with no data for this client), not
+	// a probe's.
+	m, err := dns.MessageFromWireFormat(reply[:n])
+	if err != nil || m.Rcode() != dns.RcodeNoError {
+		t.Fatalf("answer %+v: %v", m, err)
+	}
+	for _, rr := range m.Answer {
+		if data, _ := dns.DecodeRDataTXT(rr.Data); len(data) == probeNonceLen+probeSmall {
+			t.Fatalf("a probe answered with the key missing: %x", data)
+		}
 	}
 }
