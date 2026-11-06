@@ -1,0 +1,180 @@
+package nikoserver
+
+import (
+	"bytes"
+	"encoding/binary"
+	"net"
+	"net/netip"
+	"testing"
+	"time"
+
+	"www.bamsoftware.com/git/dnstt.git/dns"
+)
+
+func pendingQuery(t *testing.T, id uint16, edns int) ([]byte, int) {
+	t.Helper()
+	name, _ := dns.ParseName("x.v.example.com")
+	q := dns.Message{ID: id, Flags: 0x0100, Question: []dns.Question{{Name: name, Type: dns.RRTypeTXT, Class: dns.ClassIN}}}
+	if edns > 0 {
+		q.Additional = []dns.RR{{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: uint16(edns), Data: []byte{}}}
+	}
+	b, err := q.WireFormat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, end, ok := queryName(b)
+	if !ok {
+		t.Fatal("queryName")
+	}
+	return b, end
+}
+
+// An answer of size bytes to the query: its question and a TXT record.
+func pendingAnswer(t *testing.T, query []byte, size int) []byte {
+	t.Helper()
+	m, err := dns.MessageFromWireFormat(query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Flags = 0x8400
+	m.Additional = nil
+	m.Answer = []dns.RR{{Name: m.Question[0].Name, Type: dns.RRTypeTXT, Class: dns.ClassIN, TTL: 60, Data: dns.EncodeRDataTXT(nil)}}
+	b, _ := m.WireFormat()
+	data := make([]byte, size-len(b)) // TXT strings of 255: 1 byte of length each
+	m.Answer[0].Data = dns.EncodeRDataTXT(data[:len(data)-len(data)/256-1])
+	b, err = m.WireFormat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func TestRequesterSize(t *testing.T) {
+	for edns, want := range map[int]int{0: 512, 100: 512, 1232: 1232, 4096: 4096} {
+		q, end := pendingQuery(t, 1, edns)
+		if got := requesterSize(q, end); got != want {
+			t.Errorf("EDNS %d: %d, want %d", edns, got, want)
+		}
+	}
+	// Records before the OPT, or something else than an OPT: 512.
+	q, end := pendingQuery(t, 1, 1232)
+	q[end+2] = 1 // the record's type: A
+	if got := requesterSize(q, end); got != 512 {
+		t.Errorf("not an OPT: %d", got)
+	}
+}
+
+func TestPendingQueries(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	p := &pendingQueries{now: func() time.Time { return now }}
+	client := netip.MustParseAddrPort("198.51.100.7:5353")
+	q, end := pendingQuery(t, 0x4242, 1232)
+	a := pendingAnswer(t, q, 900)
+
+	if _, ok := p.take(client, a); ok {
+		t.Fatal("an answer no query waits for")
+	}
+	// A resolver's retry: two queries, two answers.
+	p.add(client, q, end)
+	p.add(client, q, end)
+	for i := range 2 {
+		if size, ok := p.take(client, a); !ok || size != 1232 {
+			t.Fatalf("answer %d: %d %v", i, size, ok)
+		}
+	}
+	if _, ok := p.take(client, a); ok {
+		t.Fatal("a third answer to two queries")
+	}
+	// Another client, the same ID: not its query.
+	p.add(client, q, end)
+	if _, ok := p.take(netip.MustParseAddrPort("198.51.100.8:5353"), a); ok {
+		t.Fatal("an answer for another client")
+	}
+	// The previous generation still counts; two later, gone.
+	now = now.Add(pendingGeneration + time.Second)
+	p.add(netip.MustParseAddrPort("198.51.100.9:1"), q, end) // turns the generations over
+	if _, ok := p.take(client, a); !ok {
+		t.Fatal("an answer within the second generation dropped")
+	}
+	p.add(client, q, end)
+	now = now.Add(2*pendingGeneration + time.Second)
+	if _, ok := p.take(client, a); ok {
+		t.Fatal("an answer after two generations")
+	}
+}
+
+func TestTruncated(t *testing.T) {
+	q, end := pendingQuery(t, 0x0102, 0)
+	a := pendingAnswer(t, q, 4000)
+	tc := truncated(a)
+	if tc == nil || len(tc) != end || !bytes.Equal(tc[:2], q[:2]) || tc[2]&0x02 == 0 ||
+		binary.BigEndian.Uint16(tc[4:6]) != 1 || binary.BigEndian.Uint16(tc[6:8]) != 0 {
+		t.Fatalf("truncated % x", tc)
+	}
+	m, err := dns.MessageFromWireFormat(tc)
+	if err != nil || len(m.Answer) != 0 || m.Question[0].Name.String() != "x.v.example.com" {
+		t.Fatalf("%+v %v", m, err)
+	}
+	if truncated(a[:20]) != nil || truncated(nil) != nil {
+		t.Fatal("a cut answer truncated")
+	}
+}
+
+// The front's answer path: a backend's answer goes to a query that waits
+// for it and within the requester's size; larger, it goes as TC; to no
+// query, it does not go at all (a forged source gets nothing larger than
+// what it sent, and the node is no reflector).
+func TestFrontAnswerSize(t *testing.T) {
+	front, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer front.Close()
+	clientConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientConn.Close()
+	local := front.LocalAddr().(*net.UDPAddr).AddrPort()
+	client := clientConn.LocalAddr().(*net.UDPAddr).AddrPort()
+	f := &dnsFront{log: NewLogger("error", nil), sockets: map[netip.AddrPort]*net.UDPConn{local: front}}
+	read := func() []byte {
+		clientConn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		buf := make([]byte, 65535)
+		n, err := clientConn.Read(buf)
+		if err != nil {
+			return nil
+		}
+		return buf[:n]
+	}
+	for _, c := range []struct {
+		edns, size int
+		tc         bool
+	}{
+		{0, 400, false},
+		{0, 4000, true}, // no OPT: 512 at most
+		{1232, 1200, false},
+		{1232, 4700, true}, // an MTU probe's kilobytes to a requester of 1232
+		{4096, 4000, false},
+	} {
+		q, end := pendingQuery(t, 7, c.edns)
+		a := pendingAnswer(t, q, c.size)
+		f.pending.add(client, q, end)
+		f.answer(client, local, a)
+		got := read()
+		switch {
+		case got == nil:
+			t.Errorf("EDNS %d, %d bytes: nothing came", c.edns, c.size)
+		case c.tc && (got[2]&0x02 == 0 || len(got) > 512):
+			t.Errorf("EDNS %d, %d bytes: %d bytes came, TC %v", c.edns, c.size, len(got), got[2]&0x02 != 0)
+		case !c.tc && !bytes.Equal(got, a):
+			t.Errorf("EDNS %d, %d bytes: %d bytes came", c.edns, c.size, len(got))
+		}
+	}
+	// No query waits: nothing goes.
+	q, _ := pendingQuery(t, 8, 4096)
+	f.answer(client, local, pendingAnswer(t, q, 4000))
+	if got := read(); got != nil {
+		t.Errorf("an answer no query waited for: %d bytes went", len(got))
+	}
+}
