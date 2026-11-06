@@ -183,7 +183,7 @@ func TestNekoServerDNSTTStats(t *testing.T) {
 	keyFile := filepath.Join(dir, "noise.key")
 	os.WriteFile(keyFile, []byte(hex.EncodeToString(privkey)+"\n"), 0o600)
 	statsSocket := filepath.Join(dir, "stats.sock")
-	resolver := startNodeFull(t, "dnstt", "t.example.com", map[string]any{"zone": "t.example.com", "private_key_file": keyFile}, "", statsSocket)
+	resolver := startNodeFull(t, "dnstt", "t.example.com", map[string]any{"zone": "t.example.com", "private_key_file": keyFile}, "", statsSocket, "")
 	parsed, err := dnstt.ParseResolver("udp://" + resolver)
 	if err != nil {
 		t.Fatal(err)

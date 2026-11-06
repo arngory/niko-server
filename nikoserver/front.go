@@ -140,6 +140,15 @@ func runDNSFront(ctx context.Context, c *FrontConfig, log *Logger) error {
 			front.apex[zone] = newApexZone(zone, z.NS, serial)
 		}
 	}
+	front.stats = newDNSFrontStats(front.zones)
+	if c.DNS.StatsSocket != "" {
+		stop, err := serveStats(c.DNS.StatsSocket, func() any { return front.stats.snapshot() }, log)
+		if err != nil {
+			front.closeAll()
+			return envError("dns.stats_socket %s: %v", c.DNS.StatsSocket, err)
+		}
+		defer stop()
+	}
 	for _, link := range links {
 		go link.run(ctx)
 	}
@@ -170,6 +179,7 @@ type dnsFront struct {
 	zoneBackend map[string]*backendLink
 	sockets     map[netip.AddrPort]*net.UDPConn
 	pending     pendingQueries // what the backends' answers are for
+	stats       *dnsFrontStats
 }
 
 func (f *dnsFront) closeAll() {
@@ -190,22 +200,27 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 			return envError("read %s: %v", local, err)
 		}
 		if n > maxDNSQuery {
+			f.stats.malformed.Add(1)
 			continue
 		}
 		query := buffer[:n]
 		name, questionEnd, ok := queryName(query)
 		if !ok {
+			f.stats.malformed.Add(1)
 			continue
 		}
 		zone := zoneOf(name, f.zones)
 		if zone == "" {
 			// not one of our zones: no open resolver here
+			f.stats.refused.Add(1)
 			conn.WriteToUDPAddrPort(refused(query, questionEnd), client)
 			continue
 		}
+		f.stats.queries[zone].Add(1)
 		client = netip.AddrPortFrom(client.Addr().Unmap(), client.Port())
 		if a := f.apex[zone]; a != nil && name == zone {
 			if reply, ok := a.answer(query); ok {
+				f.stats.apex.Add(1)
 				conn.WriteToUDPAddrPort(reply, client)
 				continue
 			}
@@ -213,14 +228,24 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 		if f.probe != nil && f.probeZones[zone] {
 			if reply, probe := f.probe.answer(query, name, questionEnd, zone, client.Addr(), f.padZones[zone]); probe {
 				if reply != nil {
+					f.stats.probes.Add(1)
 					conn.WriteToUDPAddrPort(reply, client)
+				} else {
+					f.stats.probesOverRate.Add(1)
 				}
 				f.log.Debugf("dnsprobe from %s: %d bytes", client.Addr(), len(reply))
 				continue
 			}
 		}
+		// Waiting before the send: the backend's answer can come back
+		// before this goroutine runs again.
 		f.pending.add(client, query, questionEnd)
-		f.zoneBackend[zone].send(encodePacket(message, client, local, query))
+		if !f.zoneBackend[zone].send(encodePacket(message, client, local, query)) {
+			f.pending.take(client, query) // the backend never got it
+			f.stats.backendAway.Add(1)
+			continue
+		}
+		f.stats.forwarded.Add(1)
 	}
 }
 
@@ -235,6 +260,7 @@ const maxDNSQuery = 4096
 func (f *dnsFront) answer(client, local netip.AddrPort, payload []byte) {
 	size, ok := f.pending.take(client, payload)
 	if !ok {
+		f.stats.unmatched.Add(1)
 		f.log.Debugf("an answer to %s no query waits for: dropped", client)
 		return
 	}
@@ -242,7 +268,9 @@ func (f *dnsFront) answer(client, local netip.AddrPort, payload []byte) {
 		if payload = truncated(payload); payload == nil {
 			return
 		}
+		f.stats.truncated.Add(1)
 	}
+	f.stats.answers.Add(1)
 	conn := f.sockets[local]
 	if conn == nil {
 		for addr, candidate := range f.sockets {
@@ -270,16 +298,20 @@ type backendLink struct {
 	conn   *net.UnixConn
 }
 
-func (l *backendLink) send(message []byte) {
+// send queues a message for the backend, false when it is dropped: the
+// backend away, or its queue full.
+func (l *backendLink) send(message []byte) bool {
 	l.access.Lock()
 	connected := l.conn != nil
 	l.access.Unlock()
 	if !connected {
-		return
+		return false
 	}
 	select {
 	case l.out <- append([]byte(nil), message...):
+		return true
 	default:
+		return false
 	}
 }
 

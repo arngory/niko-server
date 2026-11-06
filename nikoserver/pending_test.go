@@ -167,7 +167,7 @@ func TestFrontAnswerSize(t *testing.T) {
 	defer clientConn.Close()
 	local := front.LocalAddr().(*net.UDPAddr).AddrPort()
 	client := clientConn.LocalAddr().(*net.UDPAddr).AddrPort()
-	f := &dnsFront{log: NewLogger("error", nil), sockets: map[netip.AddrPort]*net.UDPConn{local: front}}
+	f := &dnsFront{log: NewLogger("error", nil), sockets: map[netip.AddrPort]*net.UDPConn{local: front}, stats: newDNSFrontStats(nil)}
 	read := func() []byte {
 		clientConn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
 		buf := make([]byte, 65535)
@@ -208,6 +208,11 @@ func TestFrontAnswerSize(t *testing.T) {
 	f.answer(client, local, pendingAnswer(t, q, 4000))
 	if got := read(); got != nil {
 		t.Errorf("an answer no query waited for: %d bytes went", len(got))
+	}
+	// The counters (dns.stats_socket): answers sent, truncated ones, the
+	// one no query waited for.
+	if st := f.stats.snapshot(); st.Answers != 7 || st.Truncated != 4 || st.Unmatched != 1 {
+		t.Errorf("stats %+v", st)
 	}
 }
 
