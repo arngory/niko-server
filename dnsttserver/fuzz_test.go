@@ -72,9 +72,9 @@ func FuzzResponseFor(f *testing.F) {
 	for _, p := range [][]byte{
 		inner,
 		tagged,
-		sealQuery(s.keys[0], seq(0xa0, 8), inner),
-		sealQuery(s.keys[1], seq(0xa0, 8), tagged),
-		sealQuery(s.keys[0], seq(0xa0, 8), append([]byte("CLIENTID"), 0xff)),
+		sealQuery(s.list()[0], seq(0xa0, 8), inner),
+		sealQuery(s.list()[1], seq(0xa0, 8), tagged),
+		sealQuery(s.list()[0], seq(0xa0, 8), append([]byte("CLIENTID"), 0xff)),
 		[]byte("short"),
 		bytes.Repeat([]byte{0xdf}, 140),
 	} {
@@ -97,7 +97,7 @@ func FuzzResponseFor(f *testing.F) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		resp, payload, sealed := responseFor(&query, domain, fuzzAuth(authMode), seal)
+		resp, payload, sealed, key := responseFor(&query, domain, fuzzAuth(authMode), seal)
 		if resp == nil {
 			if query.Flags&0x8000 == 0 {
 				t.Fatal("no answer to a query")
@@ -111,6 +111,9 @@ func FuzzResponseFor(f *testing.F) {
 			t.Fatalf("sealed with mode %d, payload %x", sealMode, payload)
 		}
 		if payload != nil {
+			if key == "" {
+				t.Fatal("a payload without a memo key")
+			}
 			if resp.Rcode() != dns.RcodeNoError || !carriesData(resp) {
 				t.Fatalf("a payload with rcode %d, carries data %v", resp.Rcode(), carriesData(resp))
 			}
@@ -155,8 +158,8 @@ func FuzzSealOpen(f *testing.F) {
 	if err != nil {
 		f.Fatal(err)
 	}
-	f.Add(sealQuery(s.keys[0], seq(0xa0, 8), []byte("CLIENTID\x01\xff")))
-	f.Add(sealQuery(s.keys[1], seq(0xa0, 8), nil))
+	f.Add(sealQuery(s.list()[0], seq(0xa0, 8), []byte("CLIENTID\x01\xff")))
+	f.Add(sealQuery(s.list()[1], seq(0xa0, 8), nil))
 	f.Add(seq(0, 10))
 	f.Add([]byte("CLIENTID"))
 	f.Add([]byte{})
@@ -182,7 +185,7 @@ func FuzzSealAnswer(f *testing.F) {
 	if err != nil {
 		f.Fatal(err)
 	}
-	k := s.keys[0]
+	k := s.list()[0]
 	f.Add([]byte{0, 2, 0xaa, 0xbb}, uint16(1000))
 	f.Add([]byte{}, uint16(64))
 	f.Add([]byte{}, uint16(9))
