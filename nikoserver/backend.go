@@ -116,6 +116,21 @@ func RunBackend(ctx context.Context, c *BackendConfig, log *Logger) error {
 		if _, err := os.Stat(c.Options.EncryptionKeyFile); err != nil {
 			return envError("masterdns key: %v", err)
 		}
+		// dnsauth for masterdns: the devices' tags, checked through the
+		// keys file as dnstt's (raycontrol docs/spec/dnsauth-masterdns.md).
+		var auth mdvembed.Authenticator
+		if mode, _ := dnsttserver.ParseAuthMode(c.Options.Auth); mode != dnsttserver.AuthOff {
+			da := &dnsttserver.DeviceAuth{ScanHMACs: float64(c.Options.AuthScanHMACs)}
+			if err := da.LoadKeys(c.Options.AuthKeysFile); err != nil {
+				return envError("masterdns auth keys %s: %v", c.Options.AuthKeysFile, err)
+			}
+			go da.WatchKeys(c.Options.AuthKeysFile, 5*time.Second, ctx.Done(), log.Infof)
+			auth = masterdnsAuth{da}
+			log.Infof("masterdns: queries need the device's tag (dnsauth, %s)", c.Options.Auth)
+		}
+		if c.Options.Seal != "" && c.Options.Seal != "off" {
+			log.Infof("masterdns: sealed answers (mdseal-v1, %s)", c.Options.Seal)
+		}
 		err := mdvembed.RunServer(ctx, mdvembed.ServerOptions{
 			Domains:  c.Options.Zones,
 			Method:   *c.Options.EncryptionMethod,
@@ -124,6 +139,9 @@ func RunBackend(ctx context.Context, c *BackendConfig, log *Logger) error {
 			Conn:     conn,
 			Dial:     dialInner,
 			Log:      log.Writer(),
+			Seal:     c.Options.Seal,
+			AuthMode: c.Options.Auth,
+			Auth:     auth,
 		})
 		if ctx.Err() != nil {
 			return nil
@@ -134,6 +152,23 @@ func RunBackend(ctx context.Context, c *BackendConfig, log *Logger) error {
 		return err
 	}
 	return fmt.Errorf("kind %q not served", c.Kind)
+}
+
+// masterdnsAuth checks masterdns's tags with the devices' keys
+// (mdvembed.Authenticator over dnsttserver.DeviceAuth).
+type masterdnsAuth struct{ *dnsttserver.DeviceAuth }
+
+var _ mdvembed.Authenticator = masterdnsAuth{}
+
+func (a masterdnsAuth) Scan(kind mdvembed.ScanKind, tag [dnsttserver.AuthTagLen]byte, msg []byte) (string, bool) {
+	k := dnsttserver.ScanSession
+	switch kind {
+	case mdvembed.ScanProbe:
+		k = dnsttserver.ScanProbe
+	case mdvembed.ScanInit:
+		k = dnsttserver.ScanInit
+	}
+	return a.DeviceAuth.Scan(k, tag, msg)
 }
 
 func defaultLevel(level string) string {

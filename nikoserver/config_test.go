@@ -202,6 +202,7 @@ func TestNekoServerConfigReview12(t *testing.T) {
 	masterdns := `{"schema":1,"role":"backend","kind":"masterdns","log":{"level":"warn"},"socket":"/run/niko/mdns/packet.sock",
 		"inner":"/run/niko/inner/vless.sock","options":{"zones":[MZONES],"encryption_method":5,"encryption_key_file":"/run/credentials/niko-mdns.service/encryption.key"}}`
 	entry := `{"zone":"%s","backend":"dns","probe":%v,"seal_pad":%v,"ns":["ns1.example.com"]}`
+	mdOne := strings.Replace(masterdns, "MZONES", `"m.example.com"`, 1)
 	zones := func(es ...string) string { return strings.Replace(front, "ZONES", strings.Join(es, ","), 1) }
 	for _, c := range []struct{ content, path string }{
 		{strings.Replace(dnstt, "ZONE1", "K.example.com", 1), "options.zone"},
@@ -213,6 +214,12 @@ func TestNekoServerConfigReview12(t *testing.T) {
 		{strings.Replace(masterdns, "MZONES", `"m.example.com","M.example.com."`, 1), "options.zones[1]"},
 		{strings.Replace(masterdns, "MZONES", `"m.example.com","x.m.example.com"`, 1), "options.zones[1]"},
 		{strings.Replace(masterdns, "MZONES", `"K.example.com"`, 1), "options.zones[0]"},
+		{strings.Replace(mdOne, `"encryption_method":5`, `"encryption_method":5,"seal":"sealed"`, 1), "options.seal"},
+		// mdseal-v1 seals with the service's key: no key file of its own.
+		{strings.Replace(mdOne, `"encryption_method":5`, `"encryption_method":5,"seal":"required","seal_key_file":"/run/x/seal.keys"`, 1), "options.seal_key_file"},
+		{strings.Replace(mdOne, `"encryption_method":5`, `"encryption_method":5,"auth":"strict"`, 1), "options.auth"},
+		{strings.Replace(mdOne, `"encryption_method":5`, `"encryption_method":5,"auth":"required"`, 1), "options.auth_keys_file"},
+		{strings.Replace(mdOne, `"encryption_method":5`, `"encryption_method":5,"auth":"required","auth_keys_file":"rel.keys"`, 1), "options.auth_keys_file"},
 	} {
 		errs := checkConfig(t, c.content)
 		found := false
@@ -227,6 +234,8 @@ func TestNekoServerConfigReview12(t *testing.T) {
 	for _, ok := range []string{
 		zones(fmt.Sprintf(entry, "t.example.com", true, true), fmt.Sprintf(entry, "S.example.net.", true, true)),
 		strings.Replace(masterdns, "MZONES", `"m.example.com","v.example.net"`, 1),
+		strings.Replace(strings.Replace(masterdns, "MZONES", `"m.example.com"`, 1), `"encryption_method":5`,
+			`"encryption_method":5,"seal":"required","auth":"optional","auth_keys_file":"/run/niko/mdns-in/auth.keys","auth_scan_hmacs":50000`, 1),
 		strings.Replace(dnstt, "ZONE1", "T.Example.COM.", 1),
 	} {
 		if errs := checkConfig(t, ok); len(errs) > 0 {

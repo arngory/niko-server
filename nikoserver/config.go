@@ -136,7 +136,10 @@ type BackendOptions struct {
 	AuthScanHMACs int `json:"auth_scan_hmacs,omitempty"`
 	// dnstt: dnsseal-v1 (raycontrol docs/spec/dnsseal-v1.md): off,
 	// optional or required, and the zone's keys (64 hex digits a line, the
-	// current first).
+	// current first). masterdns (v0.11.0): mdseal-v1 (raycontrol
+	// docs/spec/mdseal-v1.md), sealed answers, with the service's key
+	// (encryption_key_file); auth and its keys as dnstt's, dnsauth for
+	// masterdns (docs/spec/dnsauth-masterdns.md).
 	Seal        string `json:"seal,omitempty"`
 	SealKeyFile string `json:"seal_key_file,omitempty"`
 	// masterdns
@@ -460,6 +463,16 @@ func (c *BackendConfig) validate() []ConfigError {
 			e.add("options.encryption_method", "must be 3, 4 or 5 (AES-GCM; 5 = AES-256-GCM)")
 		}
 		checkSocket(&e, "options.encryption_key_file", c.Options.EncryptionKeyFile)
+		// mdseal-v1 with the service's key; dnsauth with the devices' keys
+		// (methods 3-5, above).
+		if _, err := dnsttserver.ParseSealMode(c.Options.Seal); err != nil {
+			e.add("options.seal", "%v", err)
+		}
+		if mode, err := dnsttserver.ParseAuthMode(c.Options.Auth); err != nil {
+			e.add("options.auth", "%v", err)
+		} else if mode != dnsttserver.AuthOff {
+			checkSocket(&e, "options.auth_keys_file", c.Options.AuthKeysFile)
+		}
 	case "hy2-masq", "hy2-obfs":
 		checkSocket(&e, "users_file", c.UsersFile)
 		checkBackendTLS(&e, c.TLS, "a Hysteria2 backend needs its certificate")
@@ -527,11 +540,15 @@ func (c *BackendConfig) validate() []ConfigError {
 	if c.Options.AuthScanHMACs < 0 {
 		e.add("options.auth_scan_hmacs", "not below 0")
 	}
-	if c.Kind != "dnstt" && (c.Options.Auth != "" || c.Options.AuthKeysFile != "" || c.Options.AuthScanHMACs != 0) {
-		e.add("options", "auth, auth_keys_file and auth_scan_hmacs are dnstt options")
+	dns := c.Kind == "dnstt" || c.Kind == "masterdns"
+	if !dns && (c.Options.Auth != "" || c.Options.AuthKeysFile != "" || c.Options.AuthScanHMACs != 0) {
+		e.add("options", "auth, auth_keys_file and auth_scan_hmacs are options of the DNS tunnels")
 	}
-	if c.Kind != "dnstt" && (c.Options.Seal != "" || c.Options.SealKeyFile != "") {
-		e.add("options", "seal and seal_key_file are dnstt options")
+	if !dns && c.Options.Seal != "" {
+		e.add("options", "seal is an option of the DNS tunnels")
+	}
+	if c.Kind != "dnstt" && c.Options.SealKeyFile != "" {
+		e.add("options.seal_key_file", "dnstt's: masterdns seals with its encryption key")
 	}
 	if c.Kind == "dnstt" || c.Kind == "masterdns" || c.Kind == "yggdrasil" {
 		if c.Inner == "" {
