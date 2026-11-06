@@ -40,8 +40,8 @@ func (t *taggedZone) check(query []byte, name string, questionEnd int) []byte {
 	if !ok || labels == "" {
 		return nil
 	}
-	raw, err := slipBase32.DecodeString(strings.ToUpper(strings.ReplaceAll(labels, ".", "")))
-	if err != nil || len(raw) <= dnsttserver.AuthTagLen {
+	raw, ok := slipDecode(labels)
+	if !ok || len(raw) <= dnsttserver.AuthTagLen {
 		return nil
 	}
 	if _, ok := t.auth.Scan(dnsttserver.ScanSession, [dnsttserver.AuthTagLen]byte(raw[:dnsttserver.AuthTagLen]), raw[dnsttserver.AuthTagLen:]); !ok {
@@ -60,10 +60,62 @@ func (t *taggedZone) check(query []byte, name string, questionEnd int) []byte {
 	return out
 }
 
+// slipDecode decodes the labels before a slipstream zone: base32 (lower
+// case here, queryName folded it) with the dots taken out, and nothing the
+// server's decoder could read otherwise (review): only a-z and 2-7, a
+// length a whole number of bytes takes, and the unused bits of the last
+// character zero. Go's decoder skips CR and LF and takes any last bits: the
+// tag would be checked over other bytes than the server reads.
+func slipDecode(labels string) ([]byte, bool) {
+	text := make([]byte, 0, len(labels))
+	for i := 0; i < len(labels); i++ {
+		switch c := labels[i]; {
+		case c == '.':
+		case 'a' <= c && c <= 'z':
+			text = append(text, c-'a'+'A')
+		case '2' <= c && c <= '7':
+			text = append(text, c)
+		default:
+			return nil, false
+		}
+	}
+	switch len(text) % 8 {
+	case 1, 3, 6:
+		return nil, false
+	}
+	if len(text) == 0 {
+		return nil, false
+	}
+	raw, err := slipBase32.DecodeString(string(text))
+	if err != nil {
+		return nil, false
+	}
+	// Canonical: encoding the bytes again gives the same text.
+	if slipBase32.EncodeToString(raw) != string(text) {
+		return nil, false
+	}
+	return raw, true
+}
+
+// frontOPT is the OPT the front answers an EDNS query with when the backend
+// does not see it: what slipstream's server sends (1232, the DO bit of the
+// query, no options), so the two read the same.
+func frontOPT(query []byte, questionEnd int) []byte {
+	i := optOffset(query, questionEnd)
+	if i < 0 {
+		return nil
+	}
+	return []byte{0, 0, 41, 0x04, 0xd0, 0, 0, query[i+6] & 0x80, 0, 0, 0}
+}
+
 // nodata answers a query with NOERROR and no records, as the zone would for
-// a name without the type asked: the question echoed, AA set.
+// a name without the type asked: the question echoed, AA set, and an OPT
+// when the query had one, as the server's empty answer (review: without it
+// the front's answer told an untagged query apart, and an EDNS query must
+// get one, RFC 6891 §7).
 func nodata(query []byte, questionEnd int) []byte {
-	answer := make([]byte, questionEnd)
+	opt := frontOPT(query, questionEnd)
+	answer := make([]byte, questionEnd, questionEnd+len(opt))
 	copy(answer, query[:questionEnd])
 	answer[2] = 0x84 | query[2]&0x79 // QR, AA, opcode, RD
 	answer[3] = query[3] & 0x10      // CD
@@ -71,5 +123,9 @@ func nodata(query []byte, questionEnd int) []byte {
 	binary.BigEndian.PutUint16(answer[6:8], 0)
 	binary.BigEndian.PutUint16(answer[8:10], 0)
 	binary.BigEndian.PutUint16(answer[10:12], 0)
+	if opt != nil {
+		binary.BigEndian.PutUint16(answer[10:12], 1)
+		answer = append(answer, opt...)
+	}
 	return answer
 }
