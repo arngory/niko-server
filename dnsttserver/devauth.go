@@ -35,10 +35,13 @@ var scanShare = [scanKinds]float64{0.4, 0.4, 0.2}
 // found last (a client's probes and INIT come together).
 const recentMax = 64
 
-// deviceKeys is one generation of the keys: each key's HMAC for Device,
-// under the key's own lock (a session's check waits for no other
-// session's, nor for a scan), and one per scan kind, each kind scanning
-// alone (review 13).
+// deviceKeys is one generation of the keys: each key's HMAC under the
+// key's own lock, for Device and the scans' recent pass (a session's check
+// waits for no other device's, nor for a full pass; it may wait out one
+// HMAC of a scan trying its device among the recent ones, which the scan
+// budget keeps rare: at the default budget a session's slowest checks in
+// a flood of garbage stay within microseconds, review 14), and one per scan
+// kind for the full pass, each kind's alone (review 13).
 type deviceKeys struct {
 	*authKeys
 	device []*keyMAC
