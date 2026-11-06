@@ -169,6 +169,7 @@ type dnsFront struct {
 	zones       []string
 	zoneBackend map[string]*backendLink
 	sockets     map[netip.AddrPort]*net.UDPConn
+	pending     pendingQueries // what the backends' answers are for
 }
 
 func (f *dnsFront) closeAll() {
@@ -215,12 +216,25 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 				continue
 			}
 		}
+		f.pending.add(client, query, questionEnd)
 		f.zoneBackend[zone].send(encodePacket(message, client, local, query))
 	}
 }
 
-// answer sends a backend's answer from the socket the query came in on.
+// answer sends a backend's answer from the socket the query came in on:
+// only to a query that waits for it, and within its requester's size
+// (pendingQueries).
 func (f *dnsFront) answer(client, local netip.AddrPort, payload []byte) {
+	size, ok := f.pending.take(client, payload)
+	if !ok {
+		f.log.Debugf("an answer to %s no query waits for: dropped", client)
+		return
+	}
+	if len(payload) > size {
+		if payload = truncated(payload); payload == nil {
+			return
+		}
+	}
 	conn := f.sockets[local]
 	if conn == nil {
 		for addr, candidate := range f.sockets {
