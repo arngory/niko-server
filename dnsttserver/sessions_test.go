@@ -37,7 +37,7 @@ func TestSessionTable(t *testing.T) {
 	tab := newSessionTable()
 	admitted := 0
 	for i := range 100 {
-		if tab.admit(clientID(i), startPacket()) {
+		if tab.admit(clientID(i), startPacket(), nil) {
 			admitted++
 		}
 	}
@@ -46,17 +46,17 @@ func TestSessionTable(t *testing.T) {
 	}
 	// An admitted ClientID passes again; KCP's session for it is taken,
 	// one for a ClientID never admitted is refused.
-	if !tab.admit(clientID(0), startPacket()) || !tab.add(clientID(0)) || tab.add(clientID(99)) {
+	if !tab.admit(clientID(0), startPacket(), nil) || !tab.add(clientID(0)) || tab.add(clientID(99)) {
 		t.Fatal("add")
 	}
 	// The handshake done: its place among the handshakes is free, but the
 	// rate holds the next ones back (the burst is spent).
 	tab.established(clientID(0))
-	if tab.admit(clientID(200), startPacket()) {
+	if tab.admit(clientID(200), startPacket(), nil) {
 		t.Fatal("admitted over the rate")
 	}
 	tab.last = tab.last.Add(-time.Second) // a second later: 2 more tokens
-	if !tab.admit(clientID(200), startPacket()) {
+	if !tab.admit(clientID(200), startPacket(), nil) {
 		t.Fatal("not admitted within the rate")
 	}
 	// Admissions KCP never made a session of go after pendingTimeout, when
@@ -68,7 +68,7 @@ func TestSessionTable(t *testing.T) {
 		}
 	}
 	tab.swept, tab.last = time.Time{}, tab.last.Add(-10*time.Second)
-	if !tab.admit(clientID(300), startPacket()) {
+	if !tab.admit(clientID(300), startPacket(), nil) {
 		t.Fatal("stale admissions kept their places")
 	}
 	if !tab.has(clientID(0)) || tab.has(clientID(1)) || !tab.has(clientID(300)) {
@@ -89,7 +89,7 @@ func TestSessionConnDrops(t *testing.T) {
 	tab := newSessionTable()
 	conn := sessionConn{tt, tab}
 	in, out := clientID(1), clientID(2)
-	tab.admit(in, startPacket())
+	tab.admit(in, startPacket(), nil)
 	conn.WriteTo([]byte("for a session"), in)
 	conn.WriteTo([]byte("for no session"), out)
 	select {
@@ -161,7 +161,43 @@ func TestLooksLikeStart(t *testing.T) {
 	for i := range random {
 		random[i] = byte(i * 37)
 	}
-	if tab.admit(clientID(1), random) || tab.has(clientID(1)) {
+	if tab.admit(clientID(1), random, nil) || tab.has(clientID(1)) {
 		t.Fatal("random bytes admitted")
+	}
+}
+
+// One dnsauth device gets MaxSessionsPerDevice at once (review 8: one
+// device key could take every session); other devices and untagged
+// ClientIDs are not held back by it, and a closed session frees a place.
+func TestSessionTablePerDevice(t *testing.T) {
+	defer func(d int, r float64) { MaxSessionsPerDevice, NewSessionsPerSecond = d, r }(MaxSessionsPerDevice, NewSessionsPerSecond)
+	MaxSessionsPerDevice, NewSessionsPerSecond = 3, 1000
+	tab := newSessionTable()
+	dev := func(d string) func() string { return func() string { return d } }
+	for i := range 3 {
+		if !tab.admit(clientID(i), startPacket(), dev("a")) {
+			t.Fatalf("device a's session %d refused", i)
+		}
+	}
+	if tab.admit(clientID(10), startPacket(), dev("a")) {
+		t.Fatal("device a over its bound")
+	}
+	// Established sessions count too.
+	tab.add(clientID(0))
+	tab.established(clientID(0))
+	if tab.admit(clientID(10), startPacket(), dev("a")) {
+		t.Fatal("device a over its bound with one established")
+	}
+	if !tab.admit(clientID(11), startPacket(), dev("b")) || !tab.admit(clientID(12), startPacket(), dev("")) || !tab.admit(clientID(13), startPacket(), nil) {
+		t.Fatal("another device, or an untagged ClientID, held back")
+	}
+	// A session of a's closes: its place goes to a's next one.
+	tab.remove(clientID(1))
+	if !tab.admit(clientID(10), startPacket(), dev("a")) {
+		t.Fatal("device a's place not freed")
+	}
+	// A ClientID in the table passes whatever its device's count.
+	if !tab.admit(clientID(2), startPacket(), dev("a")) {
+		t.Fatal("an admitted ClientID refused")
 	}
 }

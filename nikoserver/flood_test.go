@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/base32"
 	"encoding/hex"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/arngory/niko-server/dnsttserver"
 	"github.com/sagernet/sing-box/transport/dnstt"
 	"github.com/sagernet/sing/common/logger"
 	"www.bamsoftware.com/git/dnstt.git/dns"
@@ -93,4 +95,74 @@ func TestNekoServerDNSTTFreshClientIDFlood(t *testing.T) {
 	}
 	conn.Close()
 	t.Logf("under a flood of 300 fresh ClientIDs a second: a session in %v", time.Since(start).Round(time.Millisecond))
+}
+
+// A session gets dnsttserver.MaxStreams streams at once: one over the
+// bound is closed at once, and a stream closed frees its place (review 8:
+// each stream dials the inner stage, and a session opened as many as it
+// liked).
+func TestNekoServerDNSTTStreamBound(t *testing.T) {
+	defer func(n int) { dnsttserver.MaxStreams = n }(dnsttserver.MaxStreams)
+	dnsttserver.MaxStreams = 2
+	privkey, err := noise.GeneratePrivkey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyFile := filepath.Join(t.TempDir(), "noise.key")
+	os.WriteFile(keyFile, []byte(hex.EncodeToString(privkey)+"\n"), 0o600)
+	resolver := startNode(t, "dnstt", "t.example.com", map[string]any{"zone": "t.example.com", "private_key_file": keyFile})
+	parsed, err := dnstt.ParseResolver("udp://" + resolver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := dnstt.NewClient(dnstt.ClientOptions{
+		Context: context.Background(), Logger: logger.NOP(), Dialer: udpDialer{},
+		Domain: "t.example.com", PubKey: hex.EncodeToString(noise.PubkeyFromPrivkey(privkey)), Resolver: parsed,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	// echo writes a line and reads it back: nil when the stream is open.
+	echo := func(conn net.Conn) error {
+		conn.SetDeadline(time.Now().Add(10 * time.Second))
+		if _, err := conn.Write([]byte("hello\n")); err != nil {
+			return err
+		}
+		buf := make([]byte, 6)
+		_, err := io.ReadFull(conn, buf)
+		return err
+	}
+	var open []net.Conn
+	for i := range 2 {
+		conn, err := client.DialConn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		if err := echo(conn); err != nil {
+			t.Fatalf("stream %d: %v", i, err)
+		}
+		open = append(open, conn)
+	}
+	third, err := client.DialConn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer third.Close()
+	if err := echo(third); err == nil {
+		t.Fatal("a stream over the bound was served")
+	}
+	open[0].Close()
+	time.Sleep(time.Second) // the close reaches the node
+	fourth, err := client.DialConn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fourth.Close()
+	if err := echo(fourth); err != nil {
+		t.Fatalf("a stream after one closed: %v", err)
+	}
 }

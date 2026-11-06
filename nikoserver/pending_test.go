@@ -37,7 +37,12 @@ func pendingAnswer(t *testing.T, query []byte, size int) []byte {
 		t.Fatal(err)
 	}
 	m.Flags = 0x8400
+	// The backend's own OPT when the query had one, as dnstt answers.
+	hadOPT := len(m.Additional) > 0
 	m.Additional = nil
+	if hadOPT {
+		m.Additional = []dns.RR{{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 4096, Data: []byte{}}}
+	}
 	m.Answer = []dns.RR{{Name: m.Question[0].Name, Type: dns.RRTypeTXT, Class: dns.ClassIN, TTL: 60, Data: dns.EncodeRDataTXT(nil)}}
 	b, _ := m.WireFormat()
 	data := make([]byte, size-len(b)) // TXT strings of 255: 1 byte of length each
@@ -133,6 +138,15 @@ func TestTruncated(t *testing.T) {
 	}
 	if truncated(a[:20]) != nil || truncated(nil) != nil {
 		t.Fatal("a cut answer truncated")
+	}
+	// An answer with an OPT keeps one (RFC 6891 §7, review 8): the front's.
+	q, end = pendingQuery(t, 0x0103, 1232)
+	tc = truncated(pendingAnswer(t, q, 4000))
+	if len(tc) != end+len(truncatedOPT) || binary.BigEndian.Uint16(tc[10:12]) != 1 || !bytes.Equal(tc[end:], truncatedOPT) {
+		t.Fatalf("truncated with an OPT % x", tc)
+	}
+	if m, err := dns.MessageFromWireFormat(tc); err != nil || len(m.Additional) != 1 || m.Additional[0].Type != dns.RRTypeOPT || m.Additional[0].Class != 4096 {
+		t.Fatalf("%+v %v", m, err)
 	}
 }
 

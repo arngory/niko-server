@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -682,5 +684,44 @@ func TestSendLoopMemo(t *testing.T) {
 	}
 	if (&answerMemo{}).answer(&record{}) {
 		t.Fatal("a record without a key used the memo")
+	}
+}
+
+// The keys file rewritten after LoadKeys, before the watcher's first look
+// and at the same size, is taken (review 8: the watcher compared mtime and
+// size with what it saw at its start, and a revocation was missed).
+func TestAuthWatchKeysContent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth.keys")
+	k1 := "d1 " + strings.Repeat("11", 32) + "\n"
+	k2 := "d1 " + strings.Repeat("22", 32) + "\n"
+	if err := os.WriteFile(path, []byte(k1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := &Auth{Mode: AuthRequired}
+	if err := a.LoadKeys(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(k2), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	defer close(stop)
+	go a.WatchKeys(path, 10*time.Millisecond, stop, t.Logf)
+	for range 200 {
+		if a.keys.Load().keys[0].key[0] == 0x22 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if a.keys.Load().keys[0].key[0] != 0x22 {
+		t.Fatal("the rewritten keys not taken")
+	}
+	// A file that does not parse keeps the keys in force.
+	if err := os.WriteFile(path, []byte("d1 zz\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if a.Devices() != 1 || a.keys.Load().keys[0].key[0] != 0x22 {
+		t.Fatal("a bad file replaced the keys")
 	}
 }

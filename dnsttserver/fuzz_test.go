@@ -110,7 +110,8 @@ func FuzzResponseFor(f *testing.F) {
 		if sealed != nil && (sealMode == SealOff || payload == nil) {
 			t.Fatalf("sealed with mode %d, payload %x", sealMode, payload)
 		}
-		if payload != nil {
+		// An empty payload is no tunnel query (the zone's apex: NODATA).
+		if len(payload) > 0 {
 			if key == "" {
 				t.Fatal("a payload without a memo key")
 			}

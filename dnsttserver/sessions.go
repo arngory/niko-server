@@ -27,7 +27,24 @@ var (
 	// fake ones cannot take more than these from MaxSessions.
 	MaxHandshakes = 128
 	// HandshakeTimeout closes a session whose handshake is not done by then.
-	HandshakeTimeout = 20 * time.Second
+	// Long, as a client is lost once it is: KCP acknowledged its sn 0 and
+	// it never sends it again, and every other packet of an unknown
+	// ClientID is refused (looksLikeStart). With 20 s, resolvers dropping
+	// a session's first queries a while stranded it (review 8); a client
+	// gives up a handshake sooner, with a new ClientID. MaxHandshakes
+	// bounds what the wait costs.
+	HandshakeTimeout = 60 * time.Second
+	// MaxSessionsPerDevice bounds the sessions of one dnsauth device (by
+	// its tag), so that one device key cannot take MaxSessions (review 8).
+	// A device keeps one session to a node, and a few more while it moves
+	// between networks: the old ones close after idleTimeout. A new
+	// ClientID over the bound is not admitted until one closes; the client
+	// sends its sn 0 again meanwhile, as KCP did not acknowledge it.
+	MaxSessionsPerDevice = 8
+	// MaxStreams bounds a session's smux streams open at once: each dials
+	// the inner stage. A client opens one per connection it carries, a few
+	// dozen for a browser through a DNS tunnel.
+	MaxStreams = 256
 	// maxHandshakeMessage bounds the client's first Noise message (48
 	// bytes for dnstt's NK): its length prefix sized an allocation of up to
 	// 64 KiB, kept while the handshake waited for the rest.
@@ -54,8 +71,9 @@ type sessionTable struct {
 }
 
 type sessionEntry struct {
-	state sessionState
-	since time.Time
+	state  sessionState
+	since  time.Time
+	device string // the dnsauth device of its tag; "" untagged
 }
 
 type sessionState int
@@ -89,7 +107,10 @@ func (t *sessionTable) has(id turbotunnel.ClientID) bool {
 
 // admit reports whether KCP may see packet p of id: id is in the table,
 // or p can open a session (looksLikeStart) and id is let in now (pending).
-func (t *sessionTable) admit(id turbotunnel.ClientID, p []byte) bool {
+// device, when not nil, names the dnsauth device of id's tag ("" for none):
+// called for a new id only, it is held to MaxSessionsPerDevice. Lock order:
+// the table's, then what device takes (Auth's).
+func (t *sessionTable) admit(id turbotunnel.ClientID, p []byte, device func() string) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if _, ok := t.open[id]; ok {
@@ -123,8 +144,22 @@ func (t *sessionTable) admit(id turbotunnel.ClientID, p []byte) bool {
 	if t.tokens < 1 {
 		return false
 	}
+	var dev string
+	if device != nil {
+		if dev = device(); dev != "" {
+			n := 0
+			for _, e := range t.open {
+				if e.device == dev {
+					n++
+				}
+			}
+			if n >= MaxSessionsPerDevice {
+				return false
+			}
+		}
+	}
 	t.tokens--
-	t.open[id] = &sessionEntry{state: sessionPending, since: now}
+	t.open[id] = &sessionEntry{state: sessionPending, since: now, device: dev}
 	t.handshake++
 	return true
 }
@@ -144,7 +179,8 @@ const (
 // write, so the data may be the length alone (the message is in sn 1).
 // Anything else from a ClientID without a session never reaches KCP: a
 // flood of random packets under fresh ClientIDs took every place of the
-// handshakes, for 20 s each, and new sessions waited (review 7). One that
+// handshakes for the whole HandshakeTimeout, and new sessions waited
+// (review 7). One that
 // copies the shape still can, as long as queries need no device tag:
 // auth=required is what keeps them out.
 func looksLikeStart(p []byte) bool {
