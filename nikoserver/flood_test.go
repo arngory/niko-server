@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/base32"
 	"encoding/hex"
+	"encoding/json"
 	"io"
 	"net"
 	"os"
@@ -168,5 +169,51 @@ func TestNekoServerDNSTTStreamBound(t *testing.T) {
 	defer again.Close()
 	if err := echo(again); err != nil {
 		t.Fatalf("a stream after one closed: %v", err)
+	}
+}
+
+// The dnstt backend gives its counters on its stats socket: after a
+// session and a stream, the queries, the admitted session and the open one.
+func TestNekoServerDNSTTStats(t *testing.T) {
+	privkey, err := noise.GeneratePrivkey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "noise.key")
+	os.WriteFile(keyFile, []byte(hex.EncodeToString(privkey)+"\n"), 0o600)
+	statsSocket := filepath.Join(dir, "stats.sock")
+	resolver := startNodeFull(t, "dnstt", "t.example.com", map[string]any{"zone": "t.example.com", "private_key_file": keyFile}, "", statsSocket)
+	parsed, err := dnstt.ParseResolver("udp://" + resolver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := dnstt.NewClient(dnstt.ClientOptions{
+		Context: context.Background(), Logger: logger.NOP(), Dialer: udpDialer{},
+		Domain: "t.example.com", PubKey: hex.EncodeToString(noise.PubkeyFromPrivkey(privkey)), Resolver: parsed,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	conn, err := client.DialConn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	echoRound(t, conn)
+	c, err := net.Dial("unix", statsSocket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	var st dnsttserver.StatsSnapshot
+	if err := json.NewDecoder(c).Decode(&st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Queries == 0 || st.SessionsAdmitted < 1 || st.Sessions < 1 || st.RefusedFull != 0 || st.AuthValid != 0 {
+		t.Fatalf("stats %+v", st)
 	}
 }
