@@ -70,7 +70,7 @@ func ask(t *testing.T, p *dnsProbe, zone, label string, qtype uint16, edns int, 
 	if !ok {
 		t.Fatal("query does not parse")
 	}
-	return p.answer(q, name, end, zone, netip.MustParseAddr(src))
+	return p.answer(q, name, end, zone, netip.MustParseAddr(src), false)
 }
 
 // The spec's example (raycontrol docs/spec/dnsprobe-v1.md §7).
@@ -244,5 +244,51 @@ func TestProbeRate(t *testing.T) {
 	}
 	if !p.allow(netip.MustParseAddr("192.0.2.1"), 1, now) {
 		t.Fatal("a new source refused with the map full")
+	}
+}
+
+// In a zone whose dnstt answers are sealed (dnsseal-v1 §6), the probe's
+// TXT data is padded as theirs: to a multiple of 64, within the room; a
+// client reads the first 43 (908) bytes, which are the same.
+func TestProbePad(t *testing.T) {
+	key := bytes.Repeat([]byte{7}, 32)
+	zone := "t.example.com"
+	now := time.Unix(1_740_000_000, 0)
+	p := newDNSProbe(key)
+	p.now = func() time.Time { return now }
+	minute := uint32(now.Unix() / 60)
+	for i, c := range []struct {
+		large bool
+		edns  int
+		want  int // TXT data
+		plain int
+	}{
+		{false, 1232, 64, probeSmall},
+		{false, 0, 64, probeSmall},
+		{true, 1232, 934, probeLarge}, // 960 is past the room of 934
+		{true, 512, 64, probeSmall},   // no room for the large one
+	} {
+		l := probeLabel(key, zone, c.large, minute, [8]byte{byte(i + 1)})
+		q := probeQuery(l+"."+zone, 16, c.edns)
+		name, end, _ := queryName(q)
+		reply, probe := p.answer(q, name, end, zone, netip.MustParseAddr("198.51.100.7"), true)
+		if !probe || reply == nil {
+			t.Fatalf("%d: not answered", i)
+		}
+		m, err := dns.MessageFromWireFormat(reply)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, _ := dns.DecodeRDataTXT(m.Answer[0].Data)
+		if len(data) != c.want {
+			t.Fatalf("%d: TXT data of %d bytes, want %d", i, len(data), c.want)
+		}
+		// The first bytes are the probe's, as without the padding.
+		b, _ := probeBase32.DecodeString(strings.ToUpper(l))
+		plain := append([]byte(nil), data[probeNonceLen:probeNonceLen+c.plain]...)
+		probeCrypt(probeMAC(key, []byte("dnsprobe-v1 e")), b, data[:probeNonceLen], plain)
+		if !bytes.Equal(plain[:probeTokenLen], probeMAC(key, []byte("dnsprobe-v1 a"), b, plain[probeTokenLen:probeSmall])[:probeTokenLen]) {
+			t.Fatalf("%d: token", i)
+		}
 	}
 }

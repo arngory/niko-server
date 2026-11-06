@@ -48,6 +48,11 @@ func TestNekoServerConfigCheck(t *testing.T) {
 	if errs := checkConfig(t, dnstt); len(errs) > 0 {
 		t.Fatal(errs)
 	}
+	// dnsseal-v1.
+	sealed := strings.Replace(dnstt, `"zone":"t.example.com"`, `"zone":"t.example.com","seal":"optional","seal_key_file":"/run/credentials/niko-dns.service/seal.keys"`, 1)
+	if errs := checkConfig(t, sealed); len(errs) > 0 {
+		t.Fatal(errs)
+	}
 	// dnsauth-v1 (raycontrol S-9).
 	authed := strings.Replace(dnstt, `"zone":"t.example.com"`, `"zone":"t.example.com","auth":"optional","auth_keys_file":"/var/lib/raycontrol/rendered/dns/auth.keys"`, 1)
 	if errs := checkConfig(t, authed); len(errs) > 0 {
@@ -95,6 +100,9 @@ func TestNekoServerConfigCheck(t *testing.T) {
 		"dns.zones[0].backend":      strings.Replace(front, `"backend":"dns"}]`, `"backend":"nope"}]`, 1),
 		"dns.zones[0].probe":        strings.Replace(front, `"backend":"dns"}]`, `"backend":"dns","probe":true}]`, 1),
 		"dns.zones[0].ns[1]":        strings.Replace(front, `"backend":"dns"}]`, `"backend":"dns","ns":["ns1.example.com","bad name"]}]`, 1),
+		"dns.zones[0].seal_pad":     strings.Replace(front, `"backend":"dns"}]`, `"backend":"dns","seal_pad":true}]`, 1),
+		"options.seal":              strings.Replace(dnstt, `"zone":"t.example.com"`, `"zone":"t.example.com","seal":"on"`, 1),
+		"options.seal_key_file":     strings.Replace(dnstt, `"zone":"t.example.com"`, `"zone":"t.example.com","seal":"required"`, 1),
 		"dns.listen[1]":             strings.Replace(front, `"[::]:53"`, `"localhost:53"`, 1),
 		"options.encryption_method": strings.Replace(masterdns, `"encryption_method":5`, `"encryption_method":2`, 1),
 		"inner":                     strings.Replace(dnstt, `"inner":"/run/niko/inner/vless.sock"`, `"inner":"relative.sock"`, 1),
