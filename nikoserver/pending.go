@@ -170,8 +170,12 @@ func skipName(msg []byte, i int) (int, bool) {
 }
 
 // truncatedOPT is the OPT of a truncated answer: the front's own, as in its
-// apex and probe answers (the root, 4096, no flags, no options).
+// apex and probe answers (the root, 4096, no options), the DO bit taken
+// from the backend's (which has the query's).
 var truncatedOPT = []byte{0, 0, 41, 0x10, 0x00, 0, 0, 0, 0, 0, 0}
+
+// optDO is the DO bit in an OPT record's TTL (RFC 3225 §3).
+const optDO = 0x8000
 
 // truncated is an answer cut to its header and question, with TC set and
 // no records but an OPT when the answer had one (the query had): what a
@@ -205,8 +209,9 @@ func truncated(answer []byte) []byte {
 	binary.BigEndian.PutUint16(out[6:8], 0)
 	binary.BigEndian.PutUint16(out[8:10], 0)
 	binary.BigEndian.PutUint16(out[10:12], 0)
-	if optOffset(answer, i+4) >= 0 {
+	if o := optOffset(answer, i+4); o >= 0 {
 		out = append(out, truncatedOPT...)
+		out[len(out)-4] = answer[o+6] & 0x80 // the flags' first byte: DO
 		binary.BigEndian.PutUint16(out[10:12], 1)
 	}
 	return out

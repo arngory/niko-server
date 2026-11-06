@@ -220,10 +220,10 @@ func probeSeal(p *dnsProbe, b, plain []byte, nonce [probeNonceLen]byte) []byte {
 // after the probe's data up to a multiple of 64, within what the requester
 // can carry, as the zone's answers are padded.
 func probeReply(p *dnsProbe, q dns.Message, b, rawLabel []byte, src netip.Addr, large bool, nonce [probeNonceLen]byte, pad bool) []byte {
-	edns, hasOPT := 0, false
+	edns, hasOPT, do := 0, false, uint32(0)
 	for _, rr := range q.Additional {
 		if rr.Type == dns.RRTypeOPT {
-			edns, hasOPT = int(rr.Class), true
+			edns, hasOPT, do = int(rr.Class), true, rr.TTL&optDO
 			break
 		}
 	}
@@ -243,7 +243,7 @@ func probeReply(p *dnsProbe, q dns.Message, b, rawLabel []byte, src netip.Addr, 
 			Answer: []dns.RR{{Name: q.Question[0].Name, Type: q.Question[0].Type, Class: q.Question[0].Class, TTL: probeTTL,
 				Data: dns.EncodeRDataTXT(data)}}}
 		if hasOPT {
-			resp.Additional = []dns.RR{{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: probeOPTSize, TTL: 0, Data: []byte{}}}
+			resp.Additional = []dns.RR{{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: probeOPTSize, TTL: do, Data: []byte{}}}
 		}
 		wire, err := resp.WireFormat()
 		if err != nil {
