@@ -10,13 +10,17 @@ import (
 // pendingQueries remembers, for each query the front passed to a backend,
 // the most its requester takes (RFC 6891 §6.2.5: the OPT's size, never
 // under 512; 512 without one). An answer from a backend never goes out
-// larger: one that is gets TC and no records, as a server's that does not
-// fit. A backend that does not size its answers itself (masterdns sends the
-// kilobytes of its MTU probes to anyone) would otherwise make the node a
-// reflector: a forged source, a hundred bytes in, kilobytes out to the
-// victim. An answer no query waits for is dropped. Two generations of
-// pendingGeneration bound it: an answer later than 5 to 10 seconds is
-// dropped too, and a flood swaps them sooner.
+// larger, nor over maxBackendAnswer: one that is gets TC and no records, as
+// a server's that does not fit. An answer no query waits for is dropped.
+// This bounds what a forged source gets out of a backend; it does not end
+// it, as the forged query writes the requester's size itself: an answer of
+// up to 1232 bytes still goes to the victim (masterdns's MTU probes sent 4
+// to 6 KB, up to 136 times the query). The backends bound the rest:
+// masterdns (arngory/sing-box 15c95f4) answers a probe with at most 4 times
+// its query, dnstt sizes its answers and answers a query without a device's
+// tag empty where dnsauth is required. Two generations of pendingGeneration
+// bound the table: an answer later than 5 to 10 seconds is dropped too, and
+// a flood swaps them sooner.
 type pendingQueries struct {
 	mu        sync.Mutex
 	cur, prev map[pendingKey]pendingEntry
