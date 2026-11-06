@@ -87,16 +87,21 @@ func (t *sessionTable) has(id turbotunnel.ClientID) bool {
 	return ok
 }
 
-// admit reports whether KCP may see a packet of id: it is in the table, or
-// it is let in now (pending).
-func (t *sessionTable) admit(id turbotunnel.ClientID) bool {
+// admit reports whether KCP may see packet p of id: id is in the table,
+// or p can open a session (looksLikeStart) and id is let in now (pending).
+func (t *sessionTable) admit(id turbotunnel.ClientID, p []byte) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if _, ok := t.open[id]; ok {
 		return true
 	}
+	if !looksLikeStart(p) {
+		return false
+	}
 	now := time.Now()
-	if t.handshake >= MaxHandshakes && now.Sub(t.swept) >= time.Second {
+	if now.Sub(t.swept) >= time.Second {
+		// Admissions KCP made no session of: their places back, and no
+		// queues kept for them (has).
 		t.swept = now
 		for k, e := range t.open {
 			if e.state == sessionPending && now.Sub(e.since) >= pendingTimeout {
@@ -122,6 +127,33 @@ func (t *sessionTable) admit(id turbotunnel.ClientID) bool {
 	t.open[id] = &sessionEntry{state: sessionPending, since: now}
 	t.handshake++
 	return true
+}
+
+const (
+	kcpHeader = 24 // kcp-go IKCP_OVERHEAD
+	kcpPush   = 81 // IKCP_CMD_PUSH
+	// noiseFirst is the length of the client's first Noise message: NK's
+	// e (32 bytes) and the tag of an empty payload (16).
+	noiseFirst = 48
+)
+
+// looksLikeStart reports whether a packet can open a dnstt session: KCP's
+// first segment of a conversation (PUSH, sn 0, no fragment) whose data
+// begins with the length of the client's first Noise message. dnstt's
+// client writes that length and the message apart, and KCP flushes each
+// write, so the data may be the length alone (the message is in sn 1).
+// Anything else from a ClientID without a session never reaches KCP: a
+// flood of random packets under fresh ClientIDs took every place of the
+// handshakes, for 20 s each, and new sessions waited (review 7). One that
+// copies the shape still can, as long as queries need no device tag:
+// auth=required is what keeps them out.
+func looksLikeStart(p []byte) bool {
+	if len(p) < kcpHeader+2 {
+		return false
+	}
+	n := binary.LittleEndian.Uint32(p[20:24])
+	return p[4] == kcpPush && p[5] == 0 && binary.LittleEndian.Uint32(p[12:16]) == 0 &&
+		n >= 2 && n <= uint32(len(p)-kcpHeader) && p[24] == 0 && p[25] == noiseFirst
 }
 
 // add takes a session KCP accepted; false: it was not admitted (or its

@@ -238,7 +238,7 @@ func (f *dnsFront) answer(client, local netip.AddrPort, payload []byte) {
 		f.log.Debugf("an answer to %s no query waits for: dropped", client)
 		return
 	}
-	if len(payload) > size {
+	if len(payload) > min(size, maxBackendAnswer) {
 		if payload = truncated(payload); payload == nil {
 			return
 		}

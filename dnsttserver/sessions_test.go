@@ -10,6 +10,17 @@ import (
 	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
 )
 
+// startPacket is the first KCP segment of a dnstt session: PUSH, sn 0,
+// with the length of the Noise first message as its data.
+func startPacket() []byte {
+	p := make([]byte, kcpHeader+2)
+	binary.LittleEndian.PutUint32(p[0:4], 0x1234)
+	p[4] = kcpPush
+	binary.LittleEndian.PutUint32(p[20:24], 2)
+	p[25] = noiseFirst
+	return p
+}
+
 func clientID(i int) turbotunnel.ClientID {
 	var id turbotunnel.ClientID
 	binary.BigEndian.PutUint64(id[:], uint64(i)+1)
@@ -26,7 +37,7 @@ func TestSessionTable(t *testing.T) {
 	tab := newSessionTable()
 	admitted := 0
 	for i := range 100 {
-		if tab.admit(clientID(i)) {
+		if tab.admit(clientID(i), startPacket()) {
 			admitted++
 		}
 	}
@@ -35,17 +46,17 @@ func TestSessionTable(t *testing.T) {
 	}
 	// An admitted ClientID passes again; KCP's session for it is taken,
 	// one for a ClientID never admitted is refused.
-	if !tab.admit(clientID(0)) || !tab.add(clientID(0)) || tab.add(clientID(99)) {
+	if !tab.admit(clientID(0), startPacket()) || !tab.add(clientID(0)) || tab.add(clientID(99)) {
 		t.Fatal("add")
 	}
 	// The handshake done: its place among the handshakes is free, but the
 	// rate holds the next ones back (the burst is spent).
 	tab.established(clientID(0))
-	if tab.admit(clientID(200)) {
+	if tab.admit(clientID(200), startPacket()) {
 		t.Fatal("admitted over the rate")
 	}
 	tab.last = tab.last.Add(-time.Second) // a second later: 2 more tokens
-	if !tab.admit(clientID(200)) {
+	if !tab.admit(clientID(200), startPacket()) {
 		t.Fatal("not admitted within the rate")
 	}
 	// Admissions KCP never made a session of go after pendingTimeout, when
@@ -57,7 +68,7 @@ func TestSessionTable(t *testing.T) {
 		}
 	}
 	tab.swept, tab.last = time.Time{}, tab.last.Add(-10*time.Second)
-	if !tab.admit(clientID(300)) {
+	if !tab.admit(clientID(300), startPacket()) {
 		t.Fatal("stale admissions kept their places")
 	}
 	if !tab.has(clientID(0)) || tab.has(clientID(1)) || !tab.has(clientID(300)) {
@@ -78,7 +89,7 @@ func TestSessionConnDrops(t *testing.T) {
 	tab := newSessionTable()
 	conn := sessionConn{tt, tab}
 	in, out := clientID(1), clientID(2)
-	tab.admit(in)
+	tab.admit(in, startPacket())
 	conn.WriteTo([]byte("for a session"), in)
 	conn.WriteTo([]byte("for no session"), out)
 	select {
@@ -121,3 +132,36 @@ type nopRWC struct{ io.Reader }
 
 func (nopRWC) Write(p []byte) (int, error) { return len(p), nil }
 func (nopRWC) Close() error                { return nil }
+
+// Only what can open a session gets a new ClientID in: random bytes, a
+// later segment, an ACK, a fragment, data that is no Noise first message.
+func TestLooksLikeStart(t *testing.T) {
+	if !looksLikeStart(startPacket()) {
+		t.Fatal("a session's first segment refused")
+	}
+	whole := append(startPacket(), make([]byte, noiseFirst)...) // with the message itself
+	binary.LittleEndian.PutUint32(whole[20:24], 2+noiseFirst)
+	if !looksLikeStart(whole) {
+		t.Fatal("the whole first message refused")
+	}
+	for name, change := range map[string]func(p []byte) []byte{
+		"short":         func(p []byte) []byte { return p[:kcpHeader+1] },
+		"ack":           func(p []byte) []byte { p[4] = 82; return p },
+		"fragment":      func(p []byte) []byte { p[5] = 1; return p },
+		"sn 1":          func(p []byte) []byte { p[12] = 1; return p },
+		"other length":  func(p []byte) []byte { p[25] = 49; return p },
+		"len past data": func(p []byte) []byte { binary.LittleEndian.PutUint32(p[20:24], 3); return p },
+	} {
+		if looksLikeStart(change(startPacket())) {
+			t.Errorf("%s: taken", name)
+		}
+	}
+	tab := newSessionTable()
+	random := make([]byte, 32)
+	for i := range random {
+		random[i] = byte(i * 37)
+	}
+	if tab.admit(clientID(1), random) || tab.has(clientID(1)) {
+		t.Fatal("random bytes admitted")
+	}
+}

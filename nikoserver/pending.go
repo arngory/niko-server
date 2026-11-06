@@ -102,20 +102,54 @@ func (p *pendingQueries) take(client netip.AddrPort, answer []byte) (int, bool) 
 	return int(e.size), true
 }
 
+// maxBackendAnswer is the most a backend's answer may be over UDP whatever
+// the requester's OPT says, since a forged query brings its own: with an
+// OPT of 65535, masterdns's MTU probe answers (4 to 6 KB) still went to the
+// victim (review 7). dnstt never answers more (maxUDPPayload), and 1232 is
+// DNS's size that does not fragment (DNS Flag Day 2020): the most a forged
+// query gets out is what any DNS server's EDNS answer is.
+const maxBackendAnswer = 1232
+
 // requesterSize is the UDP payload size a query's requester takes: its OPT
-// record's (the first record of the additional section, right after the
-// one question, with the root name), at least 512; 512 without one.
+// record's, wherever it is in the additional section (as dnstt reads it),
+// at least 512; 512 without one, or when the query cannot be walked.
 func requesterSize(query []byte, questionEnd int) int {
-	if len(query) < 12 || binary.BigEndian.Uint16(query[4:6]) != 1 ||
-		binary.BigEndian.Uint16(query[6:8]) != 0 || binary.BigEndian.Uint16(query[8:10]) != 0 ||
-		binary.BigEndian.Uint16(query[10:12]) == 0 {
+	if len(query) < 12 || binary.BigEndian.Uint16(query[4:6]) != 1 {
 		return 512
 	}
-	rr := query[questionEnd:]
-	if len(rr) < 11 || rr[0] != 0 || binary.BigEndian.Uint16(rr[1:3]) != 41 {
-		return 512
+	an := int(binary.BigEndian.Uint16(query[6:8]))
+	ns := int(binary.BigEndian.Uint16(query[8:10]))
+	ar := int(binary.BigEndian.Uint16(query[10:12]))
+	i := questionEnd
+	for r := 0; r < an+ns+ar; r++ {
+		var ok bool
+		if i, ok = skipName(query, i); !ok || i+10 > len(query) {
+			return 512
+		}
+		if r >= an+ns && binary.BigEndian.Uint16(query[i:i+2]) == 41 {
+			return min(max(int(binary.BigEndian.Uint16(query[i+2:i+4])), 512), maxDatagram)
+		}
+		i += 10 + int(binary.BigEndian.Uint16(query[i+8:i+10]))
 	}
-	return min(max(int(binary.BigEndian.Uint16(rr[3:5])), 512), maxDatagram)
+	return 512
+}
+
+// skipName returns where the name at msg[i:] ends: after its root label or
+// its compression pointer.
+func skipName(msg []byte, i int) (int, bool) {
+	for i < len(msg) {
+		switch n := int(msg[i]); {
+		case n == 0:
+			return i + 1, true
+		case n&0xc0 == 0xc0:
+			return i + 2, i+2 <= len(msg)
+		case n > 63:
+			return 0, false
+		default:
+			i += 1 + n
+		}
+	}
+	return 0, false
 }
 
 // truncated is an answer cut to its header and question, with TC set and
