@@ -144,13 +144,15 @@ func runDNSFront(ctx context.Context, c *FrontConfig, log *Logger) error {
 		}
 		if z.Tag != "" {
 			// dnsauth-v2 required: the key by the hint, never a scan.
+			// A keys file that does not read leaves the zone without
+			// keys (every query gets NOERROR) until it does: the front
+			// carries TCP and UDP 443 and the other zones too (review).
 			auth := &dnsttserver.DeviceAuth{Hint: dnsttserver.HintRequired}
 			if err := auth.LoadKeys(z.AuthKeysFile); err != nil {
-				front.closeAll()
-				return envError("dns.zones %s auth keys %s: %v", zone, z.AuthKeysFile, err)
+				log.Warnf("dns.zones %s auth keys %s: %v; no device's query passes until it reads", zone, z.AuthKeysFile, err)
 			}
 			go auth.WatchKeys(z.AuthKeysFile, 5*time.Second, ctx.Done(), log.Infof)
-			front.tagged[zone] = &taggedZone{zone: zone, auth: auth}
+			front.tagged[zone] = newTaggedZone(zone, auth)
 		}
 	}
 	front.stats = newDNSFrontStats(front.zones)
@@ -198,6 +200,7 @@ func (f *dnsFront) closeAll() {
 func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 	buffer := make([]byte, maxDatagram)
 	message := make([]byte, 0, packetHeader+maxDatagram)
+	rebuilt := make([]byte, 0, maxDNSQuery) // a tagged zone's query as its backend gets it
 	for {
 		n, client, err := conn.ReadFromUDPAddrPort(buffer)
 		if err != nil {
@@ -245,10 +248,18 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 			}
 		}
 		forward := query
-		if t := f.tagged[zone]; t != nil {
-			if forward = t.check(query, name, questionEnd); forward == nil {
-				// Not a device's query: the backend sees nothing of it.
-				f.stats.untagged.Add(1)
+		t := f.tagged[zone]
+		var field [dnsttserver.AuthTagLen]byte
+		if t != nil {
+			var verdict int
+			if forward, field, verdict = t.check(query, name, questionEnd, rebuilt); verdict != tagPassed {
+				// Not a device's query, or a copy of one: the backend
+				// sees nothing of it.
+				if verdict == tagReplayed {
+					f.stats.replayed.Add(1)
+				} else {
+					f.stats.untagged.Add(1)
+				}
 				conn.WriteToUDPAddrPort(nodata(query, questionEnd), client)
 				continue
 			}
@@ -259,6 +270,9 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 		f.pending.add(client, query, questionEnd)
 		if !f.zoneBackend[zone].send(encodePacket(message, client, local, forward)) {
 			f.pending.take(client, query) // the backend never got it
+			if t != nil {
+				t.seen.forget(field) // nor its packet: a retry is no copy
+			}
 			f.stats.backendAway.Add(1)
 			continue
 		}
