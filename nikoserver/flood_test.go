@@ -217,3 +217,34 @@ func TestNekoServerDNSTTStats(t *testing.T) {
 		t.Fatalf("stats %+v", st)
 	}
 }
+
+// A spare zone is the same tunnel (raycontrol dnszones-v1): the stock
+// client gets a session and a stream through it.
+func TestNekoServerDNSTTSpareZone(t *testing.T) {
+	privkey, err := noise.GeneratePrivkey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyFile := filepath.Join(t.TempDir(), "noise.key")
+	os.WriteFile(keyFile, []byte(hex.EncodeToString(privkey)+"\n"), 0o600)
+	resolver := startNode(t, "dnstt", "t.example.com", map[string]any{"zone": "t.example.com", "zones": []string{"s.example.net"}, "private_key_file": keyFile})
+	parsed, err := dnstt.ParseResolver("udp://" + resolver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := dnstt.NewClient(dnstt.ClientOptions{
+		Context: context.Background(), Logger: logger.NOP(), Dialer: udpDialer{},
+		Domain: "s.example.net", PubKey: hex.EncodeToString(noise.PubkeyFromPrivkey(privkey)), Resolver: parsed,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	conn, err := client.DialConn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	echoRound(t, conn)
+}

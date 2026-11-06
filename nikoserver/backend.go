@@ -104,7 +104,12 @@ func RunBackend(ctx context.Context, c *BackendConfig, log *Logger) error {
 			}
 			defer stop()
 		}
-		err = dnsttserver.RunWithStats(key, strings.TrimSuffix(c.Options.Zone, "."), conn, dialInner, auth, seal, stats)
+		// The zone and its spares (raycontrol dnszones-v1): one tunnel.
+		zones := []string{strings.TrimSuffix(c.Options.Zone, ".")}
+		for _, z := range c.Options.Zones {
+			zones = append(zones, strings.TrimSuffix(z, "."))
+		}
+		err = dnsttserver.RunZones(key, zones, conn, dialInner, auth, seal, stats)
 		if ctx.Err() != nil {
 			return nil
 		}

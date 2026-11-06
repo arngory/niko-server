@@ -480,6 +480,22 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*
 // copies it from the query).
 const optDO = 0x8000
 
+// zoneOf is the zone of domains a query's name is in, the longest one; the
+// first (the main zone) when none is: responseFor answers that NXDOMAIN.
+func zoneOf(query *dns.Message, domains []dns.Name) dns.Name {
+	best := domains[0]
+	if len(domains) == 1 || len(query.Question) != 1 {
+		return best
+	}
+	found := false
+	for _, d := range domains {
+		if _, ok := query.Question[0].Name.TrimSuffix(d); ok && (!found || len(d) > len(best)) {
+			best, found = d, true
+		}
+	}
+	return best
+}
+
 // carriesData reports whether a NOERROR response may carry downstream data:
 // an answer to one TXT question (neko: other types get NODATA).
 func carriesData(resp *dns.Message) bool {
@@ -677,7 +693,7 @@ func sessionMTU(mtu int, sizes *clientSizes, addr net.Addr) int {
 // the incoming DNS queries, and puts them on ttConn's incoming queue. Whenever
 // a query calls for a response, constructs a partial response and passes it to
 // sendLoop over ch.
-func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, auth *Auth, seal *Seal, sizes *clientSizes, sessions *sessionTable) error {
+func recvLoop(domains []dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, auth *Auth, seal *Seal, sizes *clientSizes, sessions *sessionTable) error {
 	// (neko) One buffer, not 4 KiB on the heap per query: the parsed
 	// message copies what it keeps.
 	buf := make([]byte, 4096)
@@ -695,7 +711,7 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 		}
 		sessions.stats.Queries.Add(1)
 
-		resp, payload, sealed, key, device := responseFor(&query, domain, auth, seal)
+		resp, payload, sealed, key, device := responseFor(&query, zoneOf(&query, domains), auth, seal)
 		size := requesterSize(&query)
 		// Extract the ClientID from the payload.
 		var clientID turbotunnel.ClientID
@@ -1059,14 +1075,28 @@ func RunWith(privkey []byte, domain string, dnsConn net.PacketConn, upstream Dia
 // RunWithStats is RunWith counting into stats (neko): the backend's stats
 // socket reads them.
 func RunWithStats(privkey []byte, domain string, dnsConn net.PacketConn, upstream Dialer, auth *Auth, seal *Seal, stats *Stats) error {
-	name, err := dns.ParseName(domain)
-	if err != nil {
-		return fmt.Errorf("invalid domain %+q: %v", domain, err)
-	}
-	return run(privkey, name, upstream, dnsConn, auth, seal, stats)
+	return RunZones(privkey, []string{domain}, dnsConn, upstream, auth, seal, stats)
 }
 
-func run(privkey []byte, domain dns.Name, upstream Dialer, dnsConn net.PacketConn, auth *Auth, seal *Seal, stats *Stats) error {
+// RunZones is RunWithStats for several zones (neko, raycontrol
+// docs/spec/dnszones-v1.md): the first and its spares, one tunnel; a query
+// is the tunnel's in any of them.
+func RunZones(privkey []byte, zones []string, dnsConn net.PacketConn, upstream Dialer, auth *Auth, seal *Seal, stats *Stats) error {
+	if len(zones) == 0 {
+		return errors.New("no zone")
+	}
+	names := make([]dns.Name, len(zones))
+	for i, z := range zones {
+		name, err := dns.ParseName(z)
+		if err != nil {
+			return fmt.Errorf("invalid domain %+q: %v", z, err)
+		}
+		names[i] = name
+	}
+	return run(privkey, names, upstream, dnsConn, auth, seal, stats)
+}
+
+func run(privkey []byte, domains []dns.Name, upstream Dialer, dnsConn net.PacketConn, auth *Auth, seal *Seal, stats *Stats) error {
 	defer dnsConn.Close()
 
 	log.Printf("pubkey %x", noise.PubkeyFromPrivkey(privkey))
@@ -1133,7 +1163,7 @@ func run(privkey []byte, domain dns.Name, upstream Dialer, dnsConn net.PacketCon
 
 	go func() {
 		defer done()
-		err := recvLoop(domain, dnsConn, ttConn, ch, auth, seal, sizes, sessions)
+		err := recvLoop(domains, dnsConn, ttConn, ch, auth, seal, sizes, sessions)
 		close(ch)
 		if err != nil {
 			log.Printf("recvLoop: %v", err)
