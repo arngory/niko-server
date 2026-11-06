@@ -62,6 +62,14 @@ type DNSZone struct {
 	// the front pads the TXT data of its probe answers as they are padded,
 	// to a multiple of 64 within what the requester can carry.
 	SealPad bool `json:"seal_pad,omitempty"`
+	// Tag (v0.13.0): "slipstream" — the front checks the device's
+	// dnsauth-v2 tag at the start of a query's data (raycontrol
+	// slipstream-v1 §2) with the keys of AuthKeysFile (as dnstt's:
+	// "<device id> <key hex>", reread when it changes) and gives the
+	// backend only IN TXT queries that carry one, rebuilt; others get
+	// NOERROR without records.
+	Tag          string `json:"tag,omitempty"`
+	AuthKeysFile string `json:"auth_keys_file,omitempty"`
 }
 
 type FrontDNS struct {
@@ -413,6 +421,14 @@ func (c *FrontConfig) validate() []ConfigError {
 		}
 		if len(z.NS) > 8 {
 			e.add(path+".ns", "at most 8 names")
+		}
+		switch {
+		case z.Tag != "" && z.Tag != "slipstream":
+			e.add(path+".tag", "%q: only slipstream", z.Tag)
+		case z.Tag != "" && z.AuthKeysFile == "":
+			e.add(path+".auth_keys_file", "a tagged zone needs the devices' keys")
+		case z.Tag == "" && z.AuthKeysFile != "":
+			e.add(path+".auth_keys_file", "only with tag")
 		}
 		// One tunnel's zones answer alike (dnszones-v1): a spare zone
 		// without the main one's padding would answer probes unpadded

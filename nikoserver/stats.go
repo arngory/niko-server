@@ -103,7 +103,7 @@ type dnsFrontStats struct {
 	// and only read after.
 	queries map[string]*atomic.Uint64
 
-	malformed, refused, apex, probes, probesOverRate, forwarded, backendAway, answers, unmatched, truncated, dropped atomic.Uint64
+	malformed, refused, apex, probes, probesOverRate, forwarded, backendAway, answers, unmatched, truncated, dropped, untagged atomic.Uint64
 }
 
 func newDNSFrontStats(zones []string) *dnsFrontStats {
@@ -132,6 +132,7 @@ type DNSFrontSnapshot struct {
 	Unmatched      uint64            `json:"unmatched"`        // the backends' answers no query waited for: dropped
 	Truncated      uint64            `json:"truncated"`        // answers over the requester's size: sent with TC, no records (in answers)
 	Dropped        uint64            `json:"dropped"`          // the backends' messages not sent on: unreadable, no question to truncate to, a failed write
+	Untagged       uint64            `json:"untagged"`         // queries of a tagged zone (slipstream) without a device's tag: NOERROR, the backend sees none (v0.13.0)
 }
 
 func (s *dnsFrontStats) snapshot() DNSFrontSnapshot {
@@ -140,7 +141,7 @@ func (s *dnsFrontStats) snapshot() DNSFrontSnapshot {
 		Malformed: s.malformed.Load(), Refused: s.refused.Load(), Apex: s.apex.Load(),
 		Probes: s.probes.Load(), ProbesOverRate: s.probesOverRate.Load(),
 		Forwarded: s.forwarded.Load(), BackendAway: s.backendAway.Load(),
-		Answers: s.answers.Load(), Unmatched: s.unmatched.Load(), Truncated: s.truncated.Load(), Dropped: s.dropped.Load(),
+		Answers: s.answers.Load(), Unmatched: s.unmatched.Load(), Truncated: s.truncated.Load(), Dropped: s.dropped.Load(), Untagged: s.untagged.Load(),
 	}
 	for z, n := range s.queries {
 		out.Queries[z] = n.Load()
