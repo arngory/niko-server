@@ -187,6 +187,9 @@ type BackendConfig struct {
 	StatsSocket string `json:"stats_socket,omitempty"`
 }
 
+// maxSpareZones bounds the spare zones of a dnstt tunnel.
+const maxSpareZones = 4
+
 var dnsName = regexp.MustCompile(`^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
 
 // header reads schema and role first, so an unknown schema gives one clear error.
@@ -337,6 +340,21 @@ func (c *BackendConfig) validate() []ConfigError {
 	case "dnstt":
 		if !dnsName.MatchString(strings.TrimSuffix(c.Options.Zone, ".")) {
 			e.add("options.zone", "not a DNS name: %q", c.Options.Zone)
+		}
+		// Spare zones of the same tunnel (raycontrol dnszones-v1).
+		if len(c.Options.Zones) > maxSpareZones {
+			e.add("options.zones", "%d spare zones, %d at most", len(c.Options.Zones), maxSpareZones)
+		}
+		seen := map[string]bool{strings.ToLower(strings.TrimSuffix(c.Options.Zone, ".")): true}
+		for i, zone := range c.Options.Zones {
+			z := strings.ToLower(strings.TrimSuffix(zone, "."))
+			switch {
+			case !dnsName.MatchString(z):
+				e.add(fmt.Sprintf("options.zones[%d]", i), "not a DNS name: %q", zone)
+			case seen[z]:
+				e.add(fmt.Sprintf("options.zones[%d]", i), "%q twice", zone)
+			}
+			seen[z] = true
 		}
 		checkSocket(&e, "options.private_key_file", c.Options.PrivateKeyFile)
 		if mode, err := dnsttserver.ParseAuthMode(c.Options.Auth); err != nil {

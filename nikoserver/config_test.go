@@ -81,6 +81,10 @@ func TestNekoServerConfigCheck(t *testing.T) {
 	if errs := checkConfig(t, hy2); len(errs) > 0 {
 		t.Fatal(errs)
 	}
+	// dnstt with spare zones (v0.11.0, raycontrol dnszones-v1).
+	if errs := checkConfig(t, strings.Replace(dnstt, `"zone":"t.example.com"`, `"zone":"t.example.com","zones":["s.example.net","u.example.org."]`, 1)); len(errs) > 0 {
+		t.Fatalf("dnstt with spare zones: %v", errs)
+	}
 	// dnstt has its counters on a stats socket (v0.11.0).
 	if errs := checkConfig(t, strings.Replace(dnstt, `"inner":`, `"stats_socket":"/run/niko/dns/stats.sock","inner":`, 1)); len(errs) > 0 {
 		t.Fatalf("dnstt with a stats socket: %v", errs)
@@ -113,6 +117,9 @@ func TestNekoServerConfigCheck(t *testing.T) {
 		"kind":                      strings.Replace(dnstt, `"kind":"dnstt"`, `"kind":"naive"`, 1),
 		"options.auth":              strings.Replace(dnstt, `"zone":"t.example.com"`, `"zone":"t.example.com","auth":"strict"`, 1),
 		"options.auth_keys_file":    strings.Replace(dnstt, `"zone":"t.example.com"`, `"zone":"t.example.com","auth":"required"`, 1),
+		"options.zones[0]":          strings.Replace(dnstt, `"zone":"t.example.com"`, `"zone":"t.example.com","zones":["T.example.com."]`, 1),
+		"options.zones[1]":          strings.Replace(dnstt, `"zone":"t.example.com"`, `"zone":"t.example.com","zones":["s.example.net","bad name"]`, 1),
+		"options.zones":             strings.Replace(dnstt, `"zone":"t.example.com"`, `"zone":"t.example.com","zones":["a.ex.com","b.ex.com","c.ex.com","d.ex.com","e.ex.com"]`, 1),
 	} {
 		errs := checkConfig(t, content)
 		found := false

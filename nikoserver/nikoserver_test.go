@@ -111,6 +111,18 @@ func startNodeWith(t *testing.T, kind, zone string, options map[string]any, prob
 	return startNodeFull(t, kind, zone, options, probeKeyFile, "")
 }
 
+// frontZones are the front's zones of a node's backend: its zone, and the
+// spare zones of a dnstt backend (options "zones"), all to the same backend.
+func frontZones(zone string, options map[string]any, probeKeyFile string) []map[string]any {
+	zones := []map[string]any{{"zone": zone, "backend": "dns", "probe": probeKeyFile != "", "ns": nsFor(probeKeyFile)}}
+	if spare, ok := options["zones"].([]string); ok && options["zone"] != nil {
+		for _, z := range spare {
+			zones = append(zones, map[string]any{"zone": z, "backend": "dns", "probe": probeKeyFile != "", "ns": nsFor(probeKeyFile)})
+		}
+	}
+	return zones
+}
+
 // startNodeFull is startNodeWith with the backend's stats socket.
 func startNodeFull(t *testing.T, kind, zone string, options map[string]any, probeKeyFile, statsSocket string) (resolver string) {
 	dir := t.TempDir()
@@ -133,7 +145,7 @@ func startNodeFull(t *testing.T, kind, zone string, options map[string]any, prob
 	writeJSON(t, frontPath, map[string]any{
 		"schema": 1, "role": "front", "log": map[string]string{"level": "warn"},
 		"backends": map[string]any{"dns": map[string]any{"socket": socket, "mode": "packet", "uid": uid}},
-		"dns": map[string]any{"listen": []string{resolver}, "zones": []map[string]any{{"zone": zone, "backend": "dns", "probe": probeKeyFile != "", "ns": nsFor(probeKeyFile)}},
+		"dns": map[string]any{"listen": []string{resolver}, "zones": frontZones(zone, options, probeKeyFile),
 			"probe_key_file": probeKeyFile},
 	})
 	ctx, cancel := context.WithCancel(context.Background())
