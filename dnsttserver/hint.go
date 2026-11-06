@@ -94,14 +94,34 @@ func (x *hintIndex) epoch(slot int) uint32 { return x.middle + uint32(slot) - 1 
 
 func hintValue(h [HintLen]byte) uint16 { return binary.BigEndian.Uint16(h[:]) }
 
-func buildHintIndex(k *authKeys, middle uint32) *hintIndex {
+// buildHintIndex builds the index of keys k around the epoch middle. From
+// the index of the same keys one epoch before, it only computes the new
+// epoch's hints (n HMACs every 10 minutes, raycontrol dnsauth-v2.md §3);
+// otherwise all three.
+func buildHintIndex(k *authKeys, middle uint32, prev *hintIndex) *hintIndex {
 	x := &hintIndex{keys: k, middle: middle, hints: make([][3]uint16, len(k.keys))}
-	for s := range x.byHint {
+	from := 0
+	if prev != nil && prev.keys == k && middle == prev.middle+1 {
+		// The maps are never written once built: shared with prev.
+		x.byHint[0], x.byHint[1] = prev.byHint[1], prev.byHint[2]
+		for i := range x.hints {
+			x.hints[i][0], x.hints[i][1] = prev.hints[i][1], prev.hints[i][2]
+		}
+		from = 2
+	}
+	for s := from; s < 3; s++ {
 		x.byHint[s] = make(map[uint16][]int32, len(k.keys))
 	}
+	var head [len(hintLabel) + 4]byte
+	copy(head[:], hintLabel)
+	var sum [sha256.Size]byte
 	for i := range k.keys {
-		for s := range 3 {
-			h := hintValue(Hint(&k.keys[i].key, x.epoch(s)))
+		m := hmac.New(sha256.New, k.keys[i].key[:])
+		for s := from; s < 3; s++ {
+			m.Reset()
+			binary.BigEndian.PutUint32(head[len(hintLabel):], x.epoch(s))
+			m.Write(head[:])
+			h := binary.BigEndian.Uint16(m.Sum(sum[:0]))
 			x.hints[i][s] = h
 			x.byHint[s][h] = append(x.byHint[s][h], int32(i))
 		}
@@ -117,18 +137,23 @@ type hintIndexes struct {
 	cur atomic.Pointer[hintIndex]
 }
 
-// get is the index of the keys k for the epoch now.
+// get is the index of the keys k for the epoch now. A caller with keys
+// older than those in force, or a clock behind the index's, gets its own
+// index without replacing that one: the next caller would build it again.
 func (h *hintIndexes) get(k *authKeys, now uint32) *hintIndex {
 	if x := h.cur.Load(); x != nil && x.keys == k && x.middle == now {
 		return x
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if x := h.cur.Load(); x != nil && x.keys == k && x.middle == now {
-		return x
+	cur := h.cur.Load()
+	if cur != nil && cur.keys == k && cur.middle == now {
+		return cur
 	}
-	x := buildHintIndex(k, now)
-	h.cur.Store(x)
+	x := buildHintIndex(k, now, cur)
+	if cur == nil || k.gen > cur.keys.gen || (k.gen == cur.keys.gen && now > cur.middle) {
+		h.cur.Store(x)
+	}
 	return x
 }
 

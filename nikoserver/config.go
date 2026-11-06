@@ -229,8 +229,14 @@ func checkAuthHint(e *configErrors, o BackendOptions) {
 		e.add("options.auth_hint", "%v", err)
 		return
 	}
-	if mode, _ := dnsttserver.ParseAuthMode(o.Auth); hint != dnsttserver.HintOff && mode == dnsttserver.AuthOff {
+	mode, _ := dnsttserver.ParseAuthMode(o.Auth)
+	switch {
+	case hint != dnsttserver.HintOff && mode == dnsttserver.AuthOff:
 		e.add("options.auth_hint", "needs auth: the hint is a tag's")
+	case hint == dnsttserver.HintRequired && mode != dnsttserver.AuthRequired:
+		// optional would pass a v1 tag on as untagged: the tag read as
+		// the ClientID, a new session for every query.
+		e.add("options.auth_hint", "required needs auth required: with auth optional a dnsauth-v1 tag would pass as an untagged query")
 	}
 }
 

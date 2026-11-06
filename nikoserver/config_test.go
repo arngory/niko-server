@@ -327,6 +327,8 @@ func TestNekoServerConfigAuthHint(t *testing.T) {
 		{with(dnstt, auth+`,"auth_hint":"strict"`), "options.auth_hint"},
 		{with(dnstt, `,"auth_hint":"optional"`), "options.auth_hint"},
 		{with(masterdns, `,"auth":"off","auth_hint":"required"`), "options.auth_hint"},
+		// optional auth would pass a v1 tag on as untagged
+		{with(dnstt, `,"auth":"optional","auth_keys_file":"/run/niko/dns-in/auth.keys","auth_hint":"required"`), "options.auth_hint"},
 		{hy2, "options"},
 	} {
 		errs := checkConfig(t, c.content)

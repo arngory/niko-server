@@ -2,6 +2,7 @@ package dnsttserver
 
 import (
 	"bytes"
+	"slices"
 	"testing"
 	"time"
 
@@ -147,5 +148,72 @@ func TestDeviceAuthHint(t *testing.T) {
 	}
 	if id, ok := r.Scan(ScanProbe, v2(6, now), msg); !ok || id != "d6" {
 		t.Fatalf("another device: %q %v", id, ok)
+	}
+}
+
+// The index one epoch on is the previous one shifted with the new epoch's
+// hints: the same as one built from scratch. A caller with older keys or a
+// clock behind does not replace the index in force (review of a4e5342).
+func TestHintIndexShiftAndStale(t *testing.T) {
+	_, text := devKeys(t, 50)
+	k, err := parseAuthKeys(text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := EpochOf(time.Unix(1767268800, 0))
+	var h hintIndexes
+	x0 := h.get(k, e)
+	x1 := h.get(k, e+1)
+	full := buildHintIndex(k, e+1, nil)
+	for i := range k.keys {
+		if x1.hints[i] != full.hints[i] {
+			t.Fatalf("key %d: shifted %v, built %v", i, x1.hints[i], full.hints[i])
+		}
+	}
+	for s := range 3 {
+		if len(x1.byHint[s]) != len(full.byHint[s]) {
+			t.Fatalf("slot %d: %d hints shifted, %d built", s, len(x1.byHint[s]), len(full.byHint[s]))
+		}
+		for hint, ids := range full.byHint[s] {
+			if !slices.Equal(x1.byHint[s][hint], ids) {
+				t.Fatalf("slot %d hint %04x: %v, want %v", s, hint, x1.byHint[s][hint], ids)
+			}
+		}
+	}
+	if x0.byHint[2][x0.hints[0][2]] == nil || x1.byHint[1][x0.hints[0][2]] == nil {
+		t.Fatal("the shifted slot lost its keys")
+	}
+	// A clock behind: its own index, the one in force stays.
+	if back := h.get(k, e); back.middle != e || h.cur.Load() != x1 {
+		t.Fatal("a caller one epoch behind replaced the index")
+	}
+	// Keys read later win; a caller still holding the old ones does not
+	// put them back.
+	k2, _ := parseAuthKeys(text)
+	x2 := h.get(k2, e+1)
+	if h.cur.Load() != x2 {
+		t.Fatal("newer keys not in force")
+	}
+	if h.get(k, e+1); h.cur.Load() != x2 {
+		t.Fatal("a caller with older keys replaced the index of newer ones")
+	}
+}
+
+// A v2 device found by its hint does not take a place among the recent
+// ones: they are for the v1 pass.
+func TestDeviceAuthHintNotRecent(t *testing.T) {
+	now := time.Unix(1767268800, 0)
+	keys, text := devKeys(t, 10)
+	a := &DeviceAuth{Now: func() time.Time { return now }, Hint: HintOptional}
+	a.SetKeys(text)
+	msg := []byte("nonce-12byteframe")
+	if id, ok := a.Scan(ScanInit, Tag2(&keys[3], EpochOf(now), msg), msg); !ok || id != "d3" {
+		t.Fatalf("v2 scan: %q %v", id, ok)
+	}
+	a.recentMu.Lock()
+	n := len(a.recent)
+	a.recentMu.Unlock()
+	if n != 0 || a.Valid.Load() != 1 {
+		t.Fatalf("recent %d, valid %d after a v2 scan", n, a.Valid.Load())
 	}
 }

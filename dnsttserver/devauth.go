@@ -252,9 +252,10 @@ func (a *DeviceAuth) Scan(kind ScanKind, tag [AuthTagLen]byte, msg []byte) (stri
 	if a.Hint != HintOff {
 		x := a.hints.get(k.authKeys, EpochOf(a.clock()))
 		if i := x.find(&tag, func(i int, epoch uint32) bool { return k.match2(i, epoch, &tag, msg) }); i >= 0 {
-			id := k.keys[i].id
-			a.found(id)
-			return id, true
+			// Not among the recent ones: those are for the v1 pass, and
+			// v2 devices would push v1 ones out of it.
+			a.Valid.Add(1)
+			return k.keys[i].id, true
 		}
 		if a.Hint == HintRequired {
 			a.Refused.Add(1) // no dnsauth-v1 tag is taken: nothing to scan
