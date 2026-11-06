@@ -216,6 +216,10 @@ func TestNekoServerDNSTTStats(t *testing.T) {
 	if st.Queries == 0 || st.SessionsAdmitted < 1 || st.Sessions < 1 || st.RefusedFull != 0 || st.AuthValid != 0 {
 		t.Fatalf("stats %+v", st)
 	}
+	// The backend's start, by which a reader tells a restart.
+	if d := time.Since(time.Unix(st.Started, 0)); st.Started == 0 || d < 0 || d > time.Minute {
+		t.Fatalf("started %d (%v ago)", st.Started, d)
+	}
 }
 
 // A spare zone is the same tunnel (raycontrol dnszones-v1): the stock

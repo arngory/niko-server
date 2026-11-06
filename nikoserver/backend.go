@@ -96,7 +96,7 @@ func RunBackend(ctx context.Context, c *BackendConfig, log *Logger) error {
 			log.Infof("dnstt: sealed framing (dnsseal-v1, %s, %d keys)", c.Options.Seal, seal.Keys())
 		}
 		// The counters on the stats socket, for the node's metrics.
-		stats := &dnsttserver.Stats{}
+		stats := &dnsttserver.Stats{Started: time.Now()}
 		if c.StatsSocket != "" {
 			stop, err := serveDNSTTStats(c.StatsSocket, stats, auth, seal, log)
 			if err != nil {
