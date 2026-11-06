@@ -97,7 +97,7 @@ func FuzzResponseFor(f *testing.F) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		resp, payload, sealed, key := responseFor(&query, domain, fuzzAuth(authMode), seal)
+		resp, payload, sealed, key, _ := responseFor(&query, domain, fuzzAuth(authMode), seal)
 		if resp == nil {
 			if query.Flags&0x8000 == 0 {
 				t.Fatal("no answer to a query")

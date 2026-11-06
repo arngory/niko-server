@@ -213,7 +213,7 @@ func TestNoDataForOtherTypes(t *testing.T) {
 		for _, qtype := range []uint16{1 /* A */, 2 /* NS */, 28 /* AAAA */} {
 			q := &dns.Message{ID: 1, Flags: 0x0100, Question: []dns.Question{{Name: n, Type: qtype, Class: dns.ClassIN}},
 				Additional: []dns.RR{{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 1232}}}
-			resp, payload, _, _ := responseFor(q, zone, nil, nil)
+			resp, payload, _, _, _ := responseFor(q, zone, nil, nil)
 			if resp == nil || resp.Rcode() != dns.RcodeNoError || resp.Flags&0x0400 == 0 || payload != nil || carriesData(resp) {
 				t.Errorf("%s type %d: %+v", name, qtype, resp)
 			}
@@ -223,7 +223,7 @@ func TestNoDataForOtherTypes(t *testing.T) {
 	n, _ := dns.ParseName("aaaaaaaaaaaaaaaa.t.example.com")
 	q := &dns.Message{ID: 1, Flags: 0x0100, Question: []dns.Question{{Name: n, Type: dns.RRTypeTXT, Class: dns.ClassIN}},
 		Additional: []dns.RR{{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 1232}}}
-	if resp, _, _, _ := responseFor(q, zone, nil, nil); resp == nil || !carriesData(resp) {
+	if resp, _, _, _, _ := responseFor(q, zone, nil, nil); resp == nil || !carriesData(resp) {
 		t.Errorf("TXT: %+v", resp)
 	}
 }
@@ -737,5 +737,31 @@ func TestAuthWatchKeysContent(t *testing.T) {
 	}
 	if a.Devices() != 0 {
 		t.Fatalf("an emptied file kept %d devices", a.Devices())
+	}
+}
+
+// CheckDevice names the device of the query's own tag, never one the
+// ClientID had before: an untagged start that reuses a device's ClientID
+// is no session of that device (review 10: the bound and the eviction
+// went by the cached ClientID).
+func TestAuthCheckDevice(t *testing.T) {
+	var alice [32]byte
+	rand.Read(alice[:])
+	now := time.Unix(1_800_000_000, 0)
+	a := &Auth{Mode: AuthOptional, Now: func() time.Time { return now }}
+	if err := a.SetKeys([]byte("d-alice " + hex.EncodeToString(alice[:]) + "\n")); err != nil {
+		t.Fatal(err)
+	}
+	body := append([]byte("CLIENTID"), []byte("\xe0padding and packets")...)
+	tag := Tag(&alice, EpochOf(now), body)
+	if rest, dev, ok := a.CheckDevice(append(tag[:], body...)); !ok || dev != "d-alice" || !bytes.Equal(rest, body) {
+		t.Fatalf("tagged: %q %v", dev, ok)
+	}
+	// The same ClientID, untagged: taken in optional mode, no device's.
+	if rest, dev, ok := a.CheckDevice(body); !ok || dev != "" || !bytes.Equal(rest, body) {
+		t.Fatalf("untagged with alice's ClientID: %q %v", dev, ok)
+	}
+	if _, dev, ok := (*Auth)(nil).CheckDevice(body); !ok || dev != "" {
+		t.Fatal("no auth")
 	}
 }

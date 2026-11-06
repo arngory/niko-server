@@ -324,7 +324,7 @@ func nextPacket(r *bytes.Reader) ([]byte, error) {
 // the returned dns.Message is nil, it means that there should be no response to
 // this query. If the returned dns.Message has an Rcode() of dns.RcodeNoError,
 // the message is a candidate for for carrying downstream data in a TXT record.
-func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*dns.Message, []byte, *sealKey, string) {
+func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*dns.Message, []byte, *sealKey, string, string) {
 	resp := &dns.Message{
 		ID:       query.ID,
 		Flags:    0x8000, // QR = 1, RCODE = no error
@@ -333,7 +333,7 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*
 
 	if query.Flags&0x8000 != 0 {
 		// QR != 0, this is not a query. Don't even send a response.
-		return nil, nil, nil, ""
+		return nil, nil, nil, "", ""
 	}
 
 	// Check for EDNS(0) support. Include our own OPT RR only if we receive
@@ -354,7 +354,7 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*
 			// received, a FORMERR (RCODE=1) MUST be returned."
 			resp.Flags |= dns.RcodeFormatError
 			queryLog.Printf("FORMERR: more than one OPT RR")
-			return resp, nil, nil, ""
+			return resp, nil, nil, "", ""
 		}
 		resp.Additional = append(resp.Additional, dns.RR{
 			Name:  dns.Name{},
@@ -374,7 +374,7 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*
 			resp.Flags |= dns.ExtendedRcodeBadVers & 0xf
 			additional.TTL = (dns.ExtendedRcodeBadVers >> 4) << 24
 			queryLog.Printf("BADVERS: EDNS version %d != 0", version)
-			return resp, nil, nil, ""
+			return resp, nil, nil, "", ""
 		}
 
 		payloadSize = int(rr.Class)
@@ -391,7 +391,7 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*
 	if len(query.Question) != 1 {
 		resp.Flags |= dns.RcodeFormatError
 		queryLog.Printf("FORMERR: too few or too many questions (%d)", len(query.Question))
-		return resp, nil, nil, ""
+		return resp, nil, nil, "", ""
 	}
 	question := query.Question[0]
 	// Check the name to see if it ends in our chosen domain, and extract
@@ -403,7 +403,7 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*
 		// Not a name we are authoritative for.
 		resp.Flags |= dns.RcodeNameError
 		queryLog.Printf("NXDOMAIN: not authoritative for %s", question.Name)
-		return resp, nil, nil, ""
+		return resp, nil, nil, "", ""
 	}
 	resp.Flags |= 0x0400 // AA = 1
 
@@ -411,7 +411,7 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*
 		// We don't support OPCODE != QUERY.
 		resp.Flags |= dns.RcodeNotImplemented
 		queryLog.Printf("NOTIMPL: unrecognized OPCODE %d", query.Opcode())
-		return resp, nil, nil, ""
+		return resp, nil, nil, "", ""
 	}
 
 	if question.Type != dns.RRTypeTXT {
@@ -420,7 +420,7 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*
 		// QNAMEs (RFC 9156) asks for the names above the tunnel's with A
 		// or NS, and one that takes NXDOMAIN as "nothing below"
 		// (RFC 8020) then gave up on the whole query.
-		return resp, nil, nil, ""
+		return resp, nil, nil, "", ""
 	}
 
 	encoded := bytes.ToUpper(bytes.Join(prefix, nil))
@@ -429,7 +429,7 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*
 	if err != nil {
 		// Base32 error: (neko) no data at this name, as for any query
 		// the tunnel does not take (recvLoop).
-		return resp, nil, nil, ""
+		return resp, nil, nil, "", ""
 	}
 	payload = payload[:n]
 	// (neko) The memo's key (answerMemo): the payload as the query brought
@@ -445,15 +445,19 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*
 		if inner, key := seal.open(payload); key != nil {
 			payload, sealed = inner, key
 		} else if seal.Mode == SealRequired {
-			return resp, nil, nil, ""
+			return resp, nil, nil, "", ""
 		}
 	}
 
 	// dnsauth-v1 (neko): the tag before anything that is dnstt's own, so a
 	// query without a valid one learns nothing, not even the FORMERR below
 	// for a small payload size: the zone answers as an empty one.
-	if payload, ok = auth.Check(payload); !ok {
-		return resp, nil, nil, ""
+	// The device whose tag this query carries, "" untagged: the session's
+	// bound is that device's (review 10: by its ClientID from the cache, an
+	// untagged start that reused a device's ClientID was charged to it).
+	var device string
+	if payload, device, ok = auth.CheckDevice(payload); !ok {
+		return resp, nil, nil, "", ""
 	}
 
 	// (neko) A requester payload size under maxUDPPayload is no FORMERR
@@ -461,7 +465,7 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*
 	// session of such a client gets a smaller KCP MTU instead (sessionMTU),
 	// and its answers are sized for the requester (sendLoop): slower, not
 	// dead.
-	return resp, payload, sealed, key
+	return resp, payload, sealed, key, device
 }
 
 // carriesData reports whether a NOERROR response may carry downstream data:
@@ -678,7 +682,7 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 			continue
 		}
 
-		resp, payload, sealed, key := responseFor(&query, domain, auth, seal)
+		resp, payload, sealed, key, device := responseFor(&query, domain, auth, seal)
 		size := requesterSize(&query)
 		// Extract the ClientID from the payload.
 		var clientID turbotunnel.ClientID
@@ -698,7 +702,7 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 				}
 				// (neko) KCP sees a new ClientID's packets only once
 				// the session table admits it.
-				if first && !sessions.admit(clientID, p, func() string { return auth.DeviceOf(clientID) }) {
+				if first && !sessions.admit(clientID, p, func() string { return device }) {
 					break
 				}
 				// Feed the incoming packet to KCP.
@@ -960,7 +964,7 @@ func computeMaxEncodedPayload(limit int) int {
 			},
 		},
 	}
-	resp, _, _, _ := responseFor(query, dns.Name([][]byte{}), nil, nil)
+	resp, _, _, _, _ := responseFor(query, dns.Name([][]byte{}), nil, nil)
 	// As in sendLoop.
 	resp.Answer = []dns.RR{
 		{
