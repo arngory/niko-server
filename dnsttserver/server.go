@@ -52,6 +52,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -172,6 +173,7 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream Dialer, sessio
 	limit := time.AfterFunc(HandshakeTimeout, func() { conn.Close() })
 	rw, err := noise.NewServer(&handshakeReader{ReadWriteCloser: conn}, privkey)
 	if !limit.Stop() {
+		sessions.stats.HandshakeTimeouts.Add(1)
 		return errHandshakeTimeout // the session is closed
 	}
 	if err != nil {
@@ -211,6 +213,7 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream Dialer, sessio
 		select {
 		case open <- struct{}{}:
 		default:
+			sessions.stats.StreamsRefused.Add(1)
 			queryLog.Printf("stream %08x:%d refused: %d open", conn.GetConv(), stream.ID(), MaxStreams)
 			stream.Close()
 			continue
@@ -360,8 +363,10 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*
 			Name:  dns.Name{},
 			Type:  dns.RRTypeOPT,
 			Class: 4096, // responder's UDP payload size
-			TTL:   0,
-			Data:  []byte{},
+			// (neko) The query's DO bit, as RFC 3225 §3 asks and other
+			// servers answer: always 0 was a mark of the tunnel.
+			TTL:  rr.TTL & optDO,
+			Data: []byte{},
 		})
 		additional := &resp.Additional[0]
 
@@ -372,7 +377,7 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*
 			// of the request, then it MUST respond with
 			// RCODE=BADVERS."
 			resp.Flags |= dns.ExtendedRcodeBadVers & 0xf
-			additional.TTL = (dns.ExtendedRcodeBadVers >> 4) << 24
+			additional.TTL = (dns.ExtendedRcodeBadVers>>4)<<24 | rr.TTL&optDO
 			queryLog.Printf("BADVERS: EDNS version %d != 0", version)
 			return resp, nil, nil, "", ""
 		}
@@ -444,8 +449,12 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*
 	if seal != nil && seal.Mode != SealOff {
 		if inner, key := seal.open(payload); key != nil {
 			payload, sealed = inner, key
+			seal.Opened.Add(1)
 		} else if seal.Mode == SealRequired {
+			seal.Refused.Add(1)
 			return resp, nil, nil, "", ""
+		} else {
+			seal.Unsealed.Add(1)
 		}
 	}
 
@@ -466,6 +475,31 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*
 	// and its answers are sized for the requester (sendLoop): slower, not
 	// dead.
 	return resp, payload, sealed, key, device
+}
+
+// optDO is the DO bit in an OPT record's TTL (RFC 3225 §3: a responder
+// copies it from the query).
+const optDO = 0x8000
+
+// zoneOf is the zone of domains a query's name is in, the longest one; the
+// first (the main zone) when none is: responseFor answers that NXDOMAIN.
+func zoneOf(query *dns.Message, domains []dns.Name) dns.Name {
+	return domains[zoneIndex(query, domains)]
+}
+
+// zoneIndex is zoneOf's index in domains.
+func zoneIndex(query *dns.Message, domains []dns.Name) int {
+	best := 0
+	if len(domains) == 1 || len(query.Question) != 1 {
+		return best
+	}
+	found := false
+	for i, d := range domains {
+		if _, ok := query.Question[0].Name.TrimSuffix(d); ok && (!found || len(d) > len(domains[best])) {
+			best, found = i, true
+		}
+	}
+	return best
 }
 
 // carriesData reports whether a NOERROR response may carry downstream data:
@@ -665,7 +699,7 @@ func sessionMTU(mtu int, sizes *clientSizes, addr net.Addr) int {
 // the incoming DNS queries, and puts them on ttConn's incoming queue. Whenever
 // a query calls for a response, constructs a partial response and passes it to
 // sendLoop over ch.
-func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, auth *Auth, seal *Seal, sizes *clientSizes, sessions *sessionTable) error {
+func recvLoop(domains []dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, auth *Auth, seal *Seal, sizes *clientSizes, sessions *sessionTable) error {
 	// (neko) One buffer, not 4 KiB on the heap per query: the parsed
 	// message copies what it keeps.
 	buf := make([]byte, 4096)
@@ -681,8 +715,16 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 			queryLog.Printf("cannot parse DNS query: %v", err)
 			continue
 		}
+		sessions.stats.Queries.Add(1)
 
-		resp, payload, sealed, key, device := responseFor(&query, domain, auth, seal)
+		zone := zoneIndex(&query, domains)
+		resp, payload, sealed, key, device := responseFor(&query, domains[zone], auth, seal)
+		if device != "" {
+			// A device's valid tag in this zone: its clients reach it, or
+			// someone who saw one of its queries sends it here (the tag
+			// does not cover the zone).
+			sessions.stats.tagged(zone)
+		}
 		size := requesterSize(&query)
 		// Extract the ClientID from the payload.
 		var clientID turbotunnel.ClientID
@@ -744,6 +786,9 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 		}
 
 		if rec.Resp.Rcode() == dns.RcodeNoError && carriesData(rec.Resp) && !rec.NoData && memo.answer(rec) {
+			if sessions != nil {
+				sessions.stats.MemoHits.Add(1)
+			}
 			// (neko) A query asked before (a resolver's retry): the
 			// same data as the first answer, which the resolver may
 			// already have taken.
@@ -1037,14 +1082,34 @@ func RunAuth(privkey []byte, domain string, dnsConn net.PacketConn, upstream Dia
 // RunWith is RunAuth with dnsseal-v1 (neko): seal takes the seal off
 // queries and puts it on answers; nil is dnstt as it is.
 func RunWith(privkey []byte, domain string, dnsConn net.PacketConn, upstream Dialer, auth *Auth, seal *Seal) error {
-	name, err := dns.ParseName(domain)
-	if err != nil {
-		return fmt.Errorf("invalid domain %+q: %v", domain, err)
-	}
-	return run(privkey, name, upstream, dnsConn, auth, seal)
+	return RunWithStats(privkey, domain, dnsConn, upstream, auth, seal, &Stats{})
 }
 
-func run(privkey []byte, domain dns.Name, upstream Dialer, dnsConn net.PacketConn, auth *Auth, seal *Seal) error {
+// RunWithStats is RunWith counting into stats (neko): the backend's stats
+// socket reads them.
+func RunWithStats(privkey []byte, domain string, dnsConn net.PacketConn, upstream Dialer, auth *Auth, seal *Seal, stats *Stats) error {
+	return RunZones(privkey, []string{domain}, dnsConn, upstream, auth, seal, stats)
+}
+
+// RunZones is RunWithStats for several zones (neko, raycontrol
+// docs/spec/dnszones-v1.md): the first and its spares, one tunnel; a query
+// is the tunnel's in any of them.
+func RunZones(privkey []byte, zones []string, dnsConn net.PacketConn, upstream Dialer, auth *Auth, seal *Seal, stats *Stats) error {
+	if len(zones) == 0 {
+		return errors.New("no zone")
+	}
+	names := make([]dns.Name, len(zones))
+	for i, z := range zones {
+		name, err := dns.ParseName(z)
+		if err != nil {
+			return fmt.Errorf("invalid domain %+q: %v", z, err)
+		}
+		names[i] = name
+	}
+	return run(privkey, names, upstream, dnsConn, auth, seal, stats)
+}
+
+func run(privkey []byte, domains []dns.Name, upstream Dialer, dnsConn net.PacketConn, auth *Auth, seal *Seal, stats *Stats) error {
 	defer dnsConn.Close()
 
 	log.Printf("pubkey %x", noise.PubkeyFromPrivkey(privkey))
@@ -1069,7 +1134,15 @@ func run(privkey []byte, domain dns.Name, upstream Dialer, dnsConn net.PacketCon
 
 	// The smallest requester size of each client (neko).
 	sizes := &clientSizes{overhead: seal.overhead()}
-	sessions := newSessionTable()
+	if stats == nil {
+		stats = &Stats{} // counted for no one (review 11: RunZones took nil)
+	}
+	names := make([]string, len(domains))
+	for i, d := range domains {
+		names[i] = strings.TrimSuffix(d.String(), ".")
+	}
+	stats.setZones(names)
+	sessions := newSessionTableStats(stats)
 
 	// Start up the virtual PacketConn for turbotunnel. (neko) Queues
 	// outlive their ClientID's last activity by remoteTimeout.
@@ -1111,7 +1184,7 @@ func run(privkey []byte, domain dns.Name, upstream Dialer, dnsConn net.PacketCon
 
 	go func() {
 		defer done()
-		err := recvLoop(domain, dnsConn, ttConn, ch, auth, seal, sizes, sessions)
+		err := recvLoop(domains, dnsConn, ttConn, ch, auth, seal, sizes, sessions)
 		close(ch)
 		if err != nil {
 			log.Printf("recvLoop: %v", err)

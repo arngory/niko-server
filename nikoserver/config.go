@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 )
@@ -70,6 +71,9 @@ type FrontDNS struct {
 	// docs/spec/dnsprobe-v1.md), 32 bytes in hex. With it the front answers
 	// a client's check of a resolver itself, before the zone's backend.
 	ProbeKeyFile string `json:"probe_key_file,omitempty"`
+	// StatsSocket (v0.11.0): where the front gives its counters, one JSON
+	// line to each connection (DNSFrontSnapshot), for the node's metrics.
+	StatsSocket string `json:"stats_socket,omitempty"`
 }
 
 // TCPRoute sends TLS connections with one of these server names, or
@@ -132,7 +136,10 @@ type BackendOptions struct {
 	AuthScanHMACs int `json:"auth_scan_hmacs,omitempty"`
 	// dnstt: dnsseal-v1 (raycontrol docs/spec/dnsseal-v1.md): off,
 	// optional or required, and the zone's keys (64 hex digits a line, the
-	// current first).
+	// current first). masterdns (v0.11.0): mdseal-v1 (raycontrol
+	// docs/spec/mdseal-v1.md), sealed answers, with the service's key
+	// (encryption_key_file); auth and its keys as dnstt's, dnsauth for
+	// masterdns (docs/spec/dnsauth-masterdns.md).
 	Seal        string `json:"seal,omitempty"`
 	SealKeyFile string `json:"seal_key_file,omitempty"`
 	// masterdns
@@ -182,11 +189,56 @@ type BackendConfig struct {
 	Options   BackendOptions `json:"options"`
 	Inner     string         `json:"inner,omitempty"`
 	// StatsSocket (hy2-*): where the backend answers for the sessions of a
-	// client address (raycontrol's channel probes).
+	// client address (raycontrol's channel probes). dnstt: where it gives
+	// its counters (dnsttserver.StatsSnapshot, JSON) to whoever connects.
 	StatsSocket string `json:"stats_socket,omitempty"`
 }
 
+// maxSpareZones bounds the spare zones of a dnstt tunnel.
+const maxSpareZones = 4
+
 var dnsName = regexp.MustCompile(`^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
+
+// zoneName is a tunnel zone as written: a DNS name of 253 characters at
+// most, which is 255 octets on the wire (review 11: a longer one passed
+// check and stopped the backend at its start). ASCII only, checked before
+// any folding (review 12: a Kelvin sign folds to k).
+func zoneName(z string) bool { return len(z) <= 253 && dnsName.MatchString(z) }
+
+// canonicalName is a name as the front and dnstt compare it: no final dot,
+// lower case in ASCII only (RFC 4343).
+func canonicalName(name string) string {
+	b := []byte(strings.TrimSuffix(name, "."))
+	for i, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			b[i] = c + 'a' - 'A'
+		}
+	}
+	return string(b)
+}
+
+// sameName reports whether two names are one as the front and dnstt
+// compare them.
+func sameName(a, b string) bool { return canonicalName(a) == canonicalName(b) }
+
+// samePath reports whether two paths, both set, name one file as written:
+// "a//b" and "a/./b" are "a/b"; links are not followed (review 13).
+func samePath(a, b string) bool {
+	return a != "" && b != "" && filepath.Clean(a) == filepath.Clean(b)
+}
+
+// nestedIn is the zone of zones that z is nested in, or that is nested in
+// z, "" when none: a name under both is either's (review 11: the front
+// took the first listed, dnstt the longest, and a label of the outer
+// zone's data can spell the inner one).
+func nestedIn(z string, zones []string) string {
+	for _, other := range zones {
+		if other != z && (strings.HasSuffix(z, "."+other) || strings.HasSuffix(other, "."+z)) {
+			return other
+		}
+	}
+	return ""
+}
 
 // header reads schema and role first, so an unknown schema gives one clear error.
 type header struct {
@@ -290,17 +342,40 @@ func (c *FrontConfig) validate() []ConfigError {
 	if c.DNS.ProbeKeyFile != "" {
 		checkSocket(&e, "dns.probe_key_file", c.DNS.ProbeKeyFile)
 	}
-	seen := map[string]bool{}
+	if c.DNS.StatsSocket != "" {
+		checkSocket(&e, "dns.stats_socket", c.DNS.StatsSocket)
+		// The front removes what is at the path before it listens there.
+		for name, b := range c.Backends {
+			if samePath(b.Socket, c.DNS.StatsSocket) {
+				e.add("dns.stats_socket", "the socket of backend %q", name)
+			}
+		}
+		if samePath(c.DNS.StatsSocket, c.DNS.ProbeKeyFile) {
+			e.add("dns.stats_socket", "the probe key file")
+		}
+		if c.UDP != nil {
+			for i, r := range c.UDP.Routes {
+				if samePath(c.DNS.StatsSocket, r.SalamanderPasswordFile) {
+					e.add("dns.stats_socket", "the salamander password file of udp.routes[%d]", i)
+				}
+			}
+		}
+	}
+	var seen []string
 	for i, z := range c.DNS.Zones {
 		path := fmt.Sprintf("dns.zones[%d]", i)
-		zone := strings.ToLower(strings.TrimSuffix(z.Zone, "."))
-		if !dnsName.MatchString(zone) {
-			e.add(path+".zone", "not a DNS name: %q", z.Zone)
-		}
-		if seen[zone] {
+		zone := canonicalName(z.Zone)
+		switch {
+		case !zoneName(strings.TrimSuffix(z.Zone, ".")):
+			e.add(path+".zone", "not a DNS name of 253 characters at most: %q", z.Zone)
+		case slices.Contains(seen, zone):
 			e.add(path+".zone", "duplicate zone %q", z.Zone)
+		default:
+			if other := nestedIn(zone, seen); other != "" {
+				e.add(path+".zone", "%q and %q nest: a name under both is either's", z.Zone, other)
+			}
 		}
-		seen[zone] = true
+		seen = append(seen, zone)
 		b, ok := c.Backends[z.Backend]
 		if !ok {
 			e.add(path+".backend", "no backend %q in backends", z.Backend)
@@ -316,9 +391,33 @@ func (c *FrontConfig) validate() []ConfigError {
 		if len(z.NS) > 8 {
 			e.add(path+".ns", "at most 8 names")
 		}
+		// One tunnel's zones answer alike (dnszones-v1): a spare zone
+		// without the main one's padding would answer probes unpadded
+		// beside the tunnel's sealed answers, and an apex of its own
+		// names would set it apart.
+		for j := range i {
+			if o := c.DNS.Zones[j]; o.Backend == z.Backend && (o.Probe != z.Probe || o.SealPad != z.SealPad || !slices.EqualFunc(o.NS, z.NS, sameName)) {
+				e.add(path, "probe, seal_pad and ns differ from dns.zones[%d] of the same backend", j)
+				break
+			}
+		}
 		for j, ns := range z.NS {
-			if n := strings.ToLower(strings.TrimSuffix(ns, ".")); !dnsName.MatchString(n) || len(n) > 253 {
+			if n := strings.TrimSuffix(ns, "."); !dnsName.MatchString(n) || len(n) > 253 {
 				e.add(fmt.Sprintf("%s.ns[%d]", path, j), "not a DNS name: %q", ns)
+			}
+		}
+	}
+	// A name the zones are delegated to that is a zone or lies in one is
+	// the tunnel's: the front sends a resolver's query for its address to
+	// the backend, which has none (review 13).
+	for i, z := range c.DNS.Zones {
+		for j, ns := range z.NS {
+			n := canonicalName(ns)
+			for _, zone := range seen {
+				if n == zone || strings.HasSuffix(n, "."+zone) {
+					e.add(fmt.Sprintf("dns.zones[%d].ns[%d]", i, j), "%q is in zone %q: the front would send the queries for its address to the tunnel", ns, zone)
+					break
+				}
 			}
 		}
 	}
@@ -334,8 +433,28 @@ func (c *BackendConfig) validate() []ConfigError {
 	}
 	switch c.Kind {
 	case "dnstt":
-		if !dnsName.MatchString(strings.TrimSuffix(c.Options.Zone, ".")) {
-			e.add("options.zone", "not a DNS name: %q", c.Options.Zone)
+		main := canonicalName(c.Options.Zone)
+		if !zoneName(strings.TrimSuffix(c.Options.Zone, ".")) {
+			e.add("options.zone", "not a DNS name of 253 characters at most: %q", c.Options.Zone)
+		}
+		// Spare zones of the same tunnel (raycontrol dnszones-v1).
+		if len(c.Options.Zones) > maxSpareZones {
+			e.add("options.zones", "%d spare zones, %d at most", len(c.Options.Zones), maxSpareZones)
+		}
+		all := []string{main}
+		for i, zone := range c.Options.Zones {
+			z := canonicalName(zone)
+			switch {
+			case !zoneName(strings.TrimSuffix(zone, ".")):
+				e.add(fmt.Sprintf("options.zones[%d]", i), "not a DNS name of 253 characters at most: %q", zone)
+			case slices.Contains(all, z):
+				e.add(fmt.Sprintf("options.zones[%d]", i), "%q twice", zone)
+			default:
+				if other := nestedIn(z, all); other != "" {
+					e.add(fmt.Sprintf("options.zones[%d]", i), "%q and %q nest: a name under both is either's", zone, other)
+				}
+			}
+			all = append(all, z)
 		}
 		checkSocket(&e, "options.private_key_file", c.Options.PrivateKeyFile)
 		if mode, err := dnsttserver.ParseAuthMode(c.Options.Auth); err != nil {
@@ -352,16 +471,39 @@ func (c *BackendConfig) validate() []ConfigError {
 		if len(c.Options.Zones) == 0 {
 			e.add("options.zones", "no zones")
 		}
+		if len(c.Options.Zones) > 1+maxSpareZones {
+			e.add("options.zones", "%d zones, %d at most (the main one and %d spares)", len(c.Options.Zones), 1+maxSpareZones, maxSpareZones)
+		}
+		var all []string
 		for i, zone := range c.Options.Zones {
-			if !dnsName.MatchString(strings.TrimSuffix(zone, ".")) {
-				e.add(fmt.Sprintf("options.zones[%d]", i), "not a DNS name: %q", zone)
+			z := canonicalName(zone)
+			switch {
+			case !zoneName(strings.TrimSuffix(zone, ".")):
+				e.add(fmt.Sprintf("options.zones[%d]", i), "not a DNS name of 253 characters at most: %q", zone)
+			case slices.Contains(all, z):
+				e.add(fmt.Sprintf("options.zones[%d]", i), "%q twice", zone)
+			default:
+				if other := nestedIn(z, all); other != "" {
+					e.add(fmt.Sprintf("options.zones[%d]", i), "%q and %q nest: a name under both is either's", zone, other)
+				}
 			}
+			all = append(all, z)
 		}
 		// raycontrol decision R1-8: authenticated encryption only (3-5: AES-GCM)
 		if c.Options.EncryptionMethod == nil || *c.Options.EncryptionMethod < 3 || *c.Options.EncryptionMethod > 5 {
 			e.add("options.encryption_method", "must be 3, 4 or 5 (AES-GCM; 5 = AES-256-GCM)")
 		}
 		checkSocket(&e, "options.encryption_key_file", c.Options.EncryptionKeyFile)
+		// mdseal-v1 with the service's key; dnsauth with the devices' keys
+		// (methods 3-5, above).
+		if _, err := dnsttserver.ParseSealMode(c.Options.Seal); err != nil {
+			e.add("options.seal", "%v", err)
+		}
+		if mode, err := dnsttserver.ParseAuthMode(c.Options.Auth); err != nil {
+			e.add("options.auth", "%v", err)
+		} else if mode != dnsttserver.AuthOff {
+			checkSocket(&e, "options.auth_keys_file", c.Options.AuthKeysFile)
+		}
 	case "hy2-masq", "hy2-obfs":
 		checkSocket(&e, "users_file", c.UsersFile)
 		checkBackendTLS(&e, c.TLS, "a Hysteria2 backend needs its certificate")
@@ -410,10 +552,28 @@ func (c *BackendConfig) validate() []ConfigError {
 		e.add("kind", "kind %q is not served by this niko-server release (dnstt, masterdns, hy2-masq, hy2-obfs, yggdrasil)", c.Kind)
 	}
 	if c.StatsSocket != "" {
-		if c.Kind != "hy2-masq" && c.Kind != "hy2-obfs" {
-			e.add("stats_socket", "only the Hysteria2 backends have session stats")
+		if c.Kind != "hy2-masq" && c.Kind != "hy2-obfs" && c.Kind != "dnstt" {
+			e.add("stats_socket", "only the Hysteria2 and dnstt backends have stats")
 		} else {
 			checkSocket(&e, "stats_socket", c.StatsSocket)
+		}
+		// The backend removes what is at the path before it listens there:
+		// none of the files it reads (review 14: the Hysteria2 backends'
+		// TLS key went at their next start).
+		files := []struct{ path, what string }{
+			{c.Socket, "the backend's socket"}, {c.Inner, "the inner stage's socket"}, {c.UsersFile, "users_file"},
+			{c.Options.PrivateKeyFile, "options.private_key_file"}, {c.Options.AuthKeysFile, "options.auth_keys_file"},
+			{c.Options.SealKeyFile, "options.seal_key_file"}, {c.Options.EncryptionKeyFile, "options.encryption_key_file"},
+			{c.Options.ObfsPasswordFile, "options.obfs_password_file"},
+		}
+		if c.TLS != nil {
+			files = append(files, struct{ path, what string }{c.TLS.CertificateFile, "tls.certificate_file"},
+				struct{ path, what string }{c.TLS.KeyFile, "tls.key_file"})
+		}
+		for _, f := range files {
+			if samePath(c.StatsSocket, f.path) {
+				e.add("stats_socket", "the path of %s", f.what)
+			}
 		}
 	}
 	if c.Options.Probe != nil && c.Kind != "hy2-masq" && c.Kind != "hy2-obfs" {
@@ -425,11 +585,15 @@ func (c *BackendConfig) validate() []ConfigError {
 	if c.Options.AuthScanHMACs < 0 {
 		e.add("options.auth_scan_hmacs", "not below 0")
 	}
-	if c.Kind != "dnstt" && (c.Options.Auth != "" || c.Options.AuthKeysFile != "" || c.Options.AuthScanHMACs != 0) {
-		e.add("options", "auth, auth_keys_file and auth_scan_hmacs are dnstt options")
+	dns := c.Kind == "dnstt" || c.Kind == "masterdns"
+	if !dns && (c.Options.Auth != "" || c.Options.AuthKeysFile != "" || c.Options.AuthScanHMACs != 0) {
+		e.add("options", "auth, auth_keys_file and auth_scan_hmacs are options of the DNS tunnels")
 	}
-	if c.Kind != "dnstt" && (c.Options.Seal != "" || c.Options.SealKeyFile != "") {
-		e.add("options", "seal and seal_key_file are dnstt options")
+	if !dns && c.Options.Seal != "" {
+		e.add("options", "seal is an option of the DNS tunnels")
+	}
+	if c.Kind != "dnstt" && c.Options.SealKeyFile != "" {
+		e.add("options.seal_key_file", "dnstt's: masterdns seals with its encryption key")
 	}
 	if c.Kind == "dnstt" || c.Kind == "masterdns" || c.Kind == "yggdrasil" {
 		if c.Inner == "" {
@@ -455,15 +619,40 @@ func checkBackendTLS(e *configErrors, t *BackendTLS, missing string) {
 	}
 }
 
-// zoneOf returns the zone that name falls into (by labels), or "".
+// zoneOf returns the zone of zones (lower case) that name falls into, by
+// labels, or "". ASCII case only (RFC 4343) and no copies: the front asks
+// for every query.
 func zoneOf(name string, zones []string) string {
-	name = strings.ToLower(strings.TrimSuffix(name, "."))
+	name = strings.TrimSuffix(name, ".")
 	for _, zone := range zones {
-		if name == zone || strings.HasSuffix(name, "."+zone) {
+		switch {
+		case len(name) == len(zone) && equalFoldASCII(name, zone):
+			return zone
+		case len(name) > len(zone) && name[len(name)-len(zone)-1] == '.' && equalFoldASCII(name[len(name)-len(zone):], zone):
 			return zone
 		}
 	}
 	return ""
+}
+
+// equalFoldASCII reports whether a and b are equal ignoring ASCII case.
+func equalFoldASCII(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		x, y := a[i], b[i]
+		if 'A' <= x && x <= 'Z' {
+			x += 'a' - 'A'
+		}
+		if 'A' <= y && y <= 'Z' {
+			y += 'a' - 'A'
+		}
+		if x != y {
+			return false
+		}
+	}
+	return true
 }
 
 func (t *FrontTCP) validate(e *configErrors, backends map[string]BackendRef) {

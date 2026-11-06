@@ -33,7 +33,7 @@ type apexZone struct {
 func newApexZone(zone string, ns []string, serial uint32) *apexZone {
 	names := make([]string, len(ns))
 	for i, n := range ns {
-		names[i] = strings.ToLower(strings.TrimSuffix(n, "."))
+		names[i] = canonicalName(n)
 	}
 	soa := wireName(names[0])
 	soa = append(soa, wireName("hostmaster."+zone)...)
@@ -76,7 +76,8 @@ func (a *apexZone) answer(query []byte) (reply []byte, ok bool) {
 		if len(resp.Additional) != 0 || (rr.TTL>>16)&0xff != 0 {
 			return nil, false
 		}
-		resp.Additional = []dns.RR{{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 4096, TTL: 0, Data: []byte{}}}
+		// The query's DO bit, as dnstt's answers (RFC 3225 §3).
+		resp.Additional = []dns.RR{{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 4096, TTL: rr.TTL & optDO, Data: []byte{}}}
 		limit = max(limit, int(rr.Class))
 	}
 	name, question := q.Question[0].Name, q.Question[0]

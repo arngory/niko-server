@@ -112,6 +112,18 @@ type Auth struct {
 // and lines starting with # are skipped. Cached sessions stay: a session
 // whose device is gone no longer finds its key and is refused.
 func (a *Auth) SetKeys(text []byte) error {
+	k, err := parseAuthKeys(text)
+	if err != nil {
+		return err
+	}
+	a.keys.Store(k)
+	kept := bytes.Clone(text)
+	a.text.Store(&kept)
+	return nil
+}
+
+// parseAuthKeys reads a keys file's text (SetKeys).
+func parseAuthKeys(text []byte) (*authKeys, error) {
 	k := &authKeys{byID: map[string][]int{}}
 	sc := bufio.NewScanner(bytes.NewReader(text))
 	for line := 1; sc.Scan(); line++ {
@@ -120,11 +132,11 @@ func (a *Auth) SetKeys(text []byte) error {
 			continue
 		}
 		if len(f) != 2 {
-			return fmt.Errorf("auth keys line %d: want \"<device id> <key hex>\"", line)
+			return nil, fmt.Errorf("auth keys line %d: want \"<device id> <key hex>\"", line)
 		}
 		b, err := hex.DecodeString(f[1])
 		if err != nil || len(b) != 32 {
-			return fmt.Errorf("auth keys line %d: the key is not 32 bytes of hex", line)
+			return nil, fmt.Errorf("auth keys line %d: the key is not 32 bytes of hex", line)
 		}
 		ak := authKey{id: f[0]}
 		copy(ak.key[:], b)
@@ -133,12 +145,9 @@ func (a *Auth) SetKeys(text []byte) error {
 		k.macs = append(k.macs, hmac.New(sha256.New, ak.key[:]))
 	}
 	if err := sc.Err(); err != nil {
-		return err
+		return nil, err
 	}
-	a.keys.Store(k)
-	kept := bytes.Clone(text)
-	a.text.Store(&kept)
-	return nil
+	return k, nil
 }
 
 // Devices is the number of keys in force.
@@ -165,48 +174,58 @@ func (a *Auth) LoadKeys(file string) error {
 // the seal's watcher did before). A file that does not parse keeps the keys
 // in force. Every hour it logs the counters, when they moved.
 func (a *Auth) WatchKeys(file string, every time.Duration, stop <-chan struct{}, logf func(string, ...any)) {
+	var said [4]uint64
+	watchKeys(file, every, stop, logf, &a.text, a.SetKeys, a.Devices, func() {
+		now := [4]uint64{a.Valid.Load(), a.Untagged.Load(), a.Refused.Load(), a.Throttled.Load()}
+		if now != said {
+			said = now
+			logf("auth: %d valid, %d untagged, %d refused (%d over the scan budget) since the start", now[0], now[1], now[2], now[3])
+		}
+	})
+}
+
+// watchKeys is WatchKeys of Auth and DeviceAuth: the file read every period
+// until stop, taken by set when it differs from text (the keys in force)
+// and from the last one set refused; report runs every hour.
+func watchKeys(file string, every time.Duration, stop <-chan struct{}, logf func(string, ...any),
+	text *atomic.Pointer[[]byte], set func([]byte) error, devices func() int, report func()) {
 	var bad []byte
 	var readErr string // the last read error logged, once
 	t := time.NewTicker(every)
 	defer t.Stop()
-	report := time.Now().Add(time.Hour)
-	var said [4]uint64
+	next := time.Now().Add(time.Hour)
 	for {
 		select {
 		case <-stop:
 			return
 		case <-t.C:
 		}
-		if time.Now().After(report) {
-			report = time.Now().Add(time.Hour)
-			now := [4]uint64{a.Valid.Load(), a.Untagged.Load(), a.Refused.Load(), a.Throttled.Load()}
-			if now != said {
-				said = now
-				logf("auth: %d valid, %d untagged, %d refused (%d over the scan budget) since the start", now[0], now[1], now[2], now[3])
-			}
+		if time.Now().After(next) {
+			next = time.Now().Add(time.Hour)
+			report()
 		}
 		b, err := os.ReadFile(file) //nolint:gosec // G304: the configured file
 		if err != nil {
 			// Being replaced, or gone: the keys stay, said once.
 			if err.Error() != readErr {
 				readErr = err.Error()
-				logf("auth keys %s not read, the %d in force stay: %v", file, a.Devices(), err)
+				logf("auth keys %s not read, the %d in force stay: %v", file, devices(), err)
 			}
 			continue
 		}
 		readErr = ""
 		// bad != nil: an empty file is not the bad one (review 9: a file
 		// emptied of its last device was never taken).
-		if cur := a.text.Load(); (cur != nil && bytes.Equal(b, *cur)) || (bad != nil && bytes.Equal(b, bad)) {
+		if cur := text.Load(); (cur != nil && bytes.Equal(b, *cur)) || (bad != nil && bytes.Equal(b, bad)) {
 			continue
 		}
-		if err := a.SetKeys(b); err != nil {
+		if err := set(b); err != nil {
 			bad = b
 			logf("auth keys %s not reloaded: %v", file, err)
 			continue
 		}
 		bad = nil
-		logf("auth keys reloaded: %d devices", a.Devices())
+		logf("auth keys reloaded: %d devices", devices())
 	}
 }
 

@@ -160,8 +160,13 @@ func probePlain(key, b []byte, edns int, mixed bool, src netip.Addr, size int) [
 // false when it is no probe, which then goes to the backend; reply is nil
 // for a probe over the rate, which gets no answer at all.
 func (p *dnsProbe) answer(query []byte, name string, questionEnd int, zone string, src netip.Addr, pad bool) (reply []byte, probe bool) {
-	label, ok := strings.CutSuffix(name, "."+zone)
-	if !ok || len(label) != probeLabelLen || strings.Contains(label, ".") {
+	// name is under zone (zoneOf), both lower case: no copy for the label,
+	// since every query of a probe zone comes here first.
+	if len(name) != probeLabelLen+1+len(zone) || name[probeLabelLen] != '.' || name[probeLabelLen+1:] != zone {
+		return nil, false
+	}
+	label := name[:probeLabelLen]
+	if strings.Contains(label, ".") {
 		return nil, false
 	}
 	if binary.BigEndian.Uint16(query[questionEnd-4:questionEnd-2]) != 16 { // TXT
@@ -220,10 +225,10 @@ func probeSeal(p *dnsProbe, b, plain []byte, nonce [probeNonceLen]byte) []byte {
 // after the probe's data up to a multiple of 64, within what the requester
 // can carry, as the zone's answers are padded.
 func probeReply(p *dnsProbe, q dns.Message, b, rawLabel []byte, src netip.Addr, large bool, nonce [probeNonceLen]byte, pad bool) []byte {
-	edns, hasOPT := 0, false
+	edns, hasOPT, do := 0, false, uint32(0)
 	for _, rr := range q.Additional {
 		if rr.Type == dns.RRTypeOPT {
-			edns, hasOPT = int(rr.Class), true
+			edns, hasOPT, do = int(rr.Class), true, rr.TTL&optDO
 			break
 		}
 	}
@@ -243,7 +248,7 @@ func probeReply(p *dnsProbe, q dns.Message, b, rawLabel []byte, src netip.Addr, 
 			Answer: []dns.RR{{Name: q.Question[0].Name, Type: q.Question[0].Type, Class: q.Question[0].Class, TTL: probeTTL,
 				Data: dns.EncodeRDataTXT(data)}}}
 		if hasOPT {
-			resp.Additional = []dns.RR{{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: probeOPTSize, TTL: 0, Data: []byte{}}}
+			resp.Additional = []dns.RR{{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: probeOPTSize, TTL: do, Data: []byte{}}}
 		}
 		wire, err := resp.WireFormat()
 		if err != nil {
