@@ -71,13 +71,21 @@ type authKeys struct {
 	keys []authKey
 	macs []hash.Hash
 	byID map[string][]int
+	gen  uint64 // later keys have a larger one (hintIndexes.get)
 }
+
+// keysGen numbers the generations of keys as they are read.
+var keysGen atomic.Uint64
 
 // Auth checks the tags of queries against the keys of the devices allowed
 // on the service. Safe for concurrent use (the checks take turns); the keys
 // can be replaced while it runs.
 type Auth struct {
 	Mode AuthMode
+	// Hint takes dnsauth-v2 tags, whose hint names the key: looked up, not
+	// scanned, and outside the scan budget (raycontrol dnsauth-v2.md);
+	// HintRequired takes no dnsauth-v1 tag and scans nothing.
+	Hint HintMode
 	Now  func() time.Time // time.Now when nil
 	// ScanHMACs bounds the HMACs a second spent on full scans of the keys
 	// (a query no cached session explains; up to 3 per device each), so
@@ -86,8 +94,9 @@ type Auth struct {
 	// a second if the devices are more than that allows.
 	ScanHMACs float64
 
-	keys atomic.Pointer[authKeys]
-	text atomic.Pointer[[]byte] // the keys file's text in force (WatchKeys)
+	keys  atomic.Pointer[authKeys]
+	text  atomic.Pointer[[]byte] // the keys file's text in force (WatchKeys)
+	hints hintIndexes            // dnsauth-v2's, for the keys in force
 
 	mu sync.Mutex // the macs, the caches and the scan budget
 	// ClientID -> device id of its last valid tag, in two generations: a
@@ -119,12 +128,15 @@ func (a *Auth) SetKeys(text []byte) error {
 	a.keys.Store(k)
 	kept := bytes.Clone(text)
 	a.text.Store(&kept)
+	if a.Hint != HintOff {
+		a.hints.get(k, EpochOf(a.clock())) // at once: a key gone is not found
+	}
 	return nil
 }
 
 // parseAuthKeys reads a keys file's text (SetKeys).
 func parseAuthKeys(text []byte) (*authKeys, error) {
-	k := &authKeys{byID: map[string][]int{}}
+	k := &authKeys{byID: map[string][]int{}, gen: keysGen.Add(1)}
 	sc := bufio.NewScanner(bytes.NewReader(text))
 	for line := 1; sc.Scan(); line++ {
 		f := strings.Fields(sc.Text())
@@ -240,16 +252,22 @@ func Tag(key *[32]byte, epoch uint32, payload []byte) [AuthTagLen]byte {
 // tagScratch holds what a tag is computed in: kept with the Auth, it does
 // not move to the heap on every HMAC through the hash.Hash interface.
 type tagScratch struct {
-	head [len(authLabel) + 4]byte
+	head [16 + 4]byte // the longest label (dnsauth-v2's) and the epoch
 	sum  [sha256.Size]byte
 }
 
-// tagWith computes a tag with a key's HMAC, which it resets.
+// tagWith computes a dnsauth-v1 tag with a key's HMAC, which it resets.
 func tagWith(m hash.Hash, epoch uint32, payload []byte, sc *tagScratch, out *[AuthTagLen]byte) {
+	tagWithLabel(m, authLabel, epoch, payload, sc, out)
+}
+
+// tagWithLabel computes HMAC(K, label || uint32_be(epoch) || payload)[:8]
+// with a key's HMAC, which it resets.
+func tagWithLabel(m hash.Hash, label string, epoch uint32, payload []byte, sc *tagScratch, out *[AuthTagLen]byte) {
 	m.Reset()
-	copy(sc.head[:], authLabel)
-	binary.BigEndian.PutUint32(sc.head[len(authLabel):], epoch)
-	m.Write(sc.head[:])
+	n := copy(sc.head[:], label)
+	binary.BigEndian.PutUint32(sc.head[n:], epoch)
+	m.Write(sc.head[:n+4])
 	m.Write(payload)
 	copy(out[:], m.Sum(sc.sum[:0]))
 }
@@ -368,6 +386,30 @@ func (a *Auth) validLocked(payload []byte, head turbotunnel.ClientID) tagResult 
 	tried := keys.byID[id]
 	if !cached {
 		tried = nil
+	}
+	// dnsauth-v2: the session's keys whose hint it is, then the keys the
+	// hint names; no scan and nothing from its budget.
+	if a.Hint != HintOff {
+		x := a.hints.get(keys, e)
+		match2Key := func(i int, epoch uint32) bool { return match2(keys.macs[i], epoch, &tag, body, &a.scratch) }
+		for _, i := range tried {
+			if x.keyMatches(i, &tag, func(epoch uint32) bool { return match2Key(i, epoch) }) {
+				a.cacheSession(cid, id)
+				return tagValid
+			}
+		}
+		// The session's keys were tried above: not again.
+		if i := x.find(&tag, func(i int, epoch uint32) bool { return !slices.Contains(tried, i) && match2Key(i, epoch) }); i >= 0 {
+			a.cacheSession(cid, keys.keys[i].id)
+			return tagValid
+		}
+		if a.Hint == HintRequired {
+			// No dnsauth-v1 tag is taken: nothing to scan.
+			if _, known := a.known(head, now); known {
+				return tagKnown
+			}
+			return tagInvalid
+		}
 	}
 	for _, i := range tried {
 		for _, epoch := range epochs {

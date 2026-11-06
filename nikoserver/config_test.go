@@ -302,3 +302,42 @@ func TestNekoServerConfigReview13(t *testing.T) {
 		}
 	}
 }
+
+// auth_hint (v0.12.0, dnsauth-v2): off, optional or required on the DNS
+// tunnels, and only with auth on.
+func TestNekoServerConfigAuthHint(t *testing.T) {
+	dnstt := `{"schema":1,"role":"backend","kind":"dnstt","log":{"level":"warn"},"socket":"/run/niko/dns/packet.sock",
+		"inner":"/run/niko/inner/vless.sock","options":{"zone":"t.example.com","private_key_file":"/run/credentials/niko-dns.service/dnstt.key"OPTS}}`
+	masterdns := `{"schema":1,"role":"backend","kind":"masterdns","log":{"level":"warn"},"socket":"/run/niko/mdns/packet.sock",
+		"inner":"/run/niko/inner/vless.sock","options":{"zones":["m.example.com"],"encryption_method":5,"encryption_key_file":"/run/credentials/niko-mdns.service/encryption.key"OPTS}}`
+	with := func(cfg, opts string) string { return strings.Replace(cfg, "OPTS", opts, 1) }
+	auth := `,"auth":"required","auth_keys_file":"/run/niko/dns-in/auth.keys"`
+	for _, ok := range []string{
+		with(dnstt, auth+`,"auth_hint":"optional"`), with(dnstt, auth+`,"auth_hint":"required"`), with(dnstt, auth+`,"auth_hint":"off"`),
+		with(masterdns, auth+`,"auth_hint":"required"`), with(dnstt, auth),
+	} {
+		if errs := checkConfig(t, ok); len(errs) > 0 {
+			t.Errorf("%v", errs)
+		}
+	}
+	hy2 := `{"schema":1,"role":"backend","kind":"hy2-masq","socket":"/run/niko/h/packet.sock","front_uid":9100,
+		"users_file":"/r/h/users.json","tls":{"certificate_file":"/r/h/chain.pem","key_file":"/run/niko/h/key.pem"},
+		"options":{"auth_hint":"optional"}}`
+	for _, c := range []struct{ content, path string }{
+		{with(dnstt, auth+`,"auth_hint":"strict"`), "options.auth_hint"},
+		{with(dnstt, `,"auth_hint":"optional"`), "options.auth_hint"},
+		{with(masterdns, `,"auth":"off","auth_hint":"required"`), "options.auth_hint"},
+		// optional auth would pass a v1 tag on as untagged
+		{with(dnstt, `,"auth":"optional","auth_keys_file":"/run/niko/dns-in/auth.keys","auth_hint":"required"`), "options.auth_hint"},
+		{hy2, "options"},
+	} {
+		errs := checkConfig(t, c.content)
+		found := false
+		for _, e := range errs {
+			found = found || e.Path == c.path
+		}
+		if !found {
+			t.Errorf("%s: no error at that path, got %v", c.path, errs)
+		}
+	}
+}
