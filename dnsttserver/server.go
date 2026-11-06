@@ -163,24 +163,42 @@ func handleStream(stream *smux.Stream, upstream Dialer, conv uint32) error {
 
 // acceptStreams wraps a KCP session in a Noise channel and an smux.Session,
 // then awaits smux streams. It passes each stream to handleStream.
-func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream Dialer) error {
-	// Put a Noise channel on top of the KCP conn.
-	rw, err := noise.NewServer(conn, privkey)
+func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream Dialer, sessions *sessionTable, id turbotunnel.ClientID) error {
+	// Put a Noise channel on top of the KCP conn. (neko) Within
+	// HandshakeTimeout, and with a first message of a sane length. The
+	// time limit closes the session rather than setting a read deadline:
+	// kcp-go reads the deadline without its lock, and noise's reader
+	// starts before NewServer returns, so clearing it afterwards raced.
+	limit := time.AfterFunc(HandshakeTimeout, func() { conn.Close() })
+	rw, err := noise.NewServer(&handshakeReader{ReadWriteCloser: conn}, privkey)
+	if !limit.Stop() {
+		return errHandshakeTimeout // the session is closed
+	}
 	if err != nil {
 		return err
 	}
+	sessions.established(id)
 
 	// Put an smux session on top of the encrypted Noise channel.
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.Version = 2
 	smuxConfig.KeepAliveTimeout = idleTimeout
-	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024 // default is 65536
+	// (neko) What the client may have sent and the node not passed on yet:
+	// uploads through DNS are kilobytes a second, so 128 KiB a stream and
+	// 256 KiB a session (default 4 MiB) leave tens of seconds of room, and
+	// a session pushing into a stalled inner stage holds no more than that.
+	smuxConfig.MaxStreamBuffer = 128 * 1024
+	smuxConfig.MaxReceiveBuffer = 256 * 1024
 	sess, err := smux.Server(rw, smuxConfig)
 	if err != nil {
 		return err
 	}
 	defer sess.Close()
 
+	// (neko) Each stream dials the inner stage: a socket and goroutines on
+	// the node for as long as it is open. A session gets MaxStreams at
+	// once (review 8: one took as many as it opened).
+	open := make(chan struct{}, MaxStreams)
 	for {
 		stream, err := sess.AcceptStream()
 		if err != nil {
@@ -190,11 +208,19 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream Dialer) error 
 			}
 			return err
 		}
+		select {
+		case open <- struct{}{}:
+		default:
+			queryLog.Printf("stream %08x:%d refused: %d open", conn.GetConv(), stream.ID(), MaxStreams)
+			stream.Close()
+			continue
+		}
 		log.Printf("begin stream %08x:%d", conn.GetConv(), stream.ID())
 		go func() {
 			defer func() {
 				log.Printf("end stream %08x:%d", conn.GetConv(), stream.ID())
 				stream.Close()
+				<-open
 			}()
 			err := handleStream(stream, upstream, conn.GetConv())
 			if err != nil {
@@ -206,7 +232,7 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream Dialer) error 
 
 // acceptSessions listens for incoming KCP connections and passes them to
 // acceptStreams.
-func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream Dialer, sizes *clientSizes) error {
+func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream Dialer, sizes *clientSizes, sessions *sessionTable) error {
 	for {
 		conn, err := ln.AcceptKCP()
 		if err != nil {
@@ -216,7 +242,14 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream Dialer, 
 			}
 			return err
 		}
-		log.Printf("begin session %08x", conn.GetConv())
+		// (neko) Not admitted by recvLoop (or no longer): closed at
+		// once; its last ACKs go nowhere (sessionConn).
+		id, _ := conn.RemoteAddr().(turbotunnel.ClientID)
+		if !sessions.add(id, conn.Close) {
+			conn.Close()
+			continue
+		}
+		queryLog.Printf("begin session %08x", conn.GetConv())
 		// Permit coalescing the payloads of consecutive sends.
 		conn.SetStreamMode(true)
 		// Disable the dynamic congestion window (limit only by the
@@ -230,19 +263,20 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream Dialer, 
 		conn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
 		m := sessionMTU(mtu, sizes, conn.RemoteAddr())
 		if m < mtu {
-			log.Printf("session %08x: MTU %d for a requester payload size under %d", conn.GetConv(), m, maxUDPPayload)
+			queryLog.Printf("session %08x: MTU %d for a requester payload size under %d", conn.GetConv(), m, maxUDPPayload)
 		}
 		if rc := conn.SetMtu(m); !rc {
 			panic(rc)
 		}
 		go func() {
 			defer func() {
-				log.Printf("end session %08x", conn.GetConv())
+				queryLog.Printf("end session %08x", conn.GetConv())
+				sessions.remove(id) // first: Close's last flush makes no queues
 				conn.Close()
 			}()
-			err := acceptStreams(conn, privkey, upstream)
+			err := acceptStreams(conn, privkey, upstream, sessions, id)
 			if err != nil && !errors.Is(err, io.ErrClosedPipe) {
-				log.Printf("session %08x acceptStreams: %v", conn.GetConv(), err)
+				queryLog.Printf("session %08x acceptStreams: %v", conn.GetConv(), err)
 			}
 		}()
 	}
@@ -290,7 +324,7 @@ func nextPacket(r *bytes.Reader) ([]byte, error) {
 // the returned dns.Message is nil, it means that there should be no response to
 // this query. If the returned dns.Message has an Rcode() of dns.RcodeNoError,
 // the message is a candidate for for carrying downstream data in a TXT record.
-func responseFor(query *dns.Message, domain dns.Name, auth *Auth) (*dns.Message, []byte) {
+func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*dns.Message, []byte, *sealKey, string, string) {
 	resp := &dns.Message{
 		ID:       query.ID,
 		Flags:    0x8000, // QR = 1, RCODE = no error
@@ -299,7 +333,7 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth) (*dns.Message,
 
 	if query.Flags&0x8000 != 0 {
 		// QR != 0, this is not a query. Don't even send a response.
-		return nil, nil
+		return nil, nil, nil, "", ""
 	}
 
 	// Check for EDNS(0) support. Include our own OPT RR only if we receive
@@ -319,8 +353,8 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth) (*dns.Message,
 			// "If a query message with more than one OPT RR is
 			// received, a FORMERR (RCODE=1) MUST be returned."
 			resp.Flags |= dns.RcodeFormatError
-			log.Printf("FORMERR: more than one OPT RR")
-			return resp, nil
+			queryLog.Printf("FORMERR: more than one OPT RR")
+			return resp, nil, nil, "", ""
 		}
 		resp.Additional = append(resp.Additional, dns.RR{
 			Name:  dns.Name{},
@@ -339,8 +373,8 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth) (*dns.Message,
 			// RCODE=BADVERS."
 			resp.Flags |= dns.ExtendedRcodeBadVers & 0xf
 			additional.TTL = (dns.ExtendedRcodeBadVers >> 4) << 24
-			log.Printf("BADVERS: EDNS version %d != 0", version)
-			return resp, nil
+			queryLog.Printf("BADVERS: EDNS version %d != 0", version)
+			return resp, nil, nil, "", ""
 		}
 
 		payloadSize = int(rr.Class)
@@ -356,8 +390,8 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth) (*dns.Message,
 	// There must be exactly one question.
 	if len(query.Question) != 1 {
 		resp.Flags |= dns.RcodeFormatError
-		log.Printf("FORMERR: too few or too many questions (%d)", len(query.Question))
-		return resp, nil
+		queryLog.Printf("FORMERR: too few or too many questions (%d)", len(query.Question))
+		return resp, nil, nil, "", ""
 	}
 	question := query.Question[0]
 	// Check the name to see if it ends in our chosen domain, and extract
@@ -368,16 +402,16 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth) (*dns.Message,
 	if !ok {
 		// Not a name we are authoritative for.
 		resp.Flags |= dns.RcodeNameError
-		log.Printf("NXDOMAIN: not authoritative for %s", question.Name)
-		return resp, nil
+		queryLog.Printf("NXDOMAIN: not authoritative for %s", question.Name)
+		return resp, nil, nil, "", ""
 	}
 	resp.Flags |= 0x0400 // AA = 1
 
 	if query.Opcode() != 0 {
 		// We don't support OPCODE != QUERY.
 		resp.Flags |= dns.RcodeNotImplemented
-		log.Printf("NOTIMPL: unrecognized OPCODE %d", query.Opcode())
-		return resp, nil
+		queryLog.Printf("NOTIMPL: unrecognized OPCODE %d", query.Opcode())
+		return resp, nil, nil, "", ""
 	}
 
 	if question.Type != dns.RRTypeTXT {
@@ -386,7 +420,7 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth) (*dns.Message,
 		// QNAMEs (RFC 9156) asks for the names above the tunnel's with A
 		// or NS, and one that takes NXDOMAIN as "nothing below"
 		// (RFC 8020) then gave up on the whole query.
-		return resp, nil
+		return resp, nil, nil, "", ""
 	}
 
 	encoded := bytes.ToUpper(bytes.Join(prefix, nil))
@@ -395,15 +429,35 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth) (*dns.Message,
 	if err != nil {
 		// Base32 error: (neko) no data at this name, as for any query
 		// the tunnel does not take (recvLoop).
-		return resp, nil
+		return resp, nil, nil, "", ""
 	}
 	payload = payload[:n]
+	// (neko) The memo's key (answerMemo): the payload as the query brought
+	// it. A retry's is the same; two queries of a client's never are: dnstt
+	// pads each with random bytes, a sealed one has its own N.
+	key := string(payload)
+
+	// dnsseal-v1 (neko): the seal comes off first; under it is what dnstt
+	// sends without it, the dnsauth-v1 tag included. In required mode a
+	// query no key opens is one the tunnel does not take.
+	var sealed *sealKey
+	if seal != nil && seal.Mode != SealOff {
+		if inner, key := seal.open(payload); key != nil {
+			payload, sealed = inner, key
+		} else if seal.Mode == SealRequired {
+			return resp, nil, nil, "", ""
+		}
+	}
 
 	// dnsauth-v1 (neko): the tag before anything that is dnstt's own, so a
 	// query without a valid one learns nothing, not even the FORMERR below
 	// for a small payload size: the zone answers as an empty one.
-	if payload, ok = auth.Check(payload); !ok {
-		return resp, nil
+	// The device whose tag this query carries, "" untagged: the session's
+	// bound is that device's (review 10: by its ClientID from the cache, an
+	// untagged start that reused a device's ClientID was charged to it).
+	var device string
+	if payload, device, ok = auth.CheckDevice(payload); !ok {
+		return resp, nil, nil, "", ""
 	}
 
 	// (neko) A requester payload size under maxUDPPayload is no FORMERR
@@ -411,7 +465,7 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth) (*dns.Message,
 	// session of such a client gets a smaller KCP MTU instead (sessionMTU),
 	// and its answers are sized for the requester (sendLoop): slower, not
 	// dead.
-	return resp, payload
+	return resp, payload, sealed, key, device
 }
 
 // carriesData reports whether a NOERROR response may carry downstream data:
@@ -434,9 +488,13 @@ type record struct {
 	Size int
 	// NoData: the query carried no ClientID, the answer no record.
 	NoData bool
-	// Key is the query's payload (neko): a retry's is the same, however
-	// its name was cased or split into labels (answerMemo).
+	// Key is the query's payload as it came, sealed or tagged (neko): a
+	// retry's is the same, however its name was cased or split into
+	// labels (answerMemo).
 	Key string
+	// Seal is the key that sealed the query (dnsseal-v1), nil for an open
+	// one: the answer is sealed with it, or open.
+	Seal *sealKey
 }
 
 // answerMemo keeps the data of recent answers by query payload (neko). A
@@ -446,7 +504,8 @@ type record struct {
 // send it again. Now it gets the first answer's data, and so does any
 // copy of the query, however its name is cased or split: it takes nothing
 // of the client's next data. The payload carries the client's random
-// padding, so the client never repeats one. Two generations of
+// padding, or a sealed query's N, so the client never repeats one. Two
+// generations of
 // memoGeneration bound it: an answer is kept 5 to 10 seconds, fewer under
 // a flood. Only sendLoop uses it, from one goroutine.
 type answerMemo struct {
@@ -492,7 +551,11 @@ func (m *answerMemo) answer(rec *record) bool {
 	}
 	data := e.data
 	if e.raw > encodedPayload(rec.Size) {
-		data = dns.EncodeRDataTXT(nil)
+		var empty []byte
+		if rec.Seal != nil {
+			empty = rec.Seal.answer(nil, encodedPayload(rec.Size))
+		}
+		data = dns.EncodeRDataTXT(empty)
 	}
 	q := rec.Resp.Question[0]
 	rec.Resp.Answer = []dns.RR{{Name: q.Name, Type: q.Type, Class: q.Class, TTL: responseTTL, Data: data}}
@@ -550,6 +613,9 @@ func encodedPayload(size int) int {
 type clientSizes struct {
 	mu        sync.Mutex
 	cur, prev map[turbotunnel.ClientID]int
+	// overhead is what each answer gives up before the packets: R of
+	// dnsseal-v1 when the zone has a seal (every session, sealed or not).
+	overhead int
 }
 
 // clientSizesMax is the clients of a generation.
@@ -592,17 +658,19 @@ func sessionMTU(mtu int, sizes *clientSizes, addr net.Addr) int {
 	if !ok || sizes == nil {
 		return mtu
 	}
-	return min(mtu, encodedPayload(sizes.get(id))-2)
+	return min(mtu, encodedPayload(sizes.get(id))-2-sizes.overhead)
 }
 
 // recvLoop repeatedly calls dnsConn.ReadFrom, extracts the packets contained in
 // the incoming DNS queries, and puts them on ttConn's incoming queue. Whenever
 // a query calls for a response, constructs a partial response and passes it to
 // sendLoop over ch.
-func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, auth *Auth, sizes *clientSizes) error {
+func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, auth *Auth, seal *Seal, sizes *clientSizes, sessions *sessionTable) error {
+	// (neko) One buffer, not 4 KiB on the heap per query: the parsed
+	// message copies what it keeps.
+	buf := make([]byte, 4096)
 	for {
-		var buf [4096]byte
-		n, addr, err := dnsConn.ReadFrom(buf[:])
+		n, addr, err := dnsConn.ReadFrom(buf)
 		if err != nil {
 			return err
 		}
@@ -610,13 +678,12 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 		// Got a UDP packet. Try to parse it as a DNS message.
 		query, err := dns.MessageFromWireFormat(buf[:n])
 		if err != nil {
-			log.Printf("cannot parse DNS query: %v", err)
+			queryLog.Printf("cannot parse DNS query: %v", err)
 			continue
 		}
 
-		resp, payload := responseFor(&query, domain, auth)
+		resp, payload, sealed, key, device := responseFor(&query, domain, auth, seal)
 		size := requesterSize(&query)
-		key := string(payload)
 		// Extract the ClientID from the payload.
 		var clientID turbotunnel.ClientID
 		n = copy(clientID[:], payload)
@@ -628,9 +695,14 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 			// Discard padding and pull out the packets contained in
 			// the payload.
 			r := bytes.NewReader(payload)
-			for {
+			for first := true; ; first = false {
 				p, err := nextPacket(r)
 				if err != nil {
+					break
+				}
+				// (neko) KCP sees a new ClientID's packets only once
+				// the session table admits it.
+				if first && !sessions.admit(clientID, p, func() string { return device }) {
 					break
 				}
 				// Feed the incoming packet to KCP.
@@ -645,7 +717,7 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 		// If a response is called for, pass it to sendLoop via the channel.
 		if resp != nil {
 			select {
-			case ch <- &record{resp, addr, clientID, size, noData, key}:
+			case ch <- &record{resp, addr, clientID, size, noData, key, sealed}:
 			default:
 			}
 		}
@@ -656,7 +728,7 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 // response, it sends on the network immediately. Those that represent a
 // response capable of carrying data, it packs full of as many packets as will
 // fit while keeping the total size under maxEncodedPayload, then sends it.
-func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-chan *record) error {
+func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-chan *record, sessions *sessionTable) error {
 	var nextRec *record
 	var memo answerMemo
 	for {
@@ -675,6 +747,16 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 			// (neko) A query asked before (a resolver's retry): the
 			// same data as the first answer, which the resolver may
 			// already have taken.
+		} else if rec.Resp.Rcode() == dns.RcodeNoError && carriesData(rec.Resp) && !rec.NoData && sessions != nil && !sessions.has(rec.ClientID) {
+			// (neko) No KCP session for this ClientID: nothing to
+			// send, and no queues are made for it (they were 3.6 KB a
+			// ClientID for minutes). An empty answer at once.
+			var data []byte
+			if rec.Seal != nil {
+				data = rec.Seal.answer(nil, encodedPayload(rec.Size))
+			}
+			q := rec.Resp.Question[0]
+			rec.Resp.Answer = []dns.RR{{Name: q.Name, Type: q.Type, Class: q.Class, TTL: responseTTL, Data: dns.EncodeRDataTXT(data)}}
 		} else if rec.Resp.Rcode() == dns.RcodeNoError && carriesData(rec.Resp) && !rec.NoData {
 			// If it's a non-error response, we can fill the Answer
 			// section with downstream packets.
@@ -692,8 +774,13 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 			}
 
 			var payload bytes.Buffer
-			// (neko) Within the requester's size, not the global one.
-			limit := encodedPayload(rec.Size)
+			// (neko) Within the requester's size, not the global one,
+			// and R of a sealed answer.
+			capacity := encodedPayload(rec.Size)
+			if rec.Seal != nil {
+				capacity -= sealHeadLen
+			}
+			limit := capacity
 			// We loop and bundle as many packets from OutgoingQueue
 			// into the response as will fit. Any packet that would
 			// overflow the capacity of the DNS response, we stash
@@ -753,7 +840,7 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 					// Stash this packet to send in the next
 					// response. (neko) The first packet too,
 					// instead of being truncated and lost.
-					if !ttConn.Stash(p, rec.ClientID) && skipStash && 2+len(p) <= encodedPayload(rec.Size) {
+					if !ttConn.Stash(p, rec.ClientID) && skipStash && 2+len(p) <= capacity {
 						// The stash holds a packet no answer to
 						// this requester can carry, and this one
 						// fits the next: it goes first, the other
@@ -785,8 +872,12 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 				<-timer.C
 			}
 
-			rec.Resp.Answer[0].Data = dns.EncodeRDataTXT(payload.Bytes())
-			memo.remember(rec, payload.Len())
+			data := payload.Bytes()
+			if rec.Seal != nil {
+				data = rec.Seal.answer(data, encodedPayload(rec.Size))
+			}
+			rec.Resp.Answer[0].Data = dns.EncodeRDataTXT(data)
+			memo.remember(rec, len(data))
 		}
 
 		buf, err := rec.Resp.WireFormat()
@@ -797,7 +888,7 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 		// Truncate if necessary.
 		// https://tools.ietf.org/html/rfc1035#section-4.1.1
 		if size := min(max(rec.Size, 512), maxUDPPayload); len(buf) > size {
-			log.Printf("truncating response of %d bytes to max of %d", len(buf), size)
+			queryLog.Printf("truncating response of %d bytes to max of %d", len(buf), size)
 			buf = buf[:size]
 			buf[2] |= 0x02 // TC = 1
 		}
@@ -811,7 +902,7 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 			if errors.Is(err, net.ErrClosed) {
 				return err
 			}
-			log.Printf("WriteTo error: %v", err)
+			queryLog.Printf("WriteTo error: %v", err)
 			continue
 		}
 	}
@@ -873,7 +964,7 @@ func computeMaxEncodedPayload(limit int) int {
 			},
 		},
 	}
-	resp, _ := responseFor(query, dns.Name([][]byte{}), nil)
+	resp, _, _, _, _ := responseFor(query, dns.Name([][]byte{}), nil, nil)
 	// As in sendLoop.
 	resp.Answer = []dns.RR{
 		{
@@ -888,7 +979,9 @@ func computeMaxEncodedPayload(limit int) int {
 	// Binary search to find the maximum payload length that does not result
 	// in a wire-format message whose length exceeds the limit.
 	low := 0
-	high := 32768
+	// (neko) No more data than the message may hold: was 32768, ~185 MiB
+	// of garbage for the table of encodedPayload.
+	high := limit + 1
 	for low+1 < high {
 		mid := (low + high) / 2
 		resp.Answer[0].Data = dns.EncodeRDataTXT(make([]byte, mid))
@@ -938,14 +1031,20 @@ func Run(privkey []byte, domain string, dnsConn net.PacketConn, upstream Dialer)
 // RunAuth is Run with dnsauth-v1 (neko): auth checks the tags of queries;
 // nil takes queries without them.
 func RunAuth(privkey []byte, domain string, dnsConn net.PacketConn, upstream Dialer, auth *Auth) error {
+	return RunWith(privkey, domain, dnsConn, upstream, auth, nil)
+}
+
+// RunWith is RunAuth with dnsseal-v1 (neko): seal takes the seal off
+// queries and puts it on answers; nil is dnstt as it is.
+func RunWith(privkey []byte, domain string, dnsConn net.PacketConn, upstream Dialer, auth *Auth, seal *Seal) error {
 	name, err := dns.ParseName(domain)
 	if err != nil {
 		return fmt.Errorf("invalid domain %+q: %v", domain, err)
 	}
-	return run(privkey, name, upstream, dnsConn, auth)
+	return run(privkey, name, upstream, dnsConn, auth, seal)
 }
 
-func run(privkey []byte, domain dns.Name, upstream Dialer, dnsConn net.PacketConn, auth *Auth) error {
+func run(privkey []byte, domain dns.Name, upstream Dialer, dnsConn net.PacketConn, auth *Auth, seal *Seal) error {
 	defer dnsConn.Close()
 
 	log.Printf("pubkey %x", noise.PubkeyFromPrivkey(privkey))
@@ -958,8 +1057,8 @@ func run(privkey []byte, domain dns.Name, upstream Dialer, dnsConn net.PacketCon
 	// keep the UDP payload size under maxUDPPayload, even in the worst case
 	// of a maximum-length name in the query's Question section.
 	maxEncodedPayload := computeMaxEncodedPayload(maxUDPPayload)
-	// 2 bytes accounts for a packet length prefix.
-	mtu := maxEncodedPayload - 2
+	// 2 bytes accounts for a packet length prefix; a seal takes R too.
+	mtu := maxEncodedPayload - 2 - seal.overhead()
 	if mtu < 80 {
 		if mtu < 0 {
 			mtu = 0
@@ -969,11 +1068,13 @@ func run(privkey []byte, domain dns.Name, upstream Dialer, dnsConn net.PacketCon
 	log.Printf("effective MTU %d", mtu)
 
 	// The smallest requester size of each client (neko).
-	sizes := &clientSizes{}
+	sizes := &clientSizes{overhead: seal.overhead()}
+	sessions := newSessionTable()
 
-	// Start up the virtual PacketConn for turbotunnel.
-	ttConn := turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, idleTimeout*2)
-	ln, err := kcp.ServeConn(nil, 0, 0, ttConn)
+	// Start up the virtual PacketConn for turbotunnel. (neko) Queues
+	// outlive their ClientID's last activity by remoteTimeout.
+	ttConn := turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, remoteTimeout)
+	ln, err := kcp.ServeConn(nil, 0, 0, sessionConn{ttConn, sessions})
 	if err != nil {
 		return fmt.Errorf("opening KCP listener: %v", err)
 	}
@@ -987,7 +1088,7 @@ func run(privkey []byte, domain dns.Name, upstream Dialer, dnsConn net.PacketCon
 
 	go func() {
 		defer done()
-		err := acceptSessions(ln, privkey, mtu, upstream, sizes)
+		err := acceptSessions(ln, privkey, mtu, upstream, sizes, sessions)
 		if err != nil {
 			log.Printf("acceptSessions: %v", err)
 		}
@@ -1002,7 +1103,7 @@ func run(privkey []byte, domain dns.Name, upstream Dialer, dnsConn net.PacketCon
 	// another response that needs to be sent.
 	go func() {
 		defer done()
-		err := sendLoop(dnsConn, ttConn, ch)
+		err := sendLoop(dnsConn, ttConn, ch, sessions)
 		if err != nil {
 			log.Printf("sendLoop: %v", err)
 		}
@@ -1010,7 +1111,7 @@ func run(privkey []byte, domain dns.Name, upstream Dialer, dnsConn net.PacketCon
 
 	go func() {
 		defer done()
-		err := recvLoop(domain, dnsConn, ttConn, ch, auth, sizes)
+		err := recvLoop(domain, dnsConn, ttConn, ch, auth, seal, sizes, sessions)
 		close(ch)
 		if err != nil {
 			log.Printf("recvLoop: %v", err)

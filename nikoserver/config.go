@@ -57,6 +57,10 @@ type DNSZone struct {
 	// SOA and NS at the zone's apex itself (dnstt zones: the answers are
 	// built as dnstt's), the first being the SOA's primary.
 	NS []string `json:"ns,omitempty"`
+	// SealPad: the zone's dnstt answers are sealed (dnsseal-v1, required):
+	// the front pads the TXT data of its probe answers as they are padded,
+	// to a multiple of 64 within what the requester can carry.
+	SealPad bool `json:"seal_pad,omitempty"`
 }
 
 type FrontDNS struct {
@@ -126,6 +130,11 @@ type BackendOptions struct {
 	// a query no session explains (dnsttserver.Auth.ScanHMACs); 0: the
 	// default, 100000 or 20 full scans a second.
 	AuthScanHMACs int `json:"auth_scan_hmacs,omitempty"`
+	// dnstt: dnsseal-v1 (raycontrol docs/spec/dnsseal-v1.md): off,
+	// optional or required, and the zone's keys (64 hex digits a line, the
+	// current first).
+	Seal        string `json:"seal,omitempty"`
+	SealKeyFile string `json:"seal_key_file,omitempty"`
 	// masterdns
 	Zones             []string `json:"zones,omitempty"`
 	EncryptionMethod  *int     `json:"encryption_method,omitempty"`
@@ -301,6 +310,9 @@ func (c *FrontConfig) validate() []ConfigError {
 		if z.Probe && c.DNS.ProbeKeyFile == "" {
 			e.add(path+".probe", "needs dns.probe_key_file")
 		}
+		if z.SealPad && !z.Probe {
+			e.add(path+".seal_pad", "pads probe answers: needs probe")
+		}
 		if len(z.NS) > 8 {
 			e.add(path+".ns", "at most 8 names")
 		}
@@ -330,6 +342,11 @@ func (c *BackendConfig) validate() []ConfigError {
 			e.add("options.auth", "%v", err)
 		} else if mode != dnsttserver.AuthOff {
 			checkSocket(&e, "options.auth_keys_file", c.Options.AuthKeysFile)
+		}
+		if mode, err := dnsttserver.ParseSealMode(c.Options.Seal); err != nil {
+			e.add("options.seal", "%v", err)
+		} else if mode != dnsttserver.SealOff {
+			checkSocket(&e, "options.seal_key_file", c.Options.SealKeyFile)
 		}
 	case "masterdns":
 		if len(c.Options.Zones) == 0 {
@@ -410,6 +427,9 @@ func (c *BackendConfig) validate() []ConfigError {
 	}
 	if c.Kind != "dnstt" && (c.Options.Auth != "" || c.Options.AuthKeysFile != "" || c.Options.AuthScanHMACs != 0) {
 		e.add("options", "auth, auth_keys_file and auth_scan_hmacs are dnstt options")
+	}
+	if c.Kind != "dnstt" && (c.Options.Seal != "" || c.Options.SealKeyFile != "") {
+		e.add("options", "seal and seal_key_file are dnstt options")
 	}
 	if c.Kind == "dnstt" || c.Kind == "masterdns" || c.Kind == "yggdrasil" {
 		if c.Inner == "" {

@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -211,7 +213,7 @@ func TestNoDataForOtherTypes(t *testing.T) {
 		for _, qtype := range []uint16{1 /* A */, 2 /* NS */, 28 /* AAAA */} {
 			q := &dns.Message{ID: 1, Flags: 0x0100, Question: []dns.Question{{Name: n, Type: qtype, Class: dns.ClassIN}},
 				Additional: []dns.RR{{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 1232}}}
-			resp, payload := responseFor(q, zone, nil)
+			resp, payload, _, _, _ := responseFor(q, zone, nil, nil)
 			if resp == nil || resp.Rcode() != dns.RcodeNoError || resp.Flags&0x0400 == 0 || payload != nil || carriesData(resp) {
 				t.Errorf("%s type %d: %+v", name, qtype, resp)
 			}
@@ -221,7 +223,7 @@ func TestNoDataForOtherTypes(t *testing.T) {
 	n, _ := dns.ParseName("aaaaaaaaaaaaaaaa.t.example.com")
 	q := &dns.Message{ID: 1, Flags: 0x0100, Question: []dns.Question{{Name: n, Type: dns.RRTypeTXT, Class: dns.ClassIN}},
 		Additional: []dns.RR{{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 1232}}}
-	if resp, _ := responseFor(q, zone, nil); resp == nil || !carriesData(resp) {
+	if resp, _, _, _, _ := responseFor(q, zone, nil, nil); resp == nil || !carriesData(resp) {
 		t.Errorf("TXT: %+v", resp)
 	}
 }
@@ -546,7 +548,7 @@ func TestSendLoopOversizeWaits(t *testing.T) {
 	tt.WriteTo(small, id)
 	out := make(chan []byte, 4)
 	ch := make(chan *record, 1)
-	go sendLoop(capture{out: out}, tt, ch)
+	go sendLoop(capture{out: out}, tt, ch, nil)
 	zone, _ := dns.ParseName("x.t.example.com")
 	ch <- &record{Resp: &dns.Message{ID: 1, Flags: 0x8400, Question: []dns.Question{{Name: zone, Type: dns.RRTypeTXT, Class: dns.ClassIN}}},
 		Addr: turbotunnel.DummyAddr{}, ClientID: id, Size: 512}
@@ -593,7 +595,7 @@ func TestSendLoopStashSwap(t *testing.T) {
 	tt.WriteTo(next, id)
 	out := make(chan []byte, 4)
 	ch := make(chan *record, 1)
-	go sendLoop(capture{out: out}, tt, ch)
+	go sendLoop(capture{out: out}, tt, ch, nil)
 	zone, _ := dns.ParseName("x.t.example.com")
 	ch <- &record{Resp: &dns.Message{ID: 1, Flags: 0x8400, Question: []dns.Question{{Name: zone, Type: dns.RRTypeTXT, Class: dns.ClassIN}}},
 		Addr: turbotunnel.DummyAddr{}, ClientID: id, Size: 512}
@@ -633,7 +635,7 @@ func TestSendLoopMemo(t *testing.T) {
 	tt.WriteTo(next, id)
 	out := make(chan []byte, 8)
 	ch := make(chan *record, 8)
-	go sendLoop(capture{out: out}, tt, ch)
+	go sendLoop(capture{out: out}, tt, ch, nil)
 	ask := func(name, key string, size int) []byte {
 		t.Helper()
 		q, _ := dns.ParseName(name)
@@ -682,5 +684,84 @@ func TestSendLoopMemo(t *testing.T) {
 	}
 	if (&answerMemo{}).answer(&record{}) {
 		t.Fatal("a record without a key used the memo")
+	}
+}
+
+// The keys file rewritten after LoadKeys, before the watcher's first look
+// and at the same size, is taken (review 8: the watcher compared mtime and
+// size with what it saw at its start, and a revocation was missed).
+func TestAuthWatchKeysContent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth.keys")
+	k1 := "d1 " + strings.Repeat("11", 32) + "\n"
+	k2 := "d1 " + strings.Repeat("22", 32) + "\n"
+	if err := os.WriteFile(path, []byte(k1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := &Auth{Mode: AuthRequired}
+	if err := a.LoadKeys(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(k2), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	defer close(stop)
+	go a.WatchKeys(path, 10*time.Millisecond, stop, t.Logf)
+	for range 200 {
+		if a.keys.Load().keys[0].key[0] == 0x22 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if a.keys.Load().keys[0].key[0] != 0x22 {
+		t.Fatal("the rewritten keys not taken")
+	}
+	// A file that does not parse keeps the keys in force.
+	if err := os.WriteFile(path, []byte("d1 zz\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if a.Devices() != 1 || a.keys.Load().keys[0].key[0] != 0x22 {
+		t.Fatal("a bad file replaced the keys")
+	}
+	// Emptied, the last device revoked: no key (review 9: an empty file
+	// matched the nil bad one and was never taken).
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for range 200 {
+		if a.Devices() == 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if a.Devices() != 0 {
+		t.Fatalf("an emptied file kept %d devices", a.Devices())
+	}
+}
+
+// CheckDevice names the device of the query's own tag, never one the
+// ClientID had before: an untagged start that reuses a device's ClientID
+// is no session of that device (review 10: the bound and the eviction
+// went by the cached ClientID).
+func TestAuthCheckDevice(t *testing.T) {
+	var alice [32]byte
+	rand.Read(alice[:])
+	now := time.Unix(1_800_000_000, 0)
+	a := &Auth{Mode: AuthOptional, Now: func() time.Time { return now }}
+	if err := a.SetKeys([]byte("d-alice " + hex.EncodeToString(alice[:]) + "\n")); err != nil {
+		t.Fatal(err)
+	}
+	body := append([]byte("CLIENTID"), []byte("\xe0padding and packets")...)
+	tag := Tag(&alice, EpochOf(now), body)
+	if rest, dev, ok := a.CheckDevice(append(tag[:], body...)); !ok || dev != "d-alice" || !bytes.Equal(rest, body) {
+		t.Fatalf("tagged: %q %v", dev, ok)
+	}
+	// The same ClientID, untagged: taken in optional mode, no device's.
+	if rest, dev, ok := a.CheckDevice(body); !ok || dev != "" || !bytes.Equal(rest, body) {
+		t.Fatalf("untagged with alice's ClientID: %q %v", dev, ok)
+	}
+	if _, dev, ok := (*Auth)(nil).CheckDevice(body); !ok || dev != "" {
+		t.Fatal("no auth")
 	}
 }

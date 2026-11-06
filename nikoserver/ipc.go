@@ -46,6 +46,11 @@ func getAddr(b []byte) (netip.AddrPort, error) {
 		}
 		addr = addr.Unmap()
 	case 6:
+		// putAddr writes an IPv4 address, mapped or not, as 4: a mapped
+		// one under 6 is not from it (one client, two keys downstream).
+		if addr.Is4In6() {
+			return netip.AddrPort{}, errBadPacket
+		}
 	default:
 		return netip.AddrPort{}, errBadPacket
 	}

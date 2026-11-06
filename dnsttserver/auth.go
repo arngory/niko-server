@@ -87,6 +87,7 @@ type Auth struct {
 	ScanHMACs float64
 
 	keys atomic.Pointer[authKeys]
+	text atomic.Pointer[[]byte] // the keys file's text in force (WatchKeys)
 
 	mu sync.Mutex // the macs, the caches and the scan budget
 	// ClientID -> device id of its last valid tag, in two generations: a
@@ -135,6 +136,8 @@ func (a *Auth) SetKeys(text []byte) error {
 		return err
 	}
 	a.keys.Store(k)
+	kept := bytes.Clone(text)
+	a.text.Store(&kept)
 	return nil
 }
 
@@ -155,18 +158,15 @@ func (a *Auth) LoadKeys(file string) error {
 	return a.SetKeys(b)
 }
 
-// WatchKeys reloads the file when its modification time or size changes,
-// until stop is closed. A file that does not parse keeps the keys in force.
-// Every hour it logs the counters, when they moved.
+// WatchKeys reads the file again every period, until stop is closed, and
+// takes it when its text differs from the keys in force: by content, not
+// modification time and size (review 8: a file rewritten before the first
+// look, or at the same size within a tick, kept a revoked device's key, as
+// the seal's watcher did before). A file that does not parse keeps the keys
+// in force. Every hour it logs the counters, when they moved.
 func (a *Auth) WatchKeys(file string, every time.Duration, stop <-chan struct{}, logf func(string, ...any)) {
-	stat := func() (time.Time, int64) {
-		fi, err := os.Stat(file)
-		if err != nil {
-			return time.Time{}, -1
-		}
-		return fi.ModTime(), fi.Size()
-	}
-	mod, size := stat()
+	var bad []byte
+	var readErr string // the last read error logged, once
 	t := time.NewTicker(every)
 	defer t.Stop()
 	report := time.Now().Add(time.Hour)
@@ -185,15 +185,27 @@ func (a *Auth) WatchKeys(file string, every time.Duration, stop <-chan struct{},
 				logf("auth: %d valid, %d untagged, %d refused (%d over the scan budget) since the start", now[0], now[1], now[2], now[3])
 			}
 		}
-		m, s := stat()
-		if m.Equal(mod) && s == size {
+		b, err := os.ReadFile(file) //nolint:gosec // G304: the configured file
+		if err != nil {
+			// Being replaced, or gone: the keys stay, said once.
+			if err.Error() != readErr {
+				readErr = err.Error()
+				logf("auth keys %s not read, the %d in force stay: %v", file, a.Devices(), err)
+			}
 			continue
 		}
-		mod, size = m, s
-		if err := a.LoadKeys(file); err != nil {
+		readErr = ""
+		// bad != nil: an empty file is not the bad one (review 9: a file
+		// emptied of its last device was never taken).
+		if cur := a.text.Load(); (cur != nil && bytes.Equal(b, *cur)) || (bad != nil && bytes.Equal(b, bad)) {
+			continue
+		}
+		if err := a.SetKeys(b); err != nil {
+			bad = b
 			logf("auth keys %s not reloaded: %v", file, err)
 			continue
 		}
+		bad = nil
 		logf("auth keys reloaded: %d devices", a.Devices())
 	}
 }
@@ -231,18 +243,25 @@ func EpochOf(t time.Time) uint32 { return uint32(t.Unix() / int64(AuthEpoch/time
 // takes untagged queries; otherwise ok is false and the query is answered
 // as by an empty zone.
 func (a *Auth) Check(payload []byte) (rest []byte, ok bool) {
+	rest, _, ok = a.CheckDevice(payload)
+	return rest, ok
+}
+
+// CheckDevice is Check that also names the device whose valid tag the
+// payload carries ("" without one).
+func (a *Auth) CheckDevice(payload []byte) (rest []byte, device string, ok bool) {
 	if a == nil || a.Mode == AuthOff {
-		return payload, true
+		return payload, "", true
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	untagged := func() ([]byte, bool) {
+	untagged := func() ([]byte, string, bool) {
 		if a.Mode == AuthOptional {
 			a.Untagged.Add(1)
-			return payload, true
+			return payload, "", true
 		}
 		a.Refused.Add(1)
-		return nil, false
+		return nil, "", false
 	}
 	if len(payload) < AuthTagLen+len(turbotunnel.ClientID{}) {
 		return untagged() // too short for a tag; nothing to remember
@@ -252,13 +271,15 @@ func (a *Auth) Check(payload []byte) (rest []byte, ok bool) {
 	switch a.validLocked(payload, head) {
 	case tagValid:
 		a.Valid.Add(1)
-		return payload[AuthTagLen:], true
+		var cid turbotunnel.ClientID
+		copy(cid[:], payload[AuthTagLen:])
+		return payload[AuthTagLen:], a.cache[cid], true // validLocked cached it
 	case tagThrottled:
 		// Not looked at: refused even in optional mode, since a tagged
 		// query read as untagged would feed the session garbage.
 		a.Throttled.Add(1)
 		a.Refused.Add(1)
-		return nil, false
+		return nil, "", false
 	case tagKnown:
 		return untagged() // no key explained this head before
 	case tagKnownBusy:

@@ -83,7 +83,19 @@ func RunBackend(ctx context.Context, c *BackendConfig, log *Logger) error {
 			go auth.WatchKeys(c.Options.AuthKeysFile, 5*time.Second, ctx.Done(), log.Infof)
 			log.Infof("dnstt: queries need the device's tag (dnsauth-v1, %s)", c.Options.Auth)
 		}
-		err = dnsttserver.RunAuth(key, strings.TrimSuffix(c.Options.Zone, "."), conn, dialInner, auth)
+		// dnsseal-v1: the framing sealed with the zone's key.
+		smode, _ := dnsttserver.ParseSealMode(c.Options.Seal)
+		var seal *dnsttserver.Seal
+		if smode != dnsttserver.SealOff {
+			if seal, err = dnsttserver.LoadSeal(smode, c.Options.SealKeyFile); err != nil {
+				return envError("dnstt seal keys %s: %v", c.Options.SealKeyFile, err)
+			}
+			// A new key, or the previous one's grace over, without a
+			// restart that would end every session.
+			go seal.WatchKeys(c.Options.SealKeyFile, 5*time.Second, ctx.Done(), log.Infof)
+			log.Infof("dnstt: sealed framing (dnsseal-v1, %s, %d keys)", c.Options.Seal, seal.Keys())
+		}
+		err = dnsttserver.RunWith(key, strings.TrimSuffix(c.Options.Zone, "."), conn, dialInner, auth, seal)
 		if ctx.Err() != nil {
 			return nil
 		}
