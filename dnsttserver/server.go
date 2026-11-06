@@ -290,7 +290,7 @@ func nextPacket(r *bytes.Reader) ([]byte, error) {
 // the returned dns.Message is nil, it means that there should be no response to
 // this query. If the returned dns.Message has an Rcode() of dns.RcodeNoError,
 // the message is a candidate for for carrying downstream data in a TXT record.
-func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*dns.Message, []byte, *sealKey) {
+func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*dns.Message, []byte, *sealKey, string) {
 	resp := &dns.Message{
 		ID:       query.ID,
 		Flags:    0x8000, // QR = 1, RCODE = no error
@@ -299,7 +299,7 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*
 
 	if query.Flags&0x8000 != 0 {
 		// QR != 0, this is not a query. Don't even send a response.
-		return nil, nil, nil
+		return nil, nil, nil, ""
 	}
 
 	// Check for EDNS(0) support. Include our own OPT RR only if we receive
@@ -320,7 +320,7 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*
 			// received, a FORMERR (RCODE=1) MUST be returned."
 			resp.Flags |= dns.RcodeFormatError
 			log.Printf("FORMERR: more than one OPT RR")
-			return resp, nil, nil
+			return resp, nil, nil, ""
 		}
 		resp.Additional = append(resp.Additional, dns.RR{
 			Name:  dns.Name{},
@@ -340,7 +340,7 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*
 			resp.Flags |= dns.ExtendedRcodeBadVers & 0xf
 			additional.TTL = (dns.ExtendedRcodeBadVers >> 4) << 24
 			log.Printf("BADVERS: EDNS version %d != 0", version)
-			return resp, nil, nil
+			return resp, nil, nil, ""
 		}
 
 		payloadSize = int(rr.Class)
@@ -357,7 +357,7 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*
 	if len(query.Question) != 1 {
 		resp.Flags |= dns.RcodeFormatError
 		log.Printf("FORMERR: too few or too many questions (%d)", len(query.Question))
-		return resp, nil, nil
+		return resp, nil, nil, ""
 	}
 	question := query.Question[0]
 	// Check the name to see if it ends in our chosen domain, and extract
@@ -369,7 +369,7 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*
 		// Not a name we are authoritative for.
 		resp.Flags |= dns.RcodeNameError
 		log.Printf("NXDOMAIN: not authoritative for %s", question.Name)
-		return resp, nil, nil
+		return resp, nil, nil, ""
 	}
 	resp.Flags |= 0x0400 // AA = 1
 
@@ -377,7 +377,7 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*
 		// We don't support OPCODE != QUERY.
 		resp.Flags |= dns.RcodeNotImplemented
 		log.Printf("NOTIMPL: unrecognized OPCODE %d", query.Opcode())
-		return resp, nil, nil
+		return resp, nil, nil, ""
 	}
 
 	if question.Type != dns.RRTypeTXT {
@@ -386,7 +386,7 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*
 		// QNAMEs (RFC 9156) asks for the names above the tunnel's with A
 		// or NS, and one that takes NXDOMAIN as "nothing below"
 		// (RFC 8020) then gave up on the whole query.
-		return resp, nil, nil
+		return resp, nil, nil, ""
 	}
 
 	encoded := bytes.ToUpper(bytes.Join(prefix, nil))
@@ -395,9 +395,13 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*
 	if err != nil {
 		// Base32 error: (neko) no data at this name, as for any query
 		// the tunnel does not take (recvLoop).
-		return resp, nil, nil
+		return resp, nil, nil, ""
 	}
 	payload = payload[:n]
+	// (neko) The memo's key (answerMemo): the payload as the query brought
+	// it. A retry's is the same; two queries of a client's never are: dnstt
+	// pads each with random bytes, a sealed one has its own N.
+	key := string(payload)
 
 	// dnsseal-v1 (neko): the seal comes off first; under it is what dnstt
 	// sends without it, the dnsauth-v1 tag included. In required mode a
@@ -407,7 +411,7 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*
 		if inner, key := seal.open(payload); key != nil {
 			payload, sealed = inner, key
 		} else if seal.Mode == SealRequired {
-			return resp, nil, nil
+			return resp, nil, nil, ""
 		}
 	}
 
@@ -415,7 +419,7 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*
 	// query without a valid one learns nothing, not even the FORMERR below
 	// for a small payload size: the zone answers as an empty one.
 	if payload, ok = auth.Check(payload); !ok {
-		return resp, nil, nil
+		return resp, nil, nil, ""
 	}
 
 	// (neko) A requester payload size under maxUDPPayload is no FORMERR
@@ -423,7 +427,7 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*
 	// session of such a client gets a smaller KCP MTU instead (sessionMTU),
 	// and its answers are sized for the requester (sendLoop): slower, not
 	// dead.
-	return resp, payload, sealed
+	return resp, payload, sealed, key
 }
 
 // carriesData reports whether a NOERROR response may carry downstream data:
@@ -446,8 +450,9 @@ type record struct {
 	Size int
 	// NoData: the query carried no ClientID, the answer no record.
 	NoData bool
-	// Key is the query's payload (neko): a retry's is the same, however
-	// its name was cased or split into labels (answerMemo).
+	// Key is the query's payload as it came, sealed or tagged (neko): a
+	// retry's is the same, however its name was cased or split into
+	// labels (answerMemo).
 	Key string
 	// Seal is the key that sealed the query (dnsseal-v1), nil for an open
 	// one: the answer is sealed with it, or open.
@@ -461,7 +466,8 @@ type record struct {
 // send it again. Now it gets the first answer's data, and so does any
 // copy of the query, however its name is cased or split: it takes nothing
 // of the client's next data. The payload carries the client's random
-// padding, so the client never repeats one. Two generations of
+// padding, or a sealed query's N, so the client never repeats one. Two
+// generations of
 // memoGeneration bound it: an answer is kept 5 to 10 seconds, fewer under
 // a flood. Only sendLoop uses it, from one goroutine.
 type answerMemo struct {
@@ -636,9 +642,8 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 			continue
 		}
 
-		resp, payload, sealed := responseFor(&query, domain, auth, seal)
+		resp, payload, sealed, key := responseFor(&query, domain, auth, seal)
 		size := requesterSize(&query)
-		key := string(payload)
 		// Extract the ClientID from the payload.
 		var clientID turbotunnel.ClientID
 		n = copy(clientID[:], payload)
@@ -716,10 +721,11 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 			var payload bytes.Buffer
 			// (neko) Within the requester's size, not the global one,
 			// and R of a sealed answer.
-			limit := encodedPayload(rec.Size)
+			capacity := encodedPayload(rec.Size)
 			if rec.Seal != nil {
-				limit -= sealNonceLen
+				capacity -= sealNonceLen
 			}
+			limit := capacity
 			// We loop and bundle as many packets from OutgoingQueue
 			// into the response as will fit. Any packet that would
 			// overflow the capacity of the DNS response, we stash
@@ -779,7 +785,7 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 					// Stash this packet to send in the next
 					// response. (neko) The first packet too,
 					// instead of being truncated and lost.
-					if !ttConn.Stash(p, rec.ClientID) && skipStash && 2+len(p) <= encodedPayload(rec.Size) {
+					if !ttConn.Stash(p, rec.ClientID) && skipStash && 2+len(p) <= capacity {
 						// The stash holds a packet no answer to
 						// this requester can carry, and this one
 						// fits the next: it goes first, the other
@@ -903,7 +909,7 @@ func computeMaxEncodedPayload(limit int) int {
 			},
 		},
 	}
-	resp, _, _ := responseFor(query, dns.Name([][]byte{}), nil, nil)
+	resp, _, _, _ := responseFor(query, dns.Name([][]byte{}), nil, nil)
 	// As in sendLoop.
 	resp.Answer = []dns.RR{
 		{

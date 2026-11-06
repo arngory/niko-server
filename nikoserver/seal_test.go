@@ -11,6 +11,7 @@ import (
 	"encoding/base32"
 	"encoding/binary"
 	"encoding/hex"
+	"io"
 	"math/big"
 	"net"
 	"os"
@@ -91,9 +92,9 @@ func sealingResolver(t *testing.T, node, clientZone, zone string, key []byte) st
 			if len(payload) > 8 && payload[8] >= 224 {
 				payload = append(payload[:8:8], payload[min(len(payload), 9+int(payload[8]-224)):]...)
 			}
-			sealed := make([]byte, 8, 8+2+len(payload))
+			sealed := make([]byte, 8, 8+4+len(payload))
 			rand.Read(sealed)
-			sealed = append(sealed, 0, 0)
+			sealed = append(sealed, 0, 0, 0, 0)
 			sealed = append(sealed, payload...)
 			specSealXOR(ku, sealed[:8], sealed[8:])
 			text := strings.ToLower(sealB32.EncodeToString(sealed))
@@ -232,5 +233,51 @@ func TestNekoServerDNSTTSealed(t *testing.T) {
 				t.Fatalf("an open query in a required zone: %+v %v", m, err)
 			}
 		})
+	}
+}
+
+// Small echoes through the sealing resolver come back as fast as open ones:
+// a sealed poll is not taken for a resolver's retry of the one before it
+// (the memo keys by the query with its N). Keyed without N, the second of
+// two polls got the first answer again and data waited up to 10 s.
+func TestNekoServerDNSTTSealedLatency(t *testing.T) {
+	privkey, _ := noise.GeneratePrivkey()
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "noise.key")
+	os.WriteFile(keyFile, []byte(hex.EncodeToString(privkey)+"\n"), 0o600)
+	sealKey := make([]byte, 32)
+	rand.Read(sealKey)
+	sealFile := filepath.Join(dir, "seal.keys")
+	os.WriteFile(sealFile, []byte(hex.EncodeToString(sealKey)+"\n"), 0o600)
+	zone := "t.example.com"
+	node := startNode(t, "dnstt", zone, map[string]any{"zone": zone, "private_key_file": keyFile,
+		"seal": "required", "seal_key_file": sealFile})
+	clientZone := "padpadpadpadpadpadpadpadpad." + zone
+	conn := sealedClient(t, sealingResolver(t, node, clientZone, zone, sealKey), clientZone, privkey)
+	defer conn.Close()
+	var total, worst time.Duration
+	const rounds = 8
+	for range rounds {
+		msg := make([]byte, 100)
+		rand.Read(msg)
+		start := time.Now()
+		if _, err := conn.Write(msg); err != nil {
+			t.Fatal(err)
+		}
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		echo := make([]byte, len(msg))
+		if _, err := io.ReadFull(conn, echo); err != nil {
+			t.Fatal(err)
+		}
+		d := time.Since(start)
+		total += d
+		worst = max(worst, d)
+		time.Sleep(300 * time.Millisecond) // the client polls in between
+	}
+	t.Logf("%d echoes: mean %v, worst %v", rounds, total/rounds, worst)
+	// Locally about 1 ms (3 ms under -race); keyed without N, 36 ms to a
+	// second on average, the worst up to 9 s.
+	if mean := total / rounds; mean > 30*time.Millisecond || worst > 3*time.Second {
+		t.Fatalf("echoes: mean %v, worst %v", mean, worst)
 	}
 }

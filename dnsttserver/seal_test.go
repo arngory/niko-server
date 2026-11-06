@@ -2,10 +2,12 @@ package dnsttserver
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func seq(from byte, n int) []byte {
@@ -18,7 +20,7 @@ func seq(from byte, n int) []byte {
 
 // sealQuery seals a query's inner payload as a client does (§3).
 func sealQuery(k *sealKey, nonce, inner []byte) []byte {
-	body := append([]byte{0, 0}, inner...)
+	body := append(make([]byte, sealCheckLen), inner...)
 	sealXOR(&k.up, nonce, body)
 	return append(append([]byte(nil), nonce...), body...)
 }
@@ -30,13 +32,13 @@ func TestSealVectors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	k := s.keys[0]
+	k := s.list()[0]
 	inner := append(seq(0xc0, 8), 0x01, 0xff)
 	query := sealQuery(k, seq(0xa0, 8), inner)
 	answer := k.answerWith([]byte{0x00, 0x02, 0xaa, 0xbb}, 1000, seq(0xb0, 8))
 	t.Logf("query payload %x", query)
 	t.Logf("answer data %x", answer)
-	const wantQuery = "a0a1a2a3a4a5a6a75184ff1dfa308abcd1fad419"
+	const wantQuery = "a0a1a2a3a4a5a6a751843fdcf8328cbad3f8132199b4"
 	const wantAnswer = "b0b1b2b3b4b5b6b7f77002e5cc82e741ca69b3f568b5facff046fa764c1646d7395735e3f34ca5e0f2082aeae570f04304a4571256c325042f0d9dd5cec5c254"
 	if hex.EncodeToString(query) != wantQuery || hex.EncodeToString(answer) != wantAnswer {
 		t.Fatalf("vectors changed")
@@ -59,26 +61,37 @@ func TestSeal(t *testing.T) {
 		payload []byte
 		key     *sealKey
 	}{
-		"current":     {sealQuery(s.keys[0], seq(1, 8), inner), s.keys[0]},
-		"previous":    {sealQuery(s.keys[1], seq(2, 8), inner), s.keys[1]},
+		"current":     {sealQuery(s.list()[0], seq(1, 8), inner), s.list()[0]},
+		"previous":    {sealQuery(s.list()[1], seq(2, 8), inner), s.list()[1]},
 		"another key": {sealQuery(newSealKey(other), seq(3, 8), inner), nil},
-		"short":       {seq(0, 9), nil},
+		"short":       {seq(0, 11), nil},
 	} {
 		got, key := s.open(c.payload)
 		if key != c.key || (key != nil && !bytes.Equal(got, inner)) {
 			t.Errorf("%s: key %p (want %p), inner %x", name, key, c.key, got)
 		}
 	}
-	// An open query: one in 65536 passes the check; this one does not.
-	if _, key := s.open(append(seq(0x40, 8), inner...)); key != nil {
-		t.Error("an open query opened")
+	// An open query whose ClientID makes the keystream start with its
+	// padding prefix (0xE3): with a check of two bytes, 1 in 256 of the
+	// session's queries passed; with four, only those whose three random
+	// padding bytes match too.
+	id := findClientID(t, s.list()[0], 0xe3)
+	opened := 0
+	for i := range 1 << 16 {
+		q := append(id[:], 0xe3, byte(i), byte(i>>8), 0x5a, 1, 2)
+		if _, key := s.open(q); key != nil {
+			opened++
+		}
+	}
+	if opened > 1 {
+		t.Errorf("%d of 65536 open queries of one session opened", opened)
 	}
 	off, _ := NewSeal(SealOff)
-	if _, key := off.open(sealQuery(s.keys[0], seq(1, 8), inner)); key != nil {
+	if _, key := off.open(sealQuery(s.list()[0], seq(1, 8), inner)); key != nil {
 		t.Error("a seal that is off opened a query")
 	}
 
-	k := s.keys[0]
+	k := s.list()[0]
 	for _, c := range []struct{ frames, room, want int }{
 		{0, 934, 64},    // an empty answer
 		{4, 934, 64},    // a small one
@@ -110,7 +123,7 @@ func TestLoadSeal(t *testing.T) {
 	path := filepath.Join(dir, "seal.keys")
 	os.WriteFile(path, []byte("# current, then previous\n"+hex.EncodeToString(seq(0, 32))+"\n\n"+hex.EncodeToString(seq(1, 32))+"\n"), 0o600)
 	s, err := LoadSeal(SealRequired, path)
-	if err != nil || len(s.keys) != 2 {
+	if err != nil || s.Keys() != 2 {
 		t.Fatalf("%v %+v", err, s)
 	}
 	os.WriteFile(path, []byte("abcd\n"), 0o600)
@@ -129,4 +142,64 @@ func TestLoadSeal(t *testing.T) {
 	if _, err := ParseSealMode("on"); err == nil {
 		t.Error("seal mode on taken")
 	}
+}
+
+// findClientID finds a ClientID whose keystream under k begins with b: an
+// open query of that session puts b where the seal's check starts.
+func findClientID(t *testing.T, k *sealKey, b byte) [8]byte {
+	t.Helper()
+	for i := range uint64(1 << 20) {
+		var id [8]byte
+		binary.BigEndian.PutUint64(id[:], i)
+		ks := make([]byte, 1)
+		sealXOR(&k.up, id[:], ks)
+		if ks[0] == b {
+			return id
+		}
+	}
+	t.Fatal("no ClientID found")
+	return [8]byte{}
+}
+
+// The keys change under a running seal: a new current key, the previous
+// one dropped; a file that does not parse keeps those in force.
+func TestSealWatchKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seal.keys")
+	a, b := seq(0, 32), seq(1, 32)
+	if err := os.WriteFile(path, []byte(hex.EncodeToString(a)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := LoadSeal(SealRequired, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	defer close(stop)
+	go s.WatchKeys(path, 10*time.Millisecond, stop, t.Logf)
+	opens := func(key []byte) bool {
+		_, k := s.open(sealQuery(newSealKey(key), seq(1, 8), seq(0x10, 9)))
+		return k != nil
+	}
+	wait := func(what string, ok func() bool) {
+		t.Helper()
+		for deadline := time.Now().Add(5 * time.Second); !ok(); {
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: keys %d", what, s.Keys())
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	if !opens(a) || opens(b) {
+		t.Fatal("before: wrong keys")
+	}
+	os.WriteFile(path, []byte(hex.EncodeToString(b)+"\n"+hex.EncodeToString(a)+"\n"), 0o600)
+	wait("a new key", func() bool { return s.Keys() == 2 && opens(a) && opens(b) })
+	os.WriteFile(path, []byte("not hex at all, and longer than before to change the size\n"), 0o600)
+	time.Sleep(50 * time.Millisecond)
+	if s.Keys() != 2 || !opens(a) || !opens(b) {
+		t.Fatal("a bad file changed the keys")
+	}
+	os.WriteFile(path, []byte(hex.EncodeToString(b)+"\n"), 0o600)
+	wait("the previous key gone", func() bool { return s.Keys() == 1 && !opens(a) && opens(b) })
 }
