@@ -33,12 +33,12 @@ func TestQueryName(t *testing.T) {
 		t.Fatalf("a dot in a label: %q %d %v", name, end, ok)
 	}
 	for what, bad := range map[string][]byte{
-		"254 characters":   probeQuery("b"+long, 16, 0),
-		"a response":       func() []byte { r := append([]byte(nil), q...); r[2] |= 0x80; return r }(),
-		"no question":      func() []byte { r := append([]byte(nil), q...); r[5] = 0; return r }(),
-		"compression":      append([]byte{0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 0xc0, 12}, 0, 16, 0, 1),
-		"cut short":        q[:20],
-		"no type":          q[:12+len("AbC.T.Example.COM")+2+2],
+		"254 characters": probeQuery("b"+long, 16, 0),
+		"a response":     func() []byte { r := append([]byte(nil), q...); r[2] |= 0x80; return r }(),
+		"no question":    func() []byte { r := append([]byte(nil), q...); r[5] = 0; return r }(),
+		"compression":    append([]byte{0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 0xc0, 12}, 0, 16, 0, 1),
+		"cut short":      q[:20],
+		"no type":        q[:12+len("AbC.T.Example.COM")+2+2],
 	} {
 		if _, _, ok := queryName(bad); ok {
 			t.Errorf("%s: taken", what)
