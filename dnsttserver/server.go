@@ -1121,6 +1121,9 @@ func run(privkey []byte, domains []dns.Name, upstream Dialer, dnsConn net.Packet
 
 	// The smallest requester size of each client (neko).
 	sizes := &clientSizes{overhead: seal.overhead()}
+	if stats == nil {
+		stats = &Stats{} // counted for no one (review 11: RunZones took nil)
+	}
 	sessions := newSessionTableStats(stats)
 
 	// Start up the virtual PacketConn for turbotunnel. (neko) Queues

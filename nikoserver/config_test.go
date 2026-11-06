@@ -143,3 +143,47 @@ func TestNekoServerZoneMatch(t *testing.T) {
 		}
 	}
 }
+
+// Zones that nest are refused, in a tunnel and in the front: a name under
+// both is either's (review 11); so are names over 253 characters, which
+// passed check and stopped the backend at its start.
+func TestNekoServerConfigZonesNestAndLength(t *testing.T) {
+	front := `{"schema":1,"role":"front","log":{"level":"warn"},
+		"backends":{"dns":{"socket":"/run/niko/dns/packet.sock","mode":"packet","uid":9110},
+			"mdns":{"socket":"/run/niko/mdns/packet.sock","mode":"packet","uid":9111}},
+		"dns":{"listen":["0.0.0.0:53"],"zones":[{"zone":"t.example.com","backend":"dns"},{"zone":"ZONE2","backend":"mdns"}]}}`
+	dnstt := `{"schema":1,"role":"backend","kind":"dnstt","log":{"level":"warn"},"socket":"/run/niko/dns/packet.sock",
+		"inner":"/run/niko/inner/vless.sock","options":{"zone":"ZONE1","zones":["ZONE2"],"private_key_file":"/run/credentials/niko-dns.service/dnstt.key"}}`
+	long := strings.Repeat("a.", 126) + "com" // 255 characters
+	for _, c := range []struct {
+		content, path string
+	}{
+		{strings.Replace(front, "ZONE2", "x.t.example.com", 1), "dns.zones[1].zone"},
+		{strings.Replace(front, "ZONE2", "example.com", 1), "dns.zones[1].zone"},
+		{strings.Replace(front, "ZONE2", long, 1), "dns.zones[1].zone"},
+		{strings.Replace(strings.Replace(dnstt, "ZONE1", "t.example.com", 1), "ZONE2", "x.T.example.com.", 1), "options.zones[0]"},
+		{strings.Replace(strings.Replace(dnstt, "ZONE1", "x.t.example.com", 1), "ZONE2", "t.example.com", 1), "options.zones[0]"},
+		{strings.Replace(strings.Replace(dnstt, "ZONE1", long, 1), "ZONE2", "s.example.net", 1), "options.zone"},
+		{strings.Replace(strings.Replace(dnstt, "ZONE1", "t.example.com", 1), "ZONE2", long, 1), "options.zones[0]"},
+	} {
+		errs := checkConfig(t, c.content)
+		found := false
+		for _, e := range errs {
+			found = found || e.Path == c.path
+		}
+		if !found {
+			t.Errorf("%s: no error at that path, got %v", c.path, errs)
+		}
+	}
+	// Siblings and a zone ending as another without a dot between are fine.
+	for _, ok := range []string{
+		strings.Replace(front, "ZONE2", "u.example.com", 1),
+		strings.Replace(front, "ZONE2", "at.example.com", 1),
+		strings.Replace(strings.Replace(dnstt, "ZONE1", "t.example.com", 1), "ZONE2", "at.example.com", 1),
+		strings.Replace(strings.Replace(dnstt, "ZONE1", strings.Repeat("a.", 125)+"com", 1), "ZONE2", "s.example.net", 1),
+	} {
+		if errs := checkConfig(t, ok); len(errs) > 0 {
+			t.Errorf("%v", errs)
+		}
+	}
+}

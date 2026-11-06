@@ -110,11 +110,12 @@ func newSessionTable() *sessionTable { return newSessionTableStats(&Stats{}) }
 // current sessions and handshakes.
 func newSessionTableStats(stats *Stats) *sessionTable {
 	t := &sessionTable{stats: stats, open: map[turbotunnel.ClientID]*sessionEntry{}}
-	stats.current = func() (int, int) {
+	current := func() (int, int) {
 		t.mu.Lock()
 		defer t.mu.Unlock()
 		return len(t.open), t.handshake
 	}
+	stats.current.Store(&current)
 	return t
 }
 

@@ -3,7 +3,9 @@ package dnsttserver
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"io"
+	"net"
 	"testing"
 	"time"
 
@@ -233,5 +235,51 @@ func TestSessionTableEvictsIdle(t *testing.T) {
 	tab.open[clientID(0)].seen = time.Now()
 	if tab.admit(clientID(3), startPacket(), dev) {
 		t.Fatal("a pending admission evicted")
+	}
+}
+
+// The stats socket may read before the session table exists: the table
+// gives its counts through an atomic pointer (review 11, -race).
+func TestStatsSnapshotBeforeTable(t *testing.T) {
+	stats := &Stats{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range 1000 {
+			stats.Snapshot(nil, nil)
+		}
+	}()
+	newSessionTableStats(stats)
+	<-done
+	if s := stats.Snapshot(nil, nil); s.Sessions != 0 || s.Handshakes != 0 {
+		t.Fatalf("%+v", s)
+	}
+}
+
+// RunZones without stats counts for no one (review 11: it panicked).
+func TestRunZonesNilStats(t *testing.T) {
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	privkey, _, err := GenerateKeypair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := hex.DecodeString(privkey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	errc := make(chan error, 1)
+	go func() { errc <- RunZones(key, []string{"t.example.com"}, conn, nil, nil, nil, nil) }()
+	time.Sleep(50 * time.Millisecond)
+	conn.Close()
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunZones did not return after its socket closed")
 	}
 }
