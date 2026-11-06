@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -115,11 +116,48 @@ func TestTaggedZone(t *testing.T) {
 		}
 	}
 
-	// What the front answers instead: NOERROR, no records, the question.
+	// What the front answers instead: NOERROR, no records, the question,
+	// and the OPT slipstream's server answers with (1232, DO, no options).
 	_, end, _ = queryName(q)
 	a := nodata(q, end)
 	if a[2]&0x84 != 0x84 || a[3]&0x0f != 0 || binary.BigEndian.Uint16(a[6:8]) != 0 || !bytes.Equal(a[12:end], q[12:end]) {
 		t.Fatalf("nodata %x", a)
+	}
+	if binary.BigEndian.Uint16(a[10:12]) != 1 || !bytes.Equal(a[end:], []byte{0, 0, 41, 0x04, 0xd0, 0, 0, 0x80, 0, 0, 0}) {
+		t.Fatalf("nodata's OPT %x", a[end:])
+	}
+	q = slipQuery(t, dnsttserver.Tag2(&other, epoch, packet), packet, zone, 16, false)
+	if _, end, _ = queryName(q); len(nodata(q, end)) != end {
+		t.Fatal("an OPT for a query without one")
+	}
+}
+
+// The labels decode only as the server's decoder reads them: base32 letters
+// and digits 2-7, any case, dots anywhere, a whole number of bytes, the
+// last character's unused bits zero (review: Go's decoder skips CR and LF
+// and takes any last bits).
+func TestSlipDecode(t *testing.T) {
+	data := []byte("tagged-zone-dat") // 15 bytes: 24 characters, no remainder
+	enc := strings.ToLower(slipBase32.EncodeToString(data))
+	if raw, ok := slipDecode(enc[:7] + "." + enc[7:]); !ok || !bytes.Equal(raw, data) {
+		t.Fatalf("%q: %x %v", enc, raw, ok)
+	}
+	for _, bad := range []string{
+		enc[:5] + "\n" + enc[5:], // CR and LF are bytes a label may hold
+		enc[:5] + "\r" + enc[5:],
+		enc + "======",
+		enc[:4] + "0" + enc[5:], // not in the alphabet
+		enc[:4] + "8" + enc[5:],
+		enc[:4] + "-" + enc[5:],
+		enc + "a",      // 1 left over: no whole byte
+		enc + "aaa",    // 3
+		enc + "aaaaaa", // 6
+		"ab",           // 0x00 with a set unused bit
+		"", ".",
+	} {
+		if raw, ok := slipDecode(bad); ok {
+			t.Errorf("%q decoded: %x", bad, raw)
+		}
 	}
 }
 
@@ -168,7 +206,8 @@ func TestTaggedZoneSlipstream(t *testing.T) {
 	}
 	port := udp.LocalAddr().(*net.UDPAddr).Port
 	udp.Close()
-	c := &FrontConfig{Schema: 1, Role: "front", DNS: &FrontDNS{Listen: []string{fmt.Sprintf("127.0.0.1:%d", port)},
+	statsSock := filepath.Join(dir, "front-stats.sock")
+	c := &FrontConfig{Schema: 1, Role: "front", DNS: &FrontDNS{Listen: []string{fmt.Sprintf("127.0.0.1:%d", port)}, StatsSocket: statsSock,
 		Zones: []DNSZone{{Zone: "s.example.com", Backend: "slip", Tag: "slipstream", AuthKeysFile: keys}}},
 		Backends: map[string]BackendRef{"slip": {Socket: sock, Mode: "packet", UID: os.Getuid()}}}
 	go RunFront(ctx, c, NewLogger("warn", io.Discard))
@@ -199,14 +238,34 @@ func TestTaggedZoneSlipstream(t *testing.T) {
 	if a[2]&0x80 == 0 || a[3]&0x0f != 0 || !bytes.Equal(a[:2], q[:2]) || !bytes.Equal(a[12:end], q[12:end]) {
 		t.Fatalf("the server's answer through the front: %x", a)
 	}
-	// The server's answer carries an OPT (the query had one): the front
-	// answers its own without.
-	if binary.BigEndian.Uint16(a[10:12]) != 1 {
-		t.Fatalf("the answer is not the server's (no OPT): %x", a)
+	// The front's counters tell whose answer it was: the server's and the
+	// front's read the same (an OPT of 1232, no records).
+	stats := func() (forwarded, answers, untagged uint64) {
+		t.Helper()
+		sc, err := net.Dial("unix", statsSock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer sc.Close()
+		var st struct{ Forwarded, Answers, Untagged uint64 }
+		if err := json.NewDecoder(sc).Decode(&st); err != nil {
+			t.Fatal(err)
+		}
+		return st.Forwarded, st.Answers, st.Untagged
+	}
+	fw, an, un := stats()
+	if fw == 0 || an == 0 || un != 0 || binary.BigEndian.Uint16(a[10:12]) != 1 {
+		t.Fatalf("the server's answer: forwarded %d, answers %d, untagged %d: %x", fw, an, un, a)
 	}
 	var other [32]byte
 	q = slipQuery(t, dnsttserver.Tag2(&other, dnsttserver.EpochOf(time.Now()), packet), packet, "s.example.com", 16, true)
-	if a := ask(q); binary.BigEndian.Uint16(a[10:12]) != 0 || binary.BigEndian.Uint16(a[6:8]) != 0 {
-		t.Fatalf("an untagged query's answer: %x", a)
+	b := ask(q)
+	_, endB, _ := queryName(q)
+	// The same but the question (another tag: another name).
+	if binary.BigEndian.Uint16(b[6:8]) != 0 || !bytes.Equal(b[2:12], a[2:12]) || !bytes.Equal(b[endB:], a[end:]) {
+		t.Fatalf("an untagged query's answer differs from the server's empty one:\n%x\n%x", b, a)
+	}
+	if fw2, _, un := stats(); fw2 != fw || un != 1 {
+		t.Fatalf("an untagged query: forwarded %d (was %d), untagged %d", fw2, fw, un)
 	}
 }
