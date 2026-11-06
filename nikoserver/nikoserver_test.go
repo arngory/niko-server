@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -516,10 +517,25 @@ func TestNekoServerDNSFrontStats(t *testing.T) {
 	}
 }
 
-// masterdnsEcho runs a client of the fork against a node and sends an echo
-// round through it, within wait: seal is NIKO_MDSEAL ("" for none), tagger
-// the device's tags (nil for none). An error when no echo comes back.
-func masterdnsEcho(resolver, key, zone, seal string, tagger func(nonce, frame []byte) [8]byte, wait time.Duration, dir string) error {
+// mdClient is a client of the fork against a node, run until stop.
+type mdClient struct {
+	conns  chan net.Conn
+	cancel context.CancelFunc
+	done   chan struct{} // closed when Run returns, err set before
+	err    error
+}
+
+// errNoEcho: the client ran through the wait and no echo came back: what a
+// node refusing it looks like. errClientExited: the client stopped on its
+// own (a config the fork refuses), which says nothing of the node.
+var (
+	errNoEcho       = errors.New("no echo within the wait")
+	errClientExited = errors.New("the client exited")
+)
+
+// startMasterdns runs a client of the fork: seal is NIKO_MDSEAL ("" for
+// none), tagger the device's tags (nil for none).
+func startMasterdns(resolver, key, zone, seal string, tagger func(nonce, frame []byte) [8]byte, dir string) *mdClient {
 	config := map[string]any{
 		"DOMAINS": []string{zone}, "PROTOCOL_TYPE": "TCP",
 		"DATA_ENCRYPTION_METHOD": 5, "ENCRYPTION_KEY": key, "LOG_LEVEL": "ERROR",
@@ -527,35 +543,107 @@ func masterdnsEcho(resolver, key, zone, seal string, tagger func(nonce, frame []
 	if seal != "" {
 		config["NIKO_MDSEAL"] = seal
 	}
-	conns := make(chan net.Conn)
-	ctx, cancel := context.WithTimeout(context.Background(), wait)
-	defer cancel()
-	go mdvembed.Run(ctx, mdvembed.Options{Config: config, Resolvers: []string{resolver}, WorkDir: dir, Conns: conns, Tagger: tagger})
+	ctx, cancel := context.WithCancel(context.Background())
+	c := &mdClient{conns: make(chan net.Conn), cancel: cancel, done: make(chan struct{})}
+	go func() {
+		c.err = mdvembed.Run(ctx, mdvembed.Options{Config: config, Resolvers: []string{resolver}, WorkDir: dir, Conns: c.conns, Tagger: tagger})
+		close(c.done)
+	}()
+	return c
+}
+
+// stop ends the client and waits for it, a while at most.
+func (c *mdClient) stop() {
+	c.cancel()
+	select {
+	case <-c.done:
+	case <-time.After(10 * time.Second):
+	}
+}
+
+// echo sends an echo round through a new connection of the client, within
+// wait.
+func (c *mdClient) echo(wait time.Duration) error {
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
 	local, remote := net.Pipe()
 	defer local.Close()
 	select {
-	case conns <- remote:
-	case <-ctx.Done():
-		return errors.New("the client did not take the connection")
+	case c.conns <- remote:
+	case <-c.done:
+		return fmt.Errorf("%w: %v", errClientExited, c.err)
+	case <-timer.C:
+		return fmt.Errorf("%w: the client did not take the connection", errNoEcho)
 	}
 	message := randomBytes(4000)
 	go local.Write(message)
-	deadline, _ := ctx.Deadline()
-	local.SetReadDeadline(deadline)
-	echo := make([]byte, len(message))
-	if _, err := io.ReadFull(local, echo); err != nil {
+	read := make(chan error, 1)
+	go func() {
+		echo := make([]byte, len(message))
+		_, err := io.ReadFull(local, echo)
+		if err == nil && !bytes.Equal(echo, message) {
+			err = errors.New("echo differs")
+		}
+		read <- err
+	}()
+	select {
+	case err := <-read:
 		return err
+	case <-c.done:
+		return fmt.Errorf("%w: %v", errClientExited, c.err)
+	case <-timer.C:
+		return errNoEcho
 	}
-	if !bytes.Equal(echo, message) {
-		return errors.New("echo differs")
-	}
-	return nil
 }
 
-// masterdns with mdseal-v1 and dnsauth (v0.11.0, the client's fork
-// 34d5ef9): required, a client that seals and tags with its device's key
-// reaches the inner stage; one that does not seal, does not tag, or tags
-// with another key gets no session.
+// masterdnsEcho runs a client against a node for one echo round within
+// wait.
+func masterdnsEcho(resolver, key, zone, seal string, tagger func(nonce, frame []byte) [8]byte, wait time.Duration, dir string) error {
+	c := startMasterdns(resolver, key, zone, seal, tagger, dir)
+	defer c.stop()
+	return c.echo(wait)
+}
+
+// deviceTagger tags masterdns queries with a device's key
+// (dnsauth-masterdns §2).
+func deviceTagger(k [32]byte) func(nonce, frame []byte) [8]byte {
+	return func(nonce, frame []byte) [8]byte {
+		return dnsttserver.Tag(&k, dnsttserver.EpochOf(time.Now()), append(append([]byte(nil), nonce...), frame...))
+	}
+}
+
+// readFrontStats reads the front's counters from its stats socket.
+func readFrontStats(path string) (DNSFrontSnapshot, error) {
+	var st DNSFrontSnapshot
+	c, err := net.Dial("unix", path)
+	if err != nil {
+		return st, err
+	}
+	defer c.Close()
+	c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	return st, json.NewDecoder(c).Decode(&st)
+}
+
+// writeKeys replaces a keys file whole, as raycontrol does (a rename): the
+// reread never sees it half written.
+func writeKeys(t *testing.T, path string, text string) {
+	t.Helper()
+	tmp := path + ".new"
+	if err := os.WriteFile(tmp, []byte(text), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// masterdns with mdseal-v1 and dnsauth (v0.11.0, the client's fork):
+// required, a client that seals and tags with its device's key reaches the
+// inner stage; one that does not seal, does not tag, or tags with another
+// key gets no session. Each refused one on a node of its own, all at once:
+// the client runs through its wait (it did not stop on a config of its
+// own), its queries reach the backend through the front, and no echo
+// comes back.
 func TestNekoServerMasterDNSSealAuth(t *testing.T) {
 	key := hex.EncodeToString(randomBytes(16))
 	dir := t.TempDir()
@@ -567,38 +655,70 @@ func TestNekoServerMasterDNSSealAuth(t *testing.T) {
 	authFile := filepath.Join(dir, "auth.keys")
 	os.WriteFile(authFile, []byte("d1 "+hex.EncodeToString(dev[:])+"\n"), 0o600)
 	zone := "v.example.com"
-	resolver := startNode(t, "masterdns", zone, map[string]any{
+	options := map[string]any{
 		"zones": []string{zone}, "encryption_method": 5, "encryption_key_file": keyFile,
 		"seal": "required", "auth": "required", "auth_keys_file": authFile,
-	})
-	tagger := func(k [32]byte) func(nonce, frame []byte) [8]byte {
-		return func(nonce, frame []byte) [8]byte {
-			return dnsttserver.Tag(&k, dnsttserver.EpochOf(time.Now()), append(append([]byte(nil), nonce...), frame...))
-		}
 	}
-	if err := masterdnsEcho(resolver, key, zone, "required", tagger(dev), 60*time.Second, t.TempDir()); err != nil {
+	resolver := startNode(t, "masterdns", zone, options)
+	if err := masterdnsEcho(resolver, key, zone, "required", deviceTagger(dev), 60*time.Second, t.TempDir()); err != nil {
 		t.Fatalf("sealed and tagged: %v", err)
 	}
-	// The three at once: each waits out its time.
 	var wg sync.WaitGroup
 	for what, c := range map[string]struct {
 		seal   string
 		tagger func(nonce, frame []byte) [8]byte
 	}{
-		"open":        {"", tagger(dev)},
+		"open":        {"", deviceTagger(dev)},
 		"untagged":    {"required", nil},
-		"another key": {"required", tagger(other)},
+		"another key": {"required", deviceTagger(other)},
 	} {
-		wg.Add(1)
+		stats := filepath.Join(t.TempDir(), "front-stats.sock")
+		resolver := startNodeFull(t, "masterdns", zone, options, "", "", stats)
 		dir := t.TempDir()
+		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := masterdnsEcho(resolver, key, zone, c.seal, c.tagger, 8*time.Second, dir); err == nil {
-				t.Errorf("%s: a session with seal and auth required", what)
+			if err := masterdnsEcho(resolver, key, zone, c.seal, c.tagger, 8*time.Second, dir); !errors.Is(err, errNoEcho) {
+				t.Errorf("%s: %v, want no echo with seal and auth required", what, err)
+			}
+			if st, err := readFrontStats(stats); err != nil || st.Forwarded == 0 {
+				t.Errorf("%s: the client's queries did not reach the backend: %+v %v", what, st, err)
 			}
 		}()
 	}
 	wg.Wait()
+}
+
+// The keys file reread (every 5 s): a device removed loses its live
+// session's answers, one added gets a session.
+func TestNekoServerMasterDNSRevoke(t *testing.T) {
+	key := hex.EncodeToString(randomBytes(16))
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "encryption.key")
+	os.WriteFile(keyFile, []byte(key), 0o600)
+	var dev, late [32]byte
+	copy(dev[:], randomBytes(32))
+	copy(late[:], randomBytes(32))
+	authFile := filepath.Join(dir, "auth.keys")
+	writeKeys(t, authFile, "d1 "+hex.EncodeToString(dev[:])+"\n")
+	zone := "v.example.com"
+	resolver := startNode(t, "masterdns", zone, map[string]any{
+		"zones": []string{zone}, "encryption_method": 5, "encryption_key_file": keyFile,
+		"seal": "required", "auth": "required", "auth_keys_file": authFile,
+	})
+	c := startMasterdns(resolver, key, zone, "required", deviceTagger(dev), t.TempDir())
+	defer c.stop()
+	if err := c.echo(60 * time.Second); err != nil {
+		t.Fatalf("before: %v", err)
+	}
+	writeKeys(t, authFile, "d2 "+hex.EncodeToString(late[:])+"\n")
+	time.Sleep(6 * time.Second) // a reread
+	if err := c.echo(8 * time.Second); !errors.Is(err, errNoEcho) {
+		t.Fatalf("a removed device's live session: %v, want no echo", err)
+	}
+	if err := masterdnsEcho(resolver, key, zone, "required", deviceTagger(late), 60*time.Second, t.TempDir()); err != nil {
+		t.Fatalf("a device added: %v", err)
+	}
 }
 
 // optional: a client of before (no seal, no tag) goes on as it did, and
@@ -620,10 +740,7 @@ func TestNekoServerMasterDNSOptional(t *testing.T) {
 	if err := masterdnsEcho(resolver, key, zone, "", nil, 60*time.Second, t.TempDir()); err != nil {
 		t.Fatalf("a client of before: %v", err)
 	}
-	tag := func(nonce, frame []byte) [8]byte {
-		return dnsttserver.Tag(&dev, dnsttserver.EpochOf(time.Now()), append(append([]byte(nil), nonce...), frame...))
-	}
-	if err := masterdnsEcho(resolver, key, zone, "optional", tag, 60*time.Second, t.TempDir()); err != nil {
+	if err := masterdnsEcho(resolver, key, zone, "optional", deviceTagger(dev), 60*time.Second, t.TempDir()); err != nil {
 		t.Fatalf("a client that seals and tags: %v", err)
 	}
 }

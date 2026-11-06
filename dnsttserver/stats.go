@@ -76,8 +76,11 @@ type StatsSnapshot struct {
 	SealUnsealed      uint64 `json:"seal_unsealed"`
 	SealRefused       uint64 `json:"seal_refused"`
 	// Zones are each zone's queries with a device's valid dnsauth tag:
-	// which zone of the tunnel clients reach (raycontrol dnszones-v1),
-	// which no one without a device's key can make up; none with auth off.
+	// which zones of the tunnel the clients reach (raycontrol
+	// dnszones-v1); none with auth off. A hint, not proof: the tag does not
+	// cover the zone, so whoever sees a device's query can send it again in
+	// any zone, and a resolver's retries count again; without a device's
+	// key or a query of its, none can be made up.
 	Zones map[string]uint64 `json:"zones,omitempty"`
 }
 

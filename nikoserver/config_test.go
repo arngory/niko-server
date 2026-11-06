@@ -243,3 +243,53 @@ func TestNekoServerConfigReview12(t *testing.T) {
 		}
 	}
 }
+
+// Review 13: a name the zones are delegated to that lies in a zone is
+// refused (the front would send the queries for its address to the
+// tunnel); a stats socket on the path of any file the process uses, as
+// written or cleaned, is refused (it is removed before the listen); one
+// tunnel's ns compare as names.
+func TestNekoServerConfigReview13(t *testing.T) {
+	front := `{"schema":1,"role":"front","log":{"level":"warn"},
+		"backends":{"dns":{"socket":"/run/niko/dns/packet.sock","mode":"packet","uid":9110}},
+		"dns":{"listen":["0.0.0.0:53"],"probe_key_file":"/run/niko/front/dnsprobe.key","zones":[ZONES]}}`
+	dnstt := `{"schema":1,"role":"backend","kind":"dnstt","log":{"level":"warn"},"socket":"/run/niko/dns/packet.sock",
+		"inner":"/run/niko/inner/vless.sock","options":{"zone":"t.example.com","private_key_file":"/run/credentials/niko-dns.service/dnstt.key",
+		"auth":"optional","auth_keys_file":"/run/niko/dns-in/auth.keys","seal":"optional","seal_key_file":"/run/niko/dns-in/seal.keys"}}`
+	entry := `{"zone":"%s","backend":"dns","ns":["%s"]}`
+	zones := func(es ...string) string { return strings.Replace(front, "ZONES", strings.Join(es, ","), 1) }
+	stats := func(path string) string {
+		return strings.Replace(dnstt, `"inner":`, `"stats_socket":"`+path+`","inner":`, 1)
+	}
+	for _, c := range []struct{ content, path string }{
+		{zones(fmt.Sprintf(entry, "t.example.com", "ns.t.example.com")), "dns.zones[0].ns[0]"},
+		{zones(fmt.Sprintf(entry, "t.example.com", "T.example.com.")), "dns.zones[0].ns[0]"},
+		{zones(fmt.Sprintf(entry, "t.example.com", "ns.s.example.net"), fmt.Sprintf(entry, "s.example.net", "ns.s.example.net")), "dns.zones[0].ns[0]"},
+		{strings.Replace(zones(fmt.Sprintf(entry, "t.example.com", "ns.example.com")), `"zones":`, `"stats_socket":"/run/niko//dns/./packet.sock","zones":`, 1), "dns.stats_socket"},
+		{strings.Replace(zones(fmt.Sprintf(entry, "t.example.com", "ns.example.com")), `"zones":`, `"stats_socket":"/run/niko/front/dnsprobe.key","zones":`, 1), "dns.stats_socket"},
+		{stats("/run/niko//dns/packet.sock"), "stats_socket"},
+		{stats("/run/credentials/niko-dns.service/dnstt.key"), "stats_socket"},
+		{stats("/run/niko/dns-in/auth.keys"), "stats_socket"},
+		{stats("/run/niko/dns-in/./seal.keys"), "stats_socket"},
+		{stats("/run/niko/inner/vless.sock"), "stats_socket"},
+	} {
+		errs := checkConfig(t, c.content)
+		found := false
+		for _, e := range errs {
+			found = found || e.Path == c.path
+		}
+		if !found {
+			t.Errorf("%s: no error at that path, got %v", c.path, errs)
+		}
+	}
+	for _, ok := range []string{
+		// A zone under the name, and one tunnel's ns as one name.
+		zones(fmt.Sprintf(entry, "t.ns.example.com", "ns.example.com")),
+		zones(fmt.Sprintf(entry, "t.example.com", "NS.example.net."), fmt.Sprintf(entry, "s.example.org", "ns.example.net")),
+		stats("/run/niko/dns/stats.sock"),
+	} {
+		if errs := checkConfig(t, ok); len(errs) > 0 {
+			t.Errorf("%v", errs)
+		}
+	}
+}

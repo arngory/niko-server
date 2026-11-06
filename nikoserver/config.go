@@ -217,6 +217,16 @@ func canonicalName(name string) string {
 	return string(b)
 }
 
+// sameName reports whether two names are one as the front and dnstt
+// compare them.
+func sameName(a, b string) bool { return canonicalName(a) == canonicalName(b) }
+
+// samePath reports whether two paths, both set, name one file as written:
+// "a//b" and "a/./b" are "a/b"; links are not followed (review 13).
+func samePath(a, b string) bool {
+	return a != "" && b != "" && filepath.Clean(a) == filepath.Clean(b)
+}
+
 // nestedIn is the zone of zones that z is nested in, or that is nested in
 // z, "" when none: a name under both is either's (review 11: the front
 // took the first listed, dnstt the longest, and a label of the outer
@@ -336,12 +346,19 @@ func (c *FrontConfig) validate() []ConfigError {
 		checkSocket(&e, "dns.stats_socket", c.DNS.StatsSocket)
 		// The front removes what is at the path before it listens there.
 		for name, b := range c.Backends {
-			if b.Socket == c.DNS.StatsSocket {
+			if samePath(b.Socket, c.DNS.StatsSocket) {
 				e.add("dns.stats_socket", "the socket of backend %q", name)
 			}
 		}
-		if c.DNS.StatsSocket == c.DNS.ProbeKeyFile {
+		if samePath(c.DNS.StatsSocket, c.DNS.ProbeKeyFile) {
 			e.add("dns.stats_socket", "the probe key file")
+		}
+		if c.UDP != nil {
+			for i, r := range c.UDP.Routes {
+				if samePath(c.DNS.StatsSocket, r.SalamanderPasswordFile) {
+					e.add("dns.stats_socket", "the salamander password file of udp.routes[%d]", i)
+				}
+			}
 		}
 	}
 	var seen []string
@@ -379,7 +396,7 @@ func (c *FrontConfig) validate() []ConfigError {
 		// beside the tunnel's sealed answers, and an apex of its own
 		// names would set it apart.
 		for j := range i {
-			if o := c.DNS.Zones[j]; o.Backend == z.Backend && (o.Probe != z.Probe || o.SealPad != z.SealPad || !slices.Equal(o.NS, z.NS)) {
+			if o := c.DNS.Zones[j]; o.Backend == z.Backend && (o.Probe != z.Probe || o.SealPad != z.SealPad || !slices.EqualFunc(o.NS, z.NS, sameName)) {
 				e.add(path, "probe, seal_pad and ns differ from dns.zones[%d] of the same backend", j)
 				break
 			}
@@ -387,6 +404,20 @@ func (c *FrontConfig) validate() []ConfigError {
 		for j, ns := range z.NS {
 			if n := strings.TrimSuffix(ns, "."); !dnsName.MatchString(n) || len(n) > 253 {
 				e.add(fmt.Sprintf("%s.ns[%d]", path, j), "not a DNS name: %q", ns)
+			}
+		}
+	}
+	// A name the zones are delegated to that is a zone or lies in one is
+	// the tunnel's: the front sends a resolver's query for its address to
+	// the backend, which has none (review 13).
+	for i, z := range c.DNS.Zones {
+		for j, ns := range z.NS {
+			n := canonicalName(ns)
+			for _, zone := range seen {
+				if n == zone || strings.HasSuffix(n, "."+zone) {
+					e.add(fmt.Sprintf("dns.zones[%d].ns[%d]", i, j), "%q is in zone %q: the front would send the queries for its address to the tunnel", ns, zone)
+					break
+				}
 			}
 		}
 	}
@@ -527,8 +558,14 @@ func (c *BackendConfig) validate() []ConfigError {
 			checkSocket(&e, "stats_socket", c.StatsSocket)
 		}
 		// The backend removes what is at the path before it listens there.
-		if c.StatsSocket == c.Socket || c.StatsSocket == c.Inner {
-			e.add("stats_socket", "the backend's socket or the inner stage's")
+		for _, f := range []struct{ path, what string }{
+			{c.Socket, "the backend's socket"}, {c.Inner, "the inner stage's socket"},
+			{c.Options.PrivateKeyFile, "options.private_key_file"}, {c.Options.AuthKeysFile, "options.auth_keys_file"},
+			{c.Options.SealKeyFile, "options.seal_key_file"}, {c.Options.EncryptionKeyFile, "options.encryption_key_file"},
+		} {
+			if samePath(c.StatsSocket, f.path) {
+				e.add("stats_socket", "the path of %s", f.what)
+			}
 		}
 	}
 	if c.Options.Probe != nil && c.Kind != "hy2-masq" && c.Kind != "hy2-obfs" {

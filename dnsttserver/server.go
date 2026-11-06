@@ -720,7 +720,9 @@ func recvLoop(domains []dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Qu
 		zone := zoneIndex(&query, domains)
 		resp, payload, sealed, key, device := responseFor(&query, domains[zone], auth, seal)
 		if device != "" {
-			// A device's valid tag in this zone: its clients reach it.
+			// A device's valid tag in this zone: its clients reach it, or
+			// someone who saw one of its queries sends it here (the tag
+			// does not cover the zone).
 			sessions.stats.tagged(zone)
 		}
 		size := requesterSize(&query)

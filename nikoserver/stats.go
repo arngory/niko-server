@@ -24,14 +24,16 @@ func serveStats(path string, snapshot func() any, log *Logger) (func(), error) {
 		return nil, err
 	}
 	go func() {
+		var backoff acceptBackoff
 		for {
 			c, err := ln.Accept()
 			if err != nil {
-				if !acceptAgain(err, log) {
+				if !backoff.again(err, log) {
 					return
 				}
 				continue
 			}
+			backoff.delay = 0
 			_ = c.SetDeadline(time.Now().Add(2 * time.Second))
 			_ = json.NewEncoder(c).Encode(snapshot())
 			c.Close()
@@ -41,17 +43,34 @@ func serveStats(path string, snapshot func() any, log *Logger) (func(), error) {
 	return func() { ln.Close() }, nil
 }
 
-// acceptAgain reports whether a stats socket's Accept error leaves the
-// socket serving: only its close ends it. Out of descriptors (EMFILE under
-// a flood of the front's own connections) waits a moment and goes on
-// (review 12: one EMFILE ended the stats for good, without a word).
-func acceptAgain(err error, log *Logger) bool {
+// acceptBackoff paces a stats socket's accept loop: an Accept error
+// leaves the socket serving, only its close ends it. Out of descriptors
+// (EMFILE under a flood of the front's own connections) waits and goes on
+// (review 12: one EMFILE ended the stats for good, without a word): 5 ms
+// at first, twice as long each time up to 1 s, from the start again after
+// an accept that works; each error said once until another comes (review
+// 13: 20 lines a second while the descriptors ran out).
+type acceptBackoff struct {
+	delay time.Duration
+	said  string
+}
+
+func (b *acceptBackoff) again(err error, log *Logger) bool {
 	if errors.Is(err, net.ErrClosed) {
 		return false
 	}
-	log.Warnf("stats socket: %v", err)
-	time.Sleep(50 * time.Millisecond)
+	if msg := err.Error(); msg != b.said {
+		b.said = msg
+		log.Warnf("stats socket: %v", err)
+	}
+	time.Sleep(b.next())
 	return true
+}
+
+// next is the wait after one more error.
+func (b *acceptBackoff) next() time.Duration {
+	b.delay = min(max(2*b.delay, 5*time.Millisecond), time.Second)
+	return b.delay
 }
 
 // startStats serves snapshot on path when path is set; a socket that
