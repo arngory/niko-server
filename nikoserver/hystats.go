@@ -194,7 +194,10 @@ func (t *sessions) serveStats(path string, log *Logger) (func(), error) {
 		for {
 			c, err := ln.Accept()
 			if err != nil {
-				return
+				if !acceptAgain(err, log) {
+					return
+				}
+				continue
 			}
 			go func() {
 				defer c.Close()

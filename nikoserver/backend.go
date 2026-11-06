@@ -97,17 +97,12 @@ func RunBackend(ctx context.Context, c *BackendConfig, log *Logger) error {
 		}
 		// The counters on the stats socket, for the node's metrics.
 		stats := &dnsttserver.Stats{Started: time.Now()}
-		if c.StatsSocket != "" {
-			stop, err := serveStats(c.StatsSocket, func() any { return stats.Snapshot(auth, seal) }, log)
-			if err != nil {
-				return envError("dnstt stats socket %s: %v", c.StatsSocket, err)
-			}
-			defer stop()
-		}
+		defer startStats(c.StatsSocket, func() any { return stats.Snapshot(auth, seal) }, log)()
 		// The zone and its spares (raycontrol dnszones-v1): one tunnel.
-		zones := []string{strings.TrimSuffix(c.Options.Zone, ".")}
+		// As the front compares them (canonicalName).
+		zones := []string{canonicalName(c.Options.Zone)}
 		for _, z := range c.Options.Zones {
-			zones = append(zones, strings.TrimSuffix(z, "."))
+			zones = append(zones, canonicalName(z))
 		}
 		err = dnsttserver.RunZones(key, zones, conn, dialInner, auth, seal, stats)
 		if ctx.Err() != nil {

@@ -29,6 +29,28 @@ type Stats struct {
 	// The current sessions and handshakes, from the session table, which
 	// comes after the stats socket may already read (review 11: a race).
 	current atomic.Pointer[func() (sessions, handshakes int)]
+	// Each zone's queries that carried a device's valid tag, set up by run
+	// as current is.
+	zones atomic.Pointer[zoneCounts]
+}
+
+// zoneCounts are the tagged queries of each zone, in the order of run's
+// domains (the main zone first).
+type zoneCounts struct {
+	names  []string
+	tagged []atomic.Uint64
+}
+
+// setZones starts the zones' counts.
+func (s *Stats) setZones(names []string) {
+	s.zones.Store(&zoneCounts{names: names, tagged: make([]atomic.Uint64, len(names))})
+}
+
+// tagged counts a query of zone i (run's domains) with a device's valid tag.
+func (s *Stats) tagged(i int) {
+	if z := s.zones.Load(); z != nil && i >= 0 && i < len(z.tagged) {
+		z.tagged[i].Add(1)
+	}
 }
 
 // StatsSnapshot is Stats at one moment, as the stats socket gives it (JSON),
@@ -53,6 +75,10 @@ type StatsSnapshot struct {
 	SealOpened        uint64 `json:"seal_opened"`
 	SealUnsealed      uint64 `json:"seal_unsealed"`
 	SealRefused       uint64 `json:"seal_refused"`
+	// Zones are each zone's queries with a device's valid dnsauth tag:
+	// which zone of the tunnel clients reach (raycontrol dnszones-v1),
+	// which no one without a device's key can make up; none with auth off.
+	Zones map[string]uint64 `json:"zones,omitempty"`
 }
 
 // Snapshot reads the counters, those of auth and seal too (either may be
@@ -69,6 +95,12 @@ func (s *Stats) Snapshot(auth *Auth, seal *Seal) StatsSnapshot {
 	}
 	if f := s.current.Load(); f != nil {
 		out.Sessions, out.Handshakes = (*f)()
+	}
+	if z := s.zones.Load(); z != nil && auth != nil && auth.Mode != AuthOff {
+		out.Zones = make(map[string]uint64, len(z.names))
+		for i, name := range z.names {
+			out.Zones[name] = z.tagged[i].Load()
+		}
 	}
 	if auth != nil {
 		out.AuthValid, out.AuthUntagged = auth.Valid.Load(), auth.Untagged.Load()

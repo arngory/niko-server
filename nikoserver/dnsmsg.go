@@ -9,8 +9,10 @@ import (
 // queryName returns the first question's name of a DNS query, lower case
 // (ASCII, RFC 4343) and without the final dot, or ok=false for anything
 // that is not a well-formed query (responses, no question, compression, a
-// name longer than 253 characters or with a dot inside a label). One copy:
-// it runs for every query the front reads.
+// name longer than 253 characters). A name with a dot inside a label is
+// "": it is in no zone, answered REFUSED as such names are (review 12:
+// dropped, it stood out). One copy: it runs for every query the front
+// reads.
 func queryName(msg []byte) (name string, questionEnd int, ok bool) {
 	if len(msg) < 12 || msg[2]&0x80 != 0 || binary.BigEndian.Uint16(msg[4:6]) == 0 {
 		return "", 0, false
@@ -18,6 +20,7 @@ func queryName(msg []byte) (name string, questionEnd int, ok bool) {
 	var buf [maxNameText]byte
 	n := 0
 	i := 12
+	dotted := false
 	for {
 		if i >= len(msg) {
 			return "", 0, false
@@ -44,7 +47,7 @@ func queryName(msg []byte) (name string, questionEnd int, ok bool) {
 			switch {
 			case c == '.':
 				// The name would read as other labels than it has.
-				return "", 0, false
+				dotted = true
 			case 'A' <= c && c <= 'Z':
 				c += 'a' - 'A'
 			}
@@ -56,6 +59,9 @@ func queryName(msg []byte) (name string, questionEnd int, ok bool) {
 	// type and class
 	if i+4 > len(msg) {
 		return "", 0, false
+	}
+	if dotted {
+		return "", i + 4, true
 	}
 	return string(buf[:n]), i + 4, true
 }

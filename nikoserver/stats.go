@@ -2,6 +2,7 @@ package nikoserver
 
 import (
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"sync/atomic"
@@ -26,7 +27,10 @@ func serveStats(path string, snapshot func() any, log *Logger) (func(), error) {
 		for {
 			c, err := ln.Accept()
 			if err != nil {
-				return
+				if !acceptAgain(err, log) {
+					return
+				}
+				continue
 			}
 			_ = c.SetDeadline(time.Now().Add(2 * time.Second))
 			_ = json.NewEncoder(c).Encode(snapshot())
@@ -35,6 +39,34 @@ func serveStats(path string, snapshot func() any, log *Logger) (func(), error) {
 	}()
 	log.Infof("stats on %s", path)
 	return func() { ln.Close() }, nil
+}
+
+// acceptAgain reports whether a stats socket's Accept error leaves the
+// socket serving: only its close ends it. Out of descriptors (EMFILE under
+// a flood of the front's own connections) waits a moment and goes on
+// (review 12: one EMFILE ended the stats for good, without a word).
+func acceptAgain(err error, log *Logger) bool {
+	if errors.Is(err, net.ErrClosed) {
+		return false
+	}
+	log.Warnf("stats socket: %v", err)
+	time.Sleep(50 * time.Millisecond)
+	return true
+}
+
+// startStats serves snapshot on path when path is set; a socket that
+// cannot be made is said and left out: the counters are not worth the
+// service (review 12: the front's TCP and UDP 443 went down with it).
+func startStats(path string, snapshot func() any, log *Logger) func() {
+	if path == "" {
+		return func() {}
+	}
+	stop, err := serveStats(path, snapshot, log)
+	if err != nil {
+		log.Warnf("stats socket %s: %v; no counters", path, err)
+		return func() {}
+	}
+	return stop
 }
 
 // dnsFrontStats counts what the DNS front did since it started, for the
@@ -46,7 +78,7 @@ type dnsFrontStats struct {
 	// and only read after.
 	queries map[string]*atomic.Uint64
 
-	malformed, refused, apex, probes, probesOverRate, forwarded, backendAway, answers, unmatched, truncated atomic.Uint64
+	malformed, refused, apex, probes, probesOverRate, forwarded, backendAway, answers, unmatched, truncated, dropped atomic.Uint64
 }
 
 func newDNSFrontStats(zones []string) *dnsFrontStats {
@@ -58,6 +90,9 @@ func newDNSFrontStats(zones []string) *dnsFrontStats {
 }
 
 // DNSFrontSnapshot is what the DNS front gives on dns.stats_socket (v0.11.0).
+// Its queries by zone are load, not reach: anyone can send a zone's name to
+// UDP 53. Which zone clients reach is dnstt's count of its zones' queries
+// that passed dnsauth (StatsSnapshot.Zones).
 type DNSFrontSnapshot struct {
 	Started        int64             `json:"started"`          // the front's start, Unix seconds
 	Queries        map[string]uint64 `json:"queries"`          // queries in a zone, by zone
@@ -66,11 +101,12 @@ type DNSFrontSnapshot struct {
 	Apex           uint64            `json:"apex"`             // answered at a zone's apex (SOA, NS)
 	Probes         uint64            `json:"probes"`           // dnsprobe-v1 probes answered
 	ProbesOverRate uint64            `json:"probes_over_rate"` // probes over the rate: no answer
-	Forwarded      uint64            `json:"forwarded"`        // queries passed to a backend
-	BackendAway    uint64            `json:"backend_away"`     // not passed: the backend away, or its queue full
+	Forwarded      uint64            `json:"forwarded"`        // queries put in a backend's queue (a lost connection drops what waits there)
+	BackendAway    uint64            `json:"backend_away"`     // not queued: the backend away, or its queue full
 	Answers        uint64            `json:"answers"`          // the backends' answers sent on
 	Unmatched      uint64            `json:"unmatched"`        // the backends' answers no query waited for: dropped
-	Truncated      uint64            `json:"truncated"`        // answers over the requester's size: sent with TC, no records
+	Truncated      uint64            `json:"truncated"`        // answers over the requester's size: sent with TC, no records (in answers)
+	Dropped        uint64            `json:"dropped"`          // the backends' messages not sent on: unreadable, no question to truncate to, a failed write
 }
 
 func (s *dnsFrontStats) snapshot() DNSFrontSnapshot {
@@ -79,7 +115,7 @@ func (s *dnsFrontStats) snapshot() DNSFrontSnapshot {
 		Malformed: s.malformed.Load(), Refused: s.refused.Load(), Apex: s.apex.Load(),
 		Probes: s.probes.Load(), ProbesOverRate: s.probesOverRate.Load(),
 		Forwarded: s.forwarded.Load(), BackendAway: s.backendAway.Load(),
-		Answers: s.answers.Load(), Unmatched: s.unmatched.Load(), Truncated: s.truncated.Load(),
+		Answers: s.answers.Load(), Unmatched: s.unmatched.Load(), Truncated: s.truncated.Load(), Dropped: s.dropped.Load(),
 	}
 	for z, n := range s.queries {
 		out.Queries[z] = n.Load()
