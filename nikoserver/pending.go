@@ -16,7 +16,7 @@ import (
 // it, as the forged query writes the requester's size itself: an answer of
 // up to 1232 bytes still goes to the victim (masterdns's MTU probes sent 4
 // to 6 KB, up to 136 times the query). The backends bound the rest:
-// masterdns (arngory/sing-box 15c95f4) answers a probe with at most 4 times
+// masterdns (arngory/sing-box 15c95f4 on) answers a probe with at most 4 times
 // its query, dnstt sizes its answers and answers a query without a device's
 // tag empty where dnsauth is required. Two generations of pendingGeneration
 // bound the table: an answer later than 5 to 10 seconds is dropped too, and
