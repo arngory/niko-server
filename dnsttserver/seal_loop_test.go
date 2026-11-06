@@ -75,7 +75,7 @@ func TestSealedPollsNotMemoized(t *testing.T) {
 	// The client's session is in the table (its polls carry no packets
 	// that would admit it): sendLoop answers it from its queues.
 	sessions := newSessionTable()
-	sessions.admit(id)
+	sessions.admit(id, startPacket())
 	go recvLoop(domain, conn, tt, ch, nil, seal, &clientSizes{overhead: seal.overhead()}, sessions)
 	go sendLoop(conn, tt, ch, sessions)
 

@@ -686,7 +686,7 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 				}
 				// (neko) KCP sees a new ClientID's packets only once
 				// the session table admits it.
-				if first && !sessions.admit(clientID) {
+				if first && !sessions.admit(clientID, p) {
 					break
 				}
 				// Feed the incoming packet to KCP.

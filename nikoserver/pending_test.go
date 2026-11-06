@@ -56,11 +56,27 @@ func TestRequesterSize(t *testing.T) {
 			t.Errorf("EDNS %d: %d, want %d", edns, got, want)
 		}
 	}
-	// Records before the OPT, or something else than an OPT: 512.
+	// Something else than an OPT: 512.
 	q, end := pendingQuery(t, 1, 1232)
 	q[end+2] = 1 // the record's type: A
 	if got := requesterSize(q, end); got != 512 {
 		t.Errorf("not an OPT: %d", got)
+	}
+	// An OPT after another record of the additional section, as dnstt
+	// finds it (review 7: the front read 512 and cut dnstt's answers).
+	name, _ := dns.ParseName("x.v.example.com")
+	m := dns.Message{ID: 1, Flags: 0x0100, Question: []dns.Question{{Name: name, Type: dns.RRTypeTXT, Class: dns.ClassIN}},
+		Additional: []dns.RR{{Name: name, Type: 1, Class: dns.ClassIN, Data: []byte{1, 2, 3, 4}},
+			{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 1232, Data: []byte{}}}}
+	b, err := m.WireFormat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, end, _ := queryName(b); requesterSize(b, end) != 1232 {
+		t.Errorf("an OPT after a compressed record: %d", requesterSize(b, end))
+	}
+	if requesterSize(b[:len(b)-3], end) != 512 {
+		t.Error("a cut message walked")
 	}
 }
 
@@ -155,7 +171,9 @@ func TestFrontAnswerSize(t *testing.T) {
 		{0, 4000, true}, // no OPT: 512 at most
 		{1232, 1200, false},
 		{1232, 4700, true}, // an MTU probe's kilobytes to a requester of 1232
-		{4096, 4000, false},
+		{4096, 1200, false},
+		{4096, 4000, true},  // 1232 at most, whatever the OPT
+		{65535, 5999, true}, // a forged OPT (review 7: 136 times the query)
 	} {
 		q, end := pendingQuery(t, 7, c.edns)
 		a := pendingAnswer(t, q, c.size)
@@ -165,7 +183,7 @@ func TestFrontAnswerSize(t *testing.T) {
 		switch {
 		case got == nil:
 			t.Errorf("EDNS %d, %d bytes: nothing came", c.edns, c.size)
-		case c.tc && (got[2]&0x02 == 0 || len(got) > 512):
+		case c.tc && (got[2]&0x02 == 0 || len(got) > maxBackendAnswer):
 			t.Errorf("EDNS %d, %d bytes: %d bytes came, TC %v", c.edns, c.size, len(got), got[2]&0x02 != 0)
 		case !c.tc && !bytes.Equal(got, a):
 			t.Errorf("EDNS %d, %d bytes: %d bytes came", c.edns, c.size, len(got))
