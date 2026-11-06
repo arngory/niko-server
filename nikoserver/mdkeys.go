@@ -31,7 +31,11 @@ func masterdnsKeys(text []byte) ([]string, error) {
 // not read or that the server refuses keeps the keys in force, said once.
 // The server closes the sessions of a key no longer listed at once.
 func watchMasterdnsKeys(ctx context.Context, file string, every time.Duration, set func([]string) error, log *Logger) {
-	cur, _ := os.ReadFile(file) //nolint:gosec // G304: the configured file
+	// No baseline of its own: the file read here could be newer than the
+	// one the server started with (a rotation during the start), and would
+	// then never be given. The first tick gives the file as it is; keys the
+	// server has already keep their sessions (review).
+	var cur []byte
 	var bad []byte
 	var readErr string
 	t := time.NewTicker(every)
@@ -63,7 +67,10 @@ func watchMasterdnsKeys(ctx context.Context, file string, every time.Duration, s
 			log.Warnf("masterdns keys %s not taken, the keys in force stay: %v", file, err)
 			continue
 		}
+		first := cur == nil
 		cur, bad = b, nil
-		log.Infof("masterdns keys reloaded: %d (the sessions of a key gone are closed)", len(keys))
+		if !first {
+			log.Infof("masterdns keys reloaded: %d (the sessions of a key gone are closed)", len(keys))
+		}
 	}
 }
