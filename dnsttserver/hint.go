@@ -137,21 +137,25 @@ type hintIndexes struct {
 	cur atomic.Pointer[hintIndex]
 }
 
-// get is the index of the keys k for the epoch now. A caller with keys
-// older than those in force, or a clock behind the index's, gets its own
-// index without replacing that one: the next caller would build it again.
+// get is the index of the keys k for the epoch now. A clock one epoch
+// behind the index's (a caller that read the time just before the epoch
+// moved on, or a small step back) gets the index in force: two of its three
+// epochs are there, and building one per call stalled every lookup after a
+// clock step back (review: 3 ms a query with 2000 keys). A clock further
+// back gets its index stored. A caller with keys older than those in force
+// gets its own index without replacing that one.
 func (h *hintIndexes) get(k *authKeys, now uint32) *hintIndex {
-	if x := h.cur.Load(); x != nil && x.keys == k && x.middle == now {
+	if x := h.cur.Load(); x != nil && x.keys == k && (x.middle == now || x.middle == now+1) {
 		return x
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	cur := h.cur.Load()
-	if cur != nil && cur.keys == k && cur.middle == now {
+	if cur != nil && cur.keys == k && (cur.middle == now || cur.middle == now+1) {
 		return cur
 	}
 	x := buildHintIndex(k, now, cur)
-	if cur == nil || k.gen > cur.keys.gen || (k.gen == cur.keys.gen && now > cur.middle) {
+	if cur == nil || k.gen >= cur.keys.gen {
 		h.cur.Store(x)
 	}
 	return x

@@ -351,10 +351,21 @@ func TestNekoServerConfigTaggedZone(t *testing.T) {
 	if errs := checkConfig(t, with(`,"tag":"slipstream","auth_keys_file":"/run/niko/slip-front/auth.keys"`)); len(errs) > 0 {
 		t.Errorf("%v", errs)
 	}
+	// A spare zone of the same backend, tagged with the same keys.
+	if errs := checkConfig(t, with(`,"tag":"slipstream","auth_keys_file":"/k"},{"zone":"t.example.com","backend":"slip","tag":"slipstream","auth_keys_file":"/k"`)); len(errs) > 0 {
+		t.Errorf("two zones of one backend, the same keys: %v", errs)
+	}
 	for z, path := range map[string]string{
-		`,"tag":"dnstt","auth_keys_file":"/k"`: "dns.zones[0].tag",
-		`,"tag":"slipstream"`:                  "dns.zones[0].auth_keys_file",
-		`,"auth_keys_file":"/run/niko/k"`:      "dns.zones[0].auth_keys_file",
+		`,"tag":"dnstt","auth_keys_file":"/k"`:                 "dns.zones[0].tag",
+		`,"tag":"slipstream"`:                                  "dns.zones[0].auth_keys_file",
+		`,"auth_keys_file":"/run/niko/k"`:                      "dns.zones[0].auth_keys_file",
+		`,"tag":"slipstream","auth_keys_file":"rel/auth.keys"`: "dns.zones[0].auth_keys_file",
+		// An untagged zone beside a tagged one of the same backend.
+		`,"tag":"slipstream","auth_keys_file":"/k"},{"zone":"t.example.com","backend":"slip"`: "dns.zones[1]",
+		// Two tagged zones of one backend with other keys.
+		`,"tag":"slipstream","auth_keys_file":"/k"},{"zone":"t.example.com","backend":"slip","tag":"slipstream","auth_keys_file":"/j"`: "dns.zones[1]",
+		// The keys file where the front puts its stats socket.
+		`,"tag":"slipstream","auth_keys_file":"/run/niko/front/stats.sock"}],"stats_socket":"/run/niko/front/stats.sock","zones":[{"zone":"x.example.com","backend":"slip","tag":"slipstream","auth_keys_file":"/run/niko/front/stats.sock"`: "dns.stats_socket",
 	} {
 		errs := checkConfig(t, with(z))
 		found := false

@@ -391,6 +391,11 @@ func (c *FrontConfig) validate() []ConfigError {
 				}
 			}
 		}
+		for i, z := range c.DNS.Zones {
+			if z.AuthKeysFile != "" && samePath(c.DNS.StatsSocket, z.AuthKeysFile) {
+				e.add("dns.stats_socket", "the auth keys file of dns.zones[%d]", i)
+			}
+		}
 	}
 	var seen []string
 	for i, z := range c.DNS.Zones {
@@ -429,6 +434,17 @@ func (c *FrontConfig) validate() []ConfigError {
 			e.add(path+".auth_keys_file", "a tagged zone needs the devices' keys")
 		case z.Tag == "" && z.AuthKeysFile != "":
 			e.add(path+".auth_keys_file", "only with tag")
+		case z.AuthKeysFile != "":
+			checkSocket(&e, path+".auth_keys_file", z.AuthKeysFile)
+		}
+		// A backend's zones are all tagged with the same keys, or none: an
+		// untagged zone of a tagged backend would pass its queries on
+		// unchecked (review).
+		for j := range i {
+			if o := c.DNS.Zones[j]; o.Backend == z.Backend && (o.Tag != z.Tag || (o.AuthKeysFile != z.AuthKeysFile && !samePath(o.AuthKeysFile, z.AuthKeysFile))) {
+				e.add(path, "tag and auth_keys_file differ from dns.zones[%d] of the same backend", j)
+				break
+			}
 		}
 		// One tunnel's zones answer alike (dnszones-v1): a spare zone
 		// without the main one's padding would answer probes unpadded
