@@ -798,3 +798,50 @@ func TestNekoServerMasterDNSOptional(t *testing.T) {
 		t.Fatalf("a client that seals and tags: %v", err)
 	}
 }
+
+// The service's key changes while the server runs (raycontrol
+// masterdns-key-rotation §3): with the new key first and the previous one
+// after it, a session on the previous one goes on and a client with the new
+// one gets in; with the previous key gone, its session closes and the new
+// key still works.
+func TestNekoServerMasterDNSKeyRotation(t *testing.T) {
+	oldKey, newKey := hex.EncodeToString(randomBytes(16)), hex.EncodeToString(randomBytes(16))
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "encryption.key")
+	writeKeys(t, keyFile, oldKey+"\n")
+	zone := "v.example.com"
+	resolver := startNode(t, "masterdns", zone, map[string]any{
+		"zones": []string{zone}, "encryption_method": 5, "encryption_key_file": keyFile, "seal": "optional",
+	})
+	c := startMasterdns(resolver, oldKey, zone, "", nil, t.TempDir())
+	defer c.stop()
+	if err := c.echo(60 * time.Second); err != nil {
+		t.Fatalf("before: %v", err)
+	}
+	writeKeys(t, keyFile, newKey+"\n"+oldKey+"\n")
+	time.Sleep(6 * time.Second) // reread every 5 s
+	if err := c.echo(20 * time.Second); err != nil {
+		t.Fatalf("the previous key's session in its grace: %v", err)
+	}
+	if err := masterdnsEcho(resolver, newKey, zone, "", nil, 60*time.Second, t.TempDir()); err != nil {
+		t.Fatalf("the new key: %v", err)
+	}
+	writeKeys(t, keyFile, newKey+"\n")
+	written := time.Now()
+	for {
+		err := c.echo(4 * time.Second)
+		if errors.Is(err, errNoEcho) && time.Since(written) > 6*time.Second {
+			break
+		}
+		if err != nil && !errors.Is(err, errNoEcho) {
+			t.Fatalf("the previous key's session after it went: %v", err)
+		}
+		if time.Since(written) > 20*time.Second {
+			t.Fatal("a session on a key gone still answers 20 s after")
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if err := masterdnsEcho(resolver, newKey, zone, "", nil, 60*time.Second, t.TempDir()); err != nil {
+		t.Fatalf("the new key afterwards: %v", err)
+	}
+}

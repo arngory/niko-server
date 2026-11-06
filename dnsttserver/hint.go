@@ -131,28 +131,42 @@ func buildHintIndex(k *authKeys, middle uint32, prev *hintIndex) *hintIndex {
 
 // hintIndexes holds the index in force: built again at once when the keys
 // change (a device revoked is not found from then on) and when the epoch
-// moves on.
+// moves on; and the one before it, for a clock behind.
 type hintIndexes struct {
-	mu  sync.Mutex
-	cur atomic.Pointer[hintIndex]
+	mu   sync.Mutex
+	cur  atomic.Pointer[hintIndex]
+	prev atomic.Pointer[hintIndex]
 }
 
-// get is the index of the keys k for the epoch now. A caller with keys
-// older than those in force, or a clock behind the index's, gets its own
-// index without replacing that one: the next caller would build it again.
+// get is the index of the keys k for the epoch now. A clock one epoch behind
+// the index in force (a caller that read the time just before the epoch
+// moved on, or a step back) gets the one before it, and a clock further back
+// an index built once and kept there: building one per call stalled every
+// lookup after a step back (review: 3 ms a query with 2000 keys). A caller
+// with keys older than those in force gets its own index without keeping it.
 func (h *hintIndexes) get(k *authKeys, now uint32) *hintIndex {
 	if x := h.cur.Load(); x != nil && x.keys == k && x.middle == now {
 		return x
 	}
+	if x := h.prev.Load(); x != nil && x.keys == k && x.middle == now {
+		return x
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	cur := h.cur.Load()
+	cur, prev := h.cur.Load(), h.prev.Load()
 	if cur != nil && cur.keys == k && cur.middle == now {
 		return cur
 	}
+	if prev != nil && prev.keys == k && prev.middle == now {
+		return prev
+	}
 	x := buildHintIndex(k, now, cur)
-	if cur == nil || k.gen > cur.keys.gen || (k.gen == cur.keys.gen && now > cur.middle) {
+	switch {
+	case cur == nil || k.gen > cur.keys.gen || (k.gen == cur.keys.gen && now > cur.middle):
+		h.prev.Store(cur)
 		h.cur.Store(x)
+	case k.gen == cur.keys.gen:
+		h.prev.Store(x) // a clock behind
 	}
 	return x
 }

@@ -52,7 +52,7 @@ func FuzzDNSQuery(f *testing.F) {
 		}
 		z := zoneOf(name, []string{zone})
 		if z == "" {
-			if r := refused(query, end); len(r) != end || r[3]&0x0f != 5 {
+			if r := refused(query, end); len(r) != end+len(frontOPT(query, end)) || r[3]&0x0f != 5 {
 				t.Fatalf("refused: %x", r)
 			}
 			return
