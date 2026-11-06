@@ -51,17 +51,22 @@ type keyMAC struct {
 	scratch tagScratch
 }
 
-// scanSlot is a kind's scan: one at a time, and a query that finds it busy
-// is refused at once rather than waiting (review 13: masterdns's few
-// workers waited behind scans of garbage holding one lock, the live
-// sessions' queries behind them). Its budget and scratch go with it.
+// scanSlot is a kind's scans. The recent devices are tried outside it,
+// with Device's HMACs: a returning client's probes and INIT cost a few HMACs
+// and wait for no scan (review 14: inside the slot, half of a new client's
+// parallel MTU probes were refused while another scan ran). The full pass
+// over the others is one at a time, and a query that finds one under way is
+// refused at once rather than waiting (review 13: masterdns's few workers
+// waited behind scans of garbage holding one lock, the live sessions'
+// queries behind them).
 type scanSlot struct {
-	mu      sync.Mutex
-	tokens  float64
-	last    time.Time
+	mu     sync.Mutex // the budget, held for its arithmetic only
+	tokens float64
+	last   time.Time
+
+	full    sync.Mutex // the full pass, taken with TryLock
 	scratch tagScratch
-	recent  []int  // the keys of the recent devices, tried first
-	skip    []bool // the same keys marked, for the full pass to skip
+	skip    []bool // the keys the recent pass tried, for the full pass to skip
 }
 
 // DeviceAuth checks the device tags of masterdns queries (raycontrol
@@ -197,68 +202,73 @@ func (a *DeviceAuth) Device(id string, tag [AuthTagLen]byte, msg []byte) bool {
 // Scan finds the device whose tag it is: the recent devices first, then
 // the others, the current epoch first; within kind's budget, of which only
 // the HMACs done are charged. A scan may start while the budget is above
-// zero and leave it below. A scan of the kind under way refuses it at once.
+// zero and leave it below. The full pass of the kind under way refuses the
+// others' at once; the recent devices are tried beside it.
 func (a *DeviceAuth) Scan(kind ScanKind, tag [AuthTagLen]byte, msg []byte) (string, bool) {
 	if kind < 0 || kind >= scanKinds {
 		kind = ScanSession
 	}
 	slot := &a.slots[kind]
-	if !slot.mu.TryLock() {
-		a.Throttled.Add(1)
-		return "", false
-	}
-	defer slot.mu.Unlock()
 	// The keys as they are now: a device revoked is not found.
 	k := a.keys.Load()
 	if k == nil || len(k.keys) == 0 {
 		a.Refused.Add(1)
 		return "", false
 	}
-	if a.refill(slot, kind, a.clock(), len(k.keys)) <= 0 {
+	if !a.budget(slot, kind, len(k.keys)) {
 		a.Throttled.Add(1)
 		return "", false
 	}
 	es := epochs(a.clock())
-	macs := k.scan[kind]
-	hmacs := 0
-	defer func() { slot.tokens -= float64(hmacs) }()
 	var t [AuthTagLen]byte
-	match := func(i int, e uint32) bool {
-		hmacs++
-		tagWith(macs[i], e, msg, &slot.scratch, &t)
-		return hmac.Equal(t[:], tag[:])
-	}
-	// The recent devices' keys, marked for the full pass to skip.
-	if cap(slot.skip) < len(k.keys) {
-		slot.skip = make([]bool, len(k.keys))
-	}
-	skip := slot.skip[:len(k.keys)]
-	clear(skip)
-	recent := slot.recent[:0]
-	a.recentMu.Lock()
-	for _, id := range a.recent {
-		for _, i := range k.byID[id] {
-			recent = append(recent, i)
-			skip[i] = true
-		}
-	}
-	a.recentMu.Unlock()
-	slot.recent = recent
+	var buf [2 * recentMax]int
+	recent := a.recentKeys(k, buf[:0])
+	hmacs := 0
 	for _, e := range es {
 		for _, i := range recent {
-			if match(i, e) {
+			hmacs++
+			m := k.device[i]
+			m.mu.Lock()
+			tagWith(m.h, e, msg, &m.scratch, &t)
+			m.mu.Unlock()
+			if hmac.Equal(t[:], tag[:]) {
+				a.charge(slot, hmacs)
 				id := k.keys[i].id
 				a.found(id)
 				return id, true
 			}
 		}
 	}
+	a.charge(slot, hmacs)
+	if !slot.full.TryLock() {
+		a.Throttled.Add(1)
+		return "", false
+	}
+	defer slot.full.Unlock()
+	// The recent pass may have spent what was left.
+	if !a.budget(slot, kind, len(k.keys)) {
+		a.Throttled.Add(1)
+		return "", false
+	}
+	if cap(slot.skip) < len(k.keys) {
+		slot.skip = make([]bool, len(k.keys))
+	}
+	skip := slot.skip[:len(k.keys)]
+	clear(skip)
+	for _, i := range recent {
+		skip[i] = true
+	}
+	macs := k.scan[kind]
+	hmacs = 0
+	defer func() { a.charge(slot, hmacs) }()
 	for _, e := range es {
 		for i := range k.keys {
 			if skip[i] {
 				continue
 			}
-			if match(i, e) {
+			hmacs++
+			tagWith(macs[i], e, msg, &slot.scratch, &t)
+			if hmac.Equal(t[:], tag[:]) {
 				id := k.keys[i].id
 				a.found(id)
 				return id, true
@@ -267,6 +277,35 @@ func (a *DeviceAuth) Scan(kind ScanKind, tag [AuthTagLen]byte, msg []byte) (stri
 	}
 	a.Refused.Add(1)
 	return "", false
+}
+
+// recentKeys appends the keys of the recent devices to dst, the latest
+// device's first.
+func (a *DeviceAuth) recentKeys(k *deviceKeys, dst []int) []int {
+	a.recentMu.Lock()
+	defer a.recentMu.Unlock()
+	for _, id := range a.recent {
+		dst = append(dst, k.byID[id]...)
+	}
+	return dst
+}
+
+// budget brings kind's budget up to now and reports whether a scan may
+// start: the budget is above zero.
+func (a *DeviceAuth) budget(slot *scanSlot, kind ScanKind, n int) bool {
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+	return a.refill(slot, kind, a.clock(), n) > 0
+}
+
+// charge takes the HMACs done from kind's budget.
+func (a *DeviceAuth) charge(slot *scanSlot, hmacs int) {
+	if hmacs == 0 {
+		return
+	}
+	slot.mu.Lock()
+	slot.tokens -= float64(hmacs)
+	slot.mu.Unlock()
 }
 
 // found puts a device first among the recent ones; ids no longer in the
@@ -283,9 +322,9 @@ func (a *DeviceAuth) found(id string) {
 	}
 }
 
-// refill brings kind's budget up to now and returns it: its share of the
-// rate (Auth.refill's), never under two full scans of n devices a second;
-// two seconds' worth may go at once.
+// refill brings kind's budget up to now and returns it, under slot.mu: its
+// share of the rate (Auth.refill's), never under two full scans of n
+// devices a second; two seconds' worth may go at once.
 func (a *DeviceAuth) refill(slot *scanSlot, kind ScanKind, now time.Time, n int) float64 {
 	rate := a.ScanHMACs
 	if rate <= 0 {

@@ -200,7 +200,7 @@ func (t *sessions) serveStats(path string, log *Logger) (func(), error) {
 				}
 				continue
 			}
-			backoff.delay = 0
+			backoff.ok()
 			go func() {
 				defer c.Close()
 				_ = c.SetDeadline(time.Now().Add(2 * time.Second))
