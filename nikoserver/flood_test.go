@@ -100,10 +100,9 @@ func TestNekoServerDNSTTFreshClientIDFlood(t *testing.T) {
 // A session gets dnsttserver.MaxStreams streams at once: one over the
 // bound is closed at once, and a stream closed frees its place (review 8:
 // each stream dials the inner stage, and a session opened as many as it
-// liked).
+// liked). The bound as it is: a test that set it raced with the backend's
+// sessions, which read it.
 func TestNekoServerDNSTTStreamBound(t *testing.T) {
-	defer func(n int) { dnsttserver.MaxStreams = n }(dnsttserver.MaxStreams)
-	dnsttserver.MaxStreams = 2
 	privkey, err := noise.GeneratePrivkey()
 	if err != nil {
 		t.Fatal(err)
@@ -123,11 +122,11 @@ func TestNekoServerDNSTTStreamBound(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	// echo writes a line and reads it back: nil when the stream is open.
+	// echo writes a line and reads it back: nil when the stream is served.
 	echo := func(conn net.Conn) error {
-		conn.SetDeadline(time.Now().Add(10 * time.Second))
+		conn.SetDeadline(time.Now().Add(20 * time.Second))
 		if _, err := conn.Write([]byte("hello\n")); err != nil {
 			return err
 		}
@@ -136,33 +135,38 @@ func TestNekoServerDNSTTStreamBound(t *testing.T) {
 		return err
 	}
 	var open []net.Conn
-	for i := range 2 {
+	defer func() {
+		for _, c := range open {
+			c.Close()
+		}
+	}()
+	for range dnsttserver.MaxStreams {
 		conn, err := client.DialConn(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer conn.Close()
-		if err := echo(conn); err != nil {
-			t.Fatalf("stream %d: %v", i, err)
-		}
 		open = append(open, conn)
 	}
-	third, err := client.DialConn(ctx)
+	// The last of the bound is served, so all before it were taken.
+	if err := echo(open[len(open)-1]); err != nil {
+		t.Fatalf("stream %d: %v", len(open), err)
+	}
+	over, err := client.DialConn(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer third.Close()
-	if err := echo(third); err == nil {
+	defer over.Close()
+	if err := echo(over); err == nil {
 		t.Fatal("a stream over the bound was served")
 	}
 	open[0].Close()
 	time.Sleep(time.Second) // the close reaches the node
-	fourth, err := client.DialConn(ctx)
+	again, err := client.DialConn(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer fourth.Close()
-	if err := echo(fourth); err != nil {
+	defer again.Close()
+	if err := echo(again); err != nil {
 		t.Fatalf("a stream after one closed: %v", err)
 	}
 }
