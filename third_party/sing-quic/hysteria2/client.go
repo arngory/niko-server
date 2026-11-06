@@ -860,6 +860,23 @@ func (c *clientConn) Write(p []byte) (n int, err error) {
 	return n, qtls.WrapError(err)
 }
 
+// CloseWrite ends this side of the stream and keeps reading the answer (neko,
+// from the client's fork arngory/sing-box 26325f0): without it a relay closed
+// the stream whole when the client half-closed (nc at the end of its input),
+// and the answer was lost. A request not written yet goes out first, with
+// nothing after it.
+func (c *clientConn) CloseWrite() error {
+	if !c.requestWritten {
+		buffer := protocol.WriteTCPRequest(c.destination.String(), nil)
+		defer buffer.Release()
+		if _, err := c.Stream.Write(buffer.Bytes()); err != nil {
+			return qtls.WrapError(err)
+		}
+		c.requestWritten = true
+	}
+	return qtls.WrapError(c.Stream.Close())
+}
+
 func (c *clientConn) LocalAddr() net.Addr {
 	return M.Socksaddr{}
 }
