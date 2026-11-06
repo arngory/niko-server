@@ -243,18 +243,25 @@ func EpochOf(t time.Time) uint32 { return uint32(t.Unix() / int64(AuthEpoch/time
 // takes untagged queries; otherwise ok is false and the query is answered
 // as by an empty zone.
 func (a *Auth) Check(payload []byte) (rest []byte, ok bool) {
+	rest, _, ok = a.CheckDevice(payload)
+	return rest, ok
+}
+
+// CheckDevice is Check that also names the device whose valid tag the
+// payload carries ("" without one).
+func (a *Auth) CheckDevice(payload []byte) (rest []byte, device string, ok bool) {
 	if a == nil || a.Mode == AuthOff {
-		return payload, true
+		return payload, "", true
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	untagged := func() ([]byte, bool) {
+	untagged := func() ([]byte, string, bool) {
 		if a.Mode == AuthOptional {
 			a.Untagged.Add(1)
-			return payload, true
+			return payload, "", true
 		}
 		a.Refused.Add(1)
-		return nil, false
+		return nil, "", false
 	}
 	if len(payload) < AuthTagLen+len(turbotunnel.ClientID{}) {
 		return untagged() // too short for a tag; nothing to remember
@@ -264,13 +271,15 @@ func (a *Auth) Check(payload []byte) (rest []byte, ok bool) {
 	switch a.validLocked(payload, head) {
 	case tagValid:
 		a.Valid.Add(1)
-		return payload[AuthTagLen:], true
+		var cid turbotunnel.ClientID
+		copy(cid[:], payload[AuthTagLen:])
+		return payload[AuthTagLen:], a.cache[cid], true // validLocked cached it
 	case tagThrottled:
 		// Not looked at: refused even in optional mode, since a tagged
 		// query read as untagged would feed the session garbage.
 		a.Throttled.Add(1)
 		a.Refused.Add(1)
-		return nil, false
+		return nil, "", false
 	case tagKnown:
 		return untagged() // no key explained this head before
 	case tagKnownBusy:
@@ -401,20 +410,6 @@ func (a *Auth) refill(now time.Time, n int) (tokens, burst float64) {
 	}
 	a.last = now
 	return a.tokens, burst
-}
-
-// DeviceOf is the device whose valid tag id's queries carried last, ""
-// for none (auth off, untagged in optional mode, not seen).
-func (a *Auth) DeviceOf(id turbotunnel.ClientID) string {
-	if a == nil || a.Mode == AuthOff {
-		return ""
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if dev, ok := a.cache[id]; ok {
-		return dev
-	}
-	return a.prev[id]
 }
 
 // cacheSession remembers the device a session's tag was valid for.
