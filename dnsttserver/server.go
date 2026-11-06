@@ -360,8 +360,10 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*
 			Name:  dns.Name{},
 			Type:  dns.RRTypeOPT,
 			Class: 4096, // responder's UDP payload size
-			TTL:   0,
-			Data:  []byte{},
+			// (neko) The query's DO bit, as RFC 3225 §3 asks and other
+			// servers answer: always 0 was a mark of the tunnel.
+			TTL:  rr.TTL & optDO,
+			Data: []byte{},
 		})
 		additional := &resp.Additional[0]
 
@@ -372,7 +374,7 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*
 			// of the request, then it MUST respond with
 			// RCODE=BADVERS."
 			resp.Flags |= dns.ExtendedRcodeBadVers & 0xf
-			additional.TTL = (dns.ExtendedRcodeBadVers >> 4) << 24
+			additional.TTL = (dns.ExtendedRcodeBadVers>>4)<<24 | rr.TTL&optDO
 			queryLog.Printf("BADVERS: EDNS version %d != 0", version)
 			return resp, nil, nil, "", ""
 		}
@@ -467,6 +469,10 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*
 	// dead.
 	return resp, payload, sealed, key, device
 }
+
+// optDO is the DO bit in an OPT record's TTL (RFC 3225 §3: a responder
+// copies it from the query).
+const optDO = 0x8000
 
 // carriesData reports whether a NOERROR response may carry downstream data:
 // an answer to one TXT question (neko: other types get NODATA).

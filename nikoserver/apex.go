@@ -76,7 +76,8 @@ func (a *apexZone) answer(query []byte) (reply []byte, ok bool) {
 		if len(resp.Additional) != 0 || (rr.TTL>>16)&0xff != 0 {
 			return nil, false
 		}
-		resp.Additional = []dns.RR{{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 4096, TTL: 0, Data: []byte{}}}
+		// The query's DO bit, as dnstt's answers (RFC 3225 §3).
+		resp.Additional = []dns.RR{{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 4096, TTL: rr.TTL & optDO, Data: []byte{}}}
 		limit = max(limit, int(rr.Class))
 	}
 	name, question := q.Question[0].Name, q.Question[0]

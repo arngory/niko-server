@@ -765,3 +765,17 @@ func TestAuthCheckDevice(t *testing.T) {
 		t.Fatal("no auth")
 	}
 }
+
+// dnstt's answers carry the query's DO bit (RFC 3225 §3), BADVERS too.
+func TestAnswerCopiesDO(t *testing.T) {
+	zone, _ := dns.ParseName("t.example.com")
+	name, _ := dns.ParseName("x.t.example.com")
+	for _, c := range []struct{ ttl, want uint32 }{{0, 0}, {0x8000, 0x8000}, {0x10000 | 0x8000, 0x8000}} {
+		q := &dns.Message{ID: 1, Flags: 0x0100, Question: []dns.Question{{Name: name, Type: dns.RRTypeTXT, Class: dns.ClassIN}},
+			Additional: []dns.RR{{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 1232, TTL: c.ttl, Data: []byte{}}}}
+		resp, _, _, _, _ := responseFor(q, zone, nil, nil)
+		if resp == nil || len(resp.Additional) != 1 || resp.Additional[0].TTL&0x8000 != c.want {
+			t.Errorf("query TTL %#x: answer %+v", c.ttl, resp)
+		}
+	}
+}

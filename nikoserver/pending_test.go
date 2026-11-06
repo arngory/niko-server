@@ -210,3 +210,46 @@ func TestFrontAnswerSize(t *testing.T) {
 		t.Errorf("an answer no query waited for: %d bytes went", len(got))
 	}
 }
+
+// The front's own answers carry the query's DO bit (RFC 3225 §3): the
+// apex, the probe, a truncated answer (from the backend's OPT, which has
+// the query's); always 0 was a mark of the tunnel.
+func TestAnswersCopyDO(t *testing.T) {
+	withDO := func(q []byte) []byte {
+		q = append([]byte(nil), q...)
+		q[len(q)-4] |= 0x80 // the last record is the OPT: its flags' first byte
+		return q
+	}
+	optTTL := func(t *testing.T, reply []byte) uint32 {
+		t.Helper()
+		m, err := dns.MessageFromWireFormat(reply)
+		if err != nil || len(m.Additional) != 1 || m.Additional[0].Type != dns.RRTypeOPT {
+			t.Fatalf("%+v %v", m, err)
+		}
+		return m.Additional[0].TTL
+	}
+	a := newApexZone("t.example.com", []string{"ns1.example.com"}, 1_800_000_000)
+	for _, do := range []bool{false, true} {
+		q := probeQuery("t.example.com", 6, 1232)
+		if do {
+			q = withDO(q)
+		}
+		reply, ok := a.answer(q)
+		if !ok || (optTTL(t, reply)&0x8000 != 0) != do {
+			t.Fatalf("apex, DO %v: %x", do, reply)
+		}
+	}
+	key := bytes.Repeat([]byte{7}, 32)
+	p := newDNSProbe(key)
+	l := probeLabel(key, "t.example.com", false, uint32(time.Now().Unix()/60), [8]byte{1})
+	q := withDO(probeQuery(l+".t.example.com", 16, 1232))
+	name, end, _ := queryName(q)
+	if reply, probe := p.answer(q, name, end, "t.example.com", netip.MustParseAddr("198.51.100.7"), false); !probe || optTTL(t, reply)&0x8000 == 0 {
+		t.Fatalf("probe: DO not copied")
+	}
+	q, end = pendingQuery(t, 0x0104, 1232)
+	answer := withDO(pendingAnswer(t, q, 4000))
+	if tc := truncated(answer); optTTL(t, tc)&0x8000 == 0 || len(tc) != end+len(truncatedOPT) {
+		t.Fatalf("truncated: DO not copied: % x", tc)
+	}
+}
