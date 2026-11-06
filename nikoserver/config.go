@@ -508,15 +508,40 @@ func checkBackendTLS(e *configErrors, t *BackendTLS, missing string) {
 	}
 }
 
-// zoneOf returns the zone that name falls into (by labels), or "".
+// zoneOf returns the zone of zones (lower case) that name falls into, by
+// labels, or "". ASCII case only (RFC 4343) and no copies: the front asks
+// for every query.
 func zoneOf(name string, zones []string) string {
-	name = strings.ToLower(strings.TrimSuffix(name, "."))
+	name = strings.TrimSuffix(name, ".")
 	for _, zone := range zones {
-		if name == zone || strings.HasSuffix(name, "."+zone) {
+		switch {
+		case len(name) == len(zone) && equalFoldASCII(name, zone):
+			return zone
+		case len(name) > len(zone) && name[len(name)-len(zone)-1] == '.' && equalFoldASCII(name[len(name)-len(zone):], zone):
 			return zone
 		}
 	}
 	return ""
+}
+
+// equalFoldASCII reports whether a and b are equal ignoring ASCII case.
+func equalFoldASCII(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		x, y := a[i], b[i]
+		if 'A' <= x && x <= 'Z' {
+			x += 'a' - 'A'
+		}
+		if 'A' <= y && y <= 'Z' {
+			y += 'a' - 'A'
+		}
+		if x != y {
+			return false
+		}
+	}
+	return true
 }
 
 func (t *FrontTCP) validate(e *configErrors, backends map[string]BackendRef) {
