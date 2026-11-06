@@ -90,7 +90,7 @@ require (
 
 replace github.com/sagernet/sing-box => github.com/arngory/sing-box v1.14.5-0.20261102040805-34eaa8c9c5a9
 
-replace masterdnsvpn-go => github.com/arngory/sing-box/third_party/masterdnsvpn v0.0.0-20261106154806-34d5ef9e8334
+replace masterdnsvpn-go => github.com/arngory/sing-box/third_party/masterdnsvpn v0.0.0-20261106163231-0ca8951d451e
 
 replace github.com/yggdrasil-network/yggdrasil-go => github.com/arngory/yggdrasil-go v0.5.16-0.20261103204312-0db15d43777a
 

@@ -191,14 +191,16 @@ func (t *sessions) serveStats(path string, log *Logger) (func(), error) {
 		return nil, err
 	}
 	go func() {
+		var backoff acceptBackoff
 		for {
 			c, err := ln.Accept()
 			if err != nil {
-				if !acceptAgain(err, log) {
+				if !backoff.again(err, log) {
 					return
 				}
 				continue
 			}
+			backoff.delay = 0
 			go func() {
 				defer c.Close()
 				_ = c.SetDeadline(time.Now().Add(2 * time.Second))
