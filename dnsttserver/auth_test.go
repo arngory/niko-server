@@ -546,7 +546,7 @@ func TestSendLoopOversizeWaits(t *testing.T) {
 	tt.WriteTo(small, id)
 	out := make(chan []byte, 4)
 	ch := make(chan *record, 1)
-	go sendLoop(capture{out: out}, tt, ch)
+	go sendLoop(capture{out: out}, tt, ch, nil)
 	zone, _ := dns.ParseName("x.t.example.com")
 	ch <- &record{Resp: &dns.Message{ID: 1, Flags: 0x8400, Question: []dns.Question{{Name: zone, Type: dns.RRTypeTXT, Class: dns.ClassIN}}},
 		Addr: turbotunnel.DummyAddr{}, ClientID: id, Size: 512}
@@ -593,7 +593,7 @@ func TestSendLoopStashSwap(t *testing.T) {
 	tt.WriteTo(next, id)
 	out := make(chan []byte, 4)
 	ch := make(chan *record, 1)
-	go sendLoop(capture{out: out}, tt, ch)
+	go sendLoop(capture{out: out}, tt, ch, nil)
 	zone, _ := dns.ParseName("x.t.example.com")
 	ch <- &record{Resp: &dns.Message{ID: 1, Flags: 0x8400, Question: []dns.Question{{Name: zone, Type: dns.RRTypeTXT, Class: dns.ClassIN}}},
 		Addr: turbotunnel.DummyAddr{}, ClientID: id, Size: 512}
@@ -633,7 +633,7 @@ func TestSendLoopMemo(t *testing.T) {
 	tt.WriteTo(next, id)
 	out := make(chan []byte, 8)
 	ch := make(chan *record, 8)
-	go sendLoop(capture{out: out}, tt, ch)
+	go sendLoop(capture{out: out}, tt, ch, nil)
 	ask := func(name, key string, size int) []byte {
 		t.Helper()
 		q, _ := dns.ParseName(name)

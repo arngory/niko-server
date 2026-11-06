@@ -179,10 +179,6 @@ func (p *dnsProbe) answer(query []byte, name string, questionEnd int, zone strin
 	if sent := binary.BigEndian.Uint32(b[2:6]); sent+probeSkew < minute || sent > minute+probeSkew {
 		return nil, false
 	}
-	q, err := dns.MessageFromWireFormat(query)
-	if err != nil || len(q.Question) != 1 {
-		return nil, false
-	}
 	// No replay set: the answer to a label is the same whoever asks, and
 	// on the wire it is one more answer of the tunnel. A censor that
 	// races the client's query to the node learns nothing, and the
@@ -192,8 +188,13 @@ func (p *dnsProbe) answer(query []byte, name string, questionEnd int, zone strin
 	if large {
 		cost = probeLargeCost
 	}
+	// The rate first: a probe over it costs no parse of the message.
 	if !p.allow(src, cost, now) {
 		return nil, true
+	}
+	q, err := dns.MessageFromWireFormat(query)
+	if err != nil || len(q.Question) != 1 {
+		return nil, false
 	}
 	var nonce [probeNonceLen]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
