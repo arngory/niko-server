@@ -104,6 +104,7 @@ type dnsFrontStats struct {
 	queries map[string]*atomic.Uint64
 
 	malformed, refused, apex, probes, probesOverRate, forwarded, backendAway, answers, unmatched, truncated, dropped, untagged, replayed atomic.Uint64
+	replayTurns                                                                                                                          *atomic.Uint64 // the front's, set once before it serves
 }
 
 func newDNSFrontStats(zones []string) *dnsFrontStats {
@@ -133,7 +134,8 @@ type DNSFrontSnapshot struct {
 	Truncated      uint64            `json:"truncated"`        // answers over the requester's size: sent with TC, no records (in answers)
 	Dropped        uint64            `json:"dropped"`          // the backends' messages not sent on: unreadable, no question to truncate to, a failed write
 	Untagged       uint64            `json:"untagged"`         // queries of a tagged zone (slipstream) without a device's tag: NOERROR, the backend sees none (v0.13.0)
-	Replayed       uint64            `json:"replayed"`         // queries of a tagged zone whose tag was seen before (copies): NOERROR, the backend sees none (v0.13.0)
+	Replayed       uint64            `json:"replayed"`         // queries of a tagged zone whose tag was seen before (copies): NOERROR, or nothing within 5 s of the original; the backend sees none (v0.13.0)
+	ReplayTurns    uint64            `json:"replay_turns"`     // generations of the memory of tagged fields started early (a load past ~870 queries a second): copies older than that reach the server, which drops them (v0.13.0)
 }
 
 func (s *dnsFrontStats) snapshot() DNSFrontSnapshot {
@@ -142,10 +144,17 @@ func (s *dnsFrontStats) snapshot() DNSFrontSnapshot {
 		Malformed: s.malformed.Load(), Refused: s.refused.Load(), Apex: s.apex.Load(),
 		Probes: s.probes.Load(), ProbesOverRate: s.probesOverRate.Load(),
 		Forwarded: s.forwarded.Load(), BackendAway: s.backendAway.Load(),
-		Answers: s.answers.Load(), Unmatched: s.unmatched.Load(), Truncated: s.truncated.Load(), Dropped: s.dropped.Load(), Untagged: s.untagged.Load(), Replayed: s.replayed.Load(),
+		Answers: s.answers.Load(), Unmatched: s.unmatched.Load(), Truncated: s.truncated.Load(), Dropped: s.dropped.Load(), Untagged: s.untagged.Load(), Replayed: s.replayed.Load(), ReplayTurns: loadOrZero(s.replayTurns),
 	}
 	for z, n := range s.queries {
 		out.Queries[z] = n.Load()
 	}
 	return out
+}
+
+func loadOrZero(v *atomic.Uint64) uint64 {
+	if v == nil {
+		return 0
+	}
+	return v.Load()
 }

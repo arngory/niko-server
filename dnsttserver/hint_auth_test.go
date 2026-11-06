@@ -183,21 +183,20 @@ func TestHintIndexShiftAndStale(t *testing.T) {
 	if x0.byHint[2][x0.hints[0][2]] == nil || x1.byHint[1][x0.hints[0][2]] == nil {
 		t.Fatal("the shifted slot lost its keys")
 	}
-	// A clock one epoch behind gets the index in force, not one built for
-	// it on every call.
-	if back := h.get(k, e); back != x1 || h.cur.Load() != x1 {
-		t.Fatal("a caller one epoch behind did not get the index in force")
+	// A clock one epoch behind gets the index before the one in force (its
+	// own window, review), not one built on every call.
+	if back := h.get(k, e); back != x0 || h.cur.Load() != x1 {
+		t.Fatal("a caller one epoch behind did not get the previous index")
 	}
 	// A clock stepped further back: its index is built once and kept
-	// (review: a build per lookup), and the clock coming back builds again.
+	// beside the one in force, and the clock coming back finds that.
 	far := h.get(k, e-5)
-	if far.middle != e-5 || h.get(k, e-5) != far || h.cur.Load() != far {
+	if far.middle != e-5 || h.get(k, e-5) != far || h.cur.Load() != x1 {
 		t.Fatal("the index of a clock stepped back is not kept")
 	}
-	if x := h.get(k, e+1); x.middle != e+1 || h.cur.Load() != x {
-		t.Fatal("the clock back: no index for it")
+	if h.get(k, e+1) != x1 {
+		t.Fatal("the clock back: not the index in force")
 	}
-	x1 = h.cur.Load()
 	// Keys read later win; a caller still holding the old ones does not
 	// put them back.
 	k2, _ := parseAuthKeys(text)
