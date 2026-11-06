@@ -69,9 +69,11 @@ func queryName(msg []byte) (name string, questionEnd int, ok bool) {
 // maxNameText is the longest name as text: 255 octets on the wire.
 const maxNameText = 253
 
-// refused answers a query with REFUSED: same ID, opcode and RD, the question echoed.
+// refused answers a query with REFUSED: same ID, opcode and RD, the question
+// echoed, and an OPT when the query had one (RFC 6891 §7).
 func refused(query []byte, questionEnd int) []byte {
-	answer := make([]byte, questionEnd)
+	opt := frontOPT(query, questionEnd)
+	answer := make([]byte, questionEnd, questionEnd+len(opt))
 	copy(answer, query[:questionEnd])
 	answer[2] = 0x80 | query[2]&0x79 // QR, opcode, RD
 	answer[3] = 5                    // REFUSED
@@ -79,5 +81,9 @@ func refused(query []byte, questionEnd int) []byte {
 	binary.BigEndian.PutUint16(answer[6:8], 0)
 	binary.BigEndian.PutUint16(answer[8:10], 0)
 	binary.BigEndian.PutUint16(answer[10:12], 0)
+	if opt != nil {
+		binary.BigEndian.PutUint16(answer[10:12], 1)
+		answer = append(answer, opt...)
+	}
 	return answer
 }

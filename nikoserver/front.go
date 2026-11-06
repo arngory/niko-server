@@ -9,8 +9,11 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/arngory/niko-server/dnsttserver"
 )
 
 // RunFront serves the front until ctx ends: the DNS front (UDP 53),
@@ -84,7 +87,7 @@ func listenDNS(ctx context.Context, network string, addr netip.AddrPort) (*net.U
 
 func runDNSFront(ctx context.Context, c *FrontConfig, log *Logger) error {
 	front := &dnsFront{log: log, zoneBackend: make(map[string]*backendLink), sockets: make(map[netip.AddrPort]*net.UDPConn),
-		probeZones: map[string]bool{}, padZones: map[string]bool{}, apex: map[string]*apexZone{}}
+		probeZones: map[string]bool{}, padZones: map[string]bool{}, apex: map[string]*apexZone{}, tagged: map[string]*taggedZone{}}
 	if c.DNS.ProbeKeyFile != "" {
 		// Without the key the front answers no probes, and goes on: the
 		// tunnels, TCP and UDP 443 must not stop for a resolver check.
@@ -127,6 +130,7 @@ func runDNSFront(ctx context.Context, c *FrontConfig, log *Logger) error {
 		links[name] = &backendLink{name: name, ref: ref, log: log, out: make(chan []byte, 1024), answer: front.answer,
 			bad: func() { front.stats.dropped.Add(1) }}
 	}
+	seenByBackend := map[string]*seenFields{} // a backend's zones share their copies
 	for _, z := range c.DNS.Zones {
 		zone := canonicalName(z.Zone)
 		front.zones = append(front.zones, zone)
@@ -140,8 +144,26 @@ func runDNSFront(ctx context.Context, c *FrontConfig, log *Logger) error {
 		if len(z.NS) > 0 {
 			front.apex[zone] = newApexZone(zone, z.NS, serial)
 		}
+		if z.Tag != "" {
+			// dnsauth-v2 required: the key by the hint, never a scan.
+			// A keys file that does not read leaves the zone without
+			// keys (every query gets NOERROR) until it does: the front
+			// carries TCP and UDP 443 and the other zones too (review).
+			auth := &dnsttserver.DeviceAuth{Hint: dnsttserver.HintRequired}
+			if err := auth.LoadKeys(z.AuthKeysFile); err != nil {
+				log.Warnf("dns.zones %s auth keys %s: %v; no device's query passes until it reads", zone, z.AuthKeysFile, err)
+			}
+			go auth.WatchKeys(z.AuthKeysFile, 5*time.Second, ctx.Done(), log.Infof)
+			seen := seenByBackend[z.Backend]
+			if seen == nil {
+				seen = &seenFields{early: &front.seenEarly}
+				seenByBackend[z.Backend] = seen
+			}
+			front.tagged[zone] = newTaggedZone(zone, auth, seen)
+		}
 	}
 	front.stats = newDNSFrontStats(front.zones)
+	front.stats.replayTurns = &front.seenEarly
 	defer startStats(c.DNS.StatsSocket, func() any { return front.stats.snapshot() }, log)()
 	for _, link := range links {
 		go link.run(ctx)
@@ -174,6 +196,8 @@ type dnsFront struct {
 	sockets     map[netip.AddrPort]*net.UDPConn
 	pending     pendingQueries // what the backends' answers are for
 	stats       *dnsFrontStats
+	tagged      map[string]*taggedZone // zones whose queries carry a device's tag (slipstream)
+	seenEarly   atomic.Uint64          // their memories' generations started early
 }
 
 func (f *dnsFront) closeAll() {
@@ -185,6 +209,8 @@ func (f *dnsFront) closeAll() {
 func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 	buffer := make([]byte, maxDatagram)
 	message := make([]byte, 0, packetHeader+maxDatagram)
+	rebuilt := make([]byte, 0, maxDNSQuery) // a tagged zone's query as its backend gets it
+	raw := make([]byte, 0, maxNameText)     // its name decoded
 	for {
 		n, client, err := conn.ReadFromUDPAddrPort(buffer)
 		if err != nil {
@@ -231,11 +257,37 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 				continue
 			}
 		}
+		forward := query
+		t := f.tagged[zone]
+		var field [dnsttserver.AuthTagLen]byte
+		if t != nil {
+			var verdict int
+			if forward, field, verdict = t.check(query, name, questionEnd, rebuilt, raw); verdict != tagPassed {
+				// Not a device's query, or a copy of one: the backend
+				// sees nothing of it. A copy right after the original
+				// gets nothing: the original's answer is on its way.
+				switch verdict {
+				case tagEcho:
+					f.stats.replayed.Add(1)
+					continue
+				case tagReplayed:
+					f.stats.replayed.Add(1)
+				default:
+					f.stats.untagged.Add(1)
+				}
+				conn.WriteToUDPAddrPort(nodata(query, questionEnd), client)
+				continue
+			}
+		}
 		// Waiting before the send: the backend's answer can come back
-		// before this goroutine runs again.
+		// before this goroutine runs again. The requester's size is the
+		// query's as it came.
 		f.pending.add(client, query, questionEnd)
-		if !f.zoneBackend[zone].send(encodePacket(message, client, local, query)) {
+		if !f.zoneBackend[zone].send(encodePacket(message, client, local, forward)) {
 			f.pending.take(client, query) // the backend never got it
+			if t != nil {
+				t.seen.forget(field, time.Now()) // nor its packet: one retry is no copy
+			}
 			f.stats.backendAway.Add(1)
 			continue
 		}
