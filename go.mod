@@ -95,3 +95,5 @@ replace masterdnsvpn-go => github.com/arngory/sing-box/third_party/masterdnsvpn 
 replace github.com/yggdrasil-network/yggdrasil-go => github.com/arngory/yggdrasil-go v0.5.16-0.20261103204312-0db15d43777a
 
 replace github.com/sagernet/sing-quic => ./third_party/sing-quic
+
+replace www.bamsoftware.com/git/dnstt.git => ./third_party/dnstt
