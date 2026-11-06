@@ -46,7 +46,7 @@ func TestSessionTable(t *testing.T) {
 	}
 	// An admitted ClientID passes again; KCP's session for it is taken,
 	// one for a ClientID never admitted is refused.
-	if !tab.admit(clientID(0), startPacket(), nil) || !tab.add(clientID(0)) || tab.add(clientID(99)) {
+	if !tab.admit(clientID(0), startPacket(), nil) || !tab.add(clientID(0), nil) || tab.add(clientID(99), nil) {
 		t.Fatal("add")
 	}
 	// The handshake done: its place among the handshakes is free, but the
@@ -183,7 +183,7 @@ func TestSessionTablePerDevice(t *testing.T) {
 		t.Fatal("device a over its bound")
 	}
 	// Established sessions count too.
-	tab.add(clientID(0))
+	tab.add(clientID(0), nil)
 	tab.established(clientID(0))
 	if tab.admit(clientID(10), startPacket(), dev("a")) {
 		t.Fatal("device a over its bound with one established")
@@ -199,5 +199,39 @@ func TestSessionTablePerDevice(t *testing.T) {
 	// A ClientID in the table passes whatever its device's count.
 	if !tab.admit(clientID(2), startPacket(), dev("a")) {
 		t.Fatal("an admitted ClientID refused")
+	}
+}
+
+// A device at its bound: its new session takes the place of its session
+// silent longest when that one has been silent for evictIdle, and closes it;
+// a live one keeps its place (a client restarted without a word, review 9).
+func TestSessionTableEvictsIdle(t *testing.T) {
+	defer func(d int, r float64) { MaxSessionsPerDevice, NewSessionsPerSecond = d, r }(MaxSessionsPerDevice, NewSessionsPerSecond)
+	MaxSessionsPerDevice, NewSessionsPerSecond = 2, 1000
+	tab := newSessionTable()
+	dev := func() string { return "a" }
+	closed := map[int]bool{}
+	for i := range 2 {
+		if !tab.admit(clientID(i), startPacket(), dev) || !tab.add(clientID(i), func() error { closed[i] = true; return nil }) {
+			t.Fatalf("session %d", i)
+		}
+	}
+	if tab.admit(clientID(2), startPacket(), dev) || len(closed) != 0 {
+		t.Fatal("a live session evicted")
+	}
+	// Session 1 silent for evictIdle, session 0 seen just now (a packet).
+	tab.open[clientID(1)].seen = time.Now().Add(-evictIdle - time.Second)
+	tab.admit(clientID(0), startPacket(), dev)
+	if !tab.admit(clientID(2), startPacket(), dev) || !closed[1] || closed[0] || tab.has(clientID(1)) || !tab.has(clientID(0)) {
+		t.Fatalf("eviction: closed %v", closed)
+	}
+	if tab.handshake != 2 {
+		t.Fatalf("%d in the handshake, want 2", tab.handshake)
+	}
+	// A pending admission (no KCP session yet) is never evicted.
+	tab.open[clientID(2)].seen = time.Now().Add(-time.Hour)
+	tab.open[clientID(0)].seen = time.Now()
+	if tab.admit(clientID(3), startPacket(), dev) {
+		t.Fatal("a pending admission evicted")
 	}
 }

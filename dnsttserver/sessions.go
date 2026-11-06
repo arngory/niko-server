@@ -37,10 +37,17 @@ var (
 	// MaxSessionsPerDevice bounds the sessions of one dnsauth device (by
 	// its tag), so that one device key cannot take MaxSessions (review 8).
 	// A device keeps one session to a node, and a few more while it moves
-	// between networks: the old ones close after idleTimeout. A new
-	// ClientID over the bound is not admitted until one closes; the client
-	// sends its sn 0 again meanwhile, as KCP did not acknowledge it.
+	// between networks: a client that restarts drops its session without a
+	// word (KCP and smux have none), and it lives until idleTimeout. A new
+	// ClientID over the bound takes the place of the device's session
+	// silent longest, if that one has been silent for evictIdle; otherwise
+	// it is not admitted, and the client sends its sn 0 again meanwhile, as
+	// KCP did not acknowledge it.
 	MaxSessionsPerDevice = 8
+	// evictIdle is how long a device's session must have been silent to
+	// give its place to the device's new one: live sessions send smux's
+	// keepalive every 10 s.
+	evictIdle = 30 * time.Second
 	// MaxStreams bounds a session's smux streams open at once: each dials
 	// the inner stage. A client opens one per connection it carries, a few
 	// dozen for a browser through a DNS tunnel.
@@ -73,7 +80,9 @@ type sessionTable struct {
 type sessionEntry struct {
 	state  sessionState
 	since  time.Time
-	device string // the dnsauth device of its tag; "" untagged
+	seen   time.Time    // its last packet
+	device string       // the dnsauth device of its tag; "" untagged
+	close  func() error // its KCP session's, once KCP made one (add)
 }
 
 type sessionState int
@@ -111,23 +120,31 @@ func (t *sessionTable) has(id turbotunnel.ClientID) bool {
 // called for a new id only, it is held to MaxSessionsPerDevice. Lock order:
 // the table's, then what device takes (Auth's).
 func (t *sessionTable) admit(id turbotunnel.ClientID, p []byte, device func() string) bool {
+	// A session evicted for this one is closed outside the lock: its
+	// goroutine's remove takes it.
+	var evicted func() error
+	defer func() {
+		if evicted != nil {
+			evicted()
+		}
+	}()
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if _, ok := t.open[id]; ok {
+	now := time.Now()
+	if e, ok := t.open[id]; ok {
+		e.seen = now
 		return true
 	}
 	if !looksLikeStart(p) {
 		return false
 	}
-	now := time.Now()
 	if now.Sub(t.swept) >= time.Second {
 		// Admissions KCP made no session of: their places back, and no
 		// queues kept for them (has).
 		t.swept = now
 		for k, e := range t.open {
 			if e.state == sessionPending && now.Sub(e.since) >= pendingTimeout {
-				delete(t.open, k)
-				t.handshake--
+				t.removeLocked(k)
 			}
 		}
 	}
@@ -148,18 +165,28 @@ func (t *sessionTable) admit(id turbotunnel.ClientID, p []byte, device func() st
 	if device != nil {
 		if dev = device(); dev != "" {
 			n := 0
-			for _, e := range t.open {
-				if e.device == dev {
-					n++
+			var idle turbotunnel.ClientID
+			var idleEntry *sessionEntry
+			for k, e := range t.open {
+				if e.device != dev {
+					continue
+				}
+				n++
+				if e.close != nil && (idleEntry == nil || e.seen.Before(idleEntry.seen)) {
+					idle, idleEntry = k, e
 				}
 			}
 			if n >= MaxSessionsPerDevice {
-				return false
+				if idleEntry == nil || now.Sub(idleEntry.seen) < evictIdle {
+					return false
+				}
+				evicted = idleEntry.close
+				t.removeLocked(idle)
 			}
 		}
 	}
 	t.tokens--
-	t.open[id] = &sessionEntry{state: sessionPending, since: now, device: dev}
+	t.open[id] = &sessionEntry{state: sessionPending, since: now, seen: now, device: dev}
 	t.handshake++
 	return true
 }
@@ -192,16 +219,16 @@ func looksLikeStart(p []byte) bool {
 		n >= 2 && n <= uint32(len(p)-kcpHeader) && p[24] == 0 && p[25] == noiseFirst
 }
 
-// add takes a session KCP accepted; false: it was not admitted (or its
-// admission expired), close it.
-func (t *sessionTable) add(id turbotunnel.ClientID) bool {
+// add takes a session KCP accepted, with what closes it; false: it was not
+// admitted (or its admission expired), close it.
+func (t *sessionTable) add(id turbotunnel.ClientID, close func() error) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	e, ok := t.open[id]
 	if !ok || e.state != sessionPending {
 		return false
 	}
-	e.state, e.since = sessionHandshake, time.Now()
+	e.state, e.since, e.close = sessionHandshake, time.Now(), close
 	return true
 }
 
@@ -217,6 +244,11 @@ func (t *sessionTable) established(id turbotunnel.ClientID) {
 func (t *sessionTable) remove(id turbotunnel.ClientID) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.removeLocked(id)
+}
+
+// removeLocked forgets id's session; the caller holds mu.
+func (t *sessionTable) removeLocked(id turbotunnel.ClientID) {
 	if e, ok := t.open[id]; ok {
 		if e.state != sessionEstablished {
 			t.handshake--
