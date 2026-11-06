@@ -44,6 +44,8 @@ const (
 	probeSmall    = probeTokenLen + 2 + 1 + 16
 	probeLarge    = 900
 	probeNonceLen = 8
+	// probeBucket: the padding step of a sealed zone (dnsseal-v1).
+	probeBucket = 64
 	// As dnstt answers: TTL and the responder's EDNS size.
 	probeTTL     = 60
 	probeOPTSize = 4096
@@ -157,7 +159,7 @@ func probePlain(key, b []byte, edns int, mixed bool, src netip.Addr, size int) [
 // answer handles a query for name (lowercase) in zone from src: probe is
 // false when it is no probe, which then goes to the backend; reply is nil
 // for a probe over the rate, which gets no answer at all.
-func (p *dnsProbe) answer(query []byte, name string, questionEnd int, zone string, src netip.Addr) (reply []byte, probe bool) {
+func (p *dnsProbe) answer(query []byte, name string, questionEnd int, zone string, src netip.Addr, pad bool) (reply []byte, probe bool) {
 	label, ok := strings.CutSuffix(name, "."+zone)
 	if !ok || len(label) != probeLabelLen || strings.Contains(label, ".") {
 		return nil, false
@@ -177,10 +179,6 @@ func (p *dnsProbe) answer(query []byte, name string, questionEnd int, zone strin
 	if sent := binary.BigEndian.Uint32(b[2:6]); sent+probeSkew < minute || sent > minute+probeSkew {
 		return nil, false
 	}
-	q, err := dns.MessageFromWireFormat(query)
-	if err != nil || len(q.Question) != 1 {
-		return nil, false
-	}
 	// No replay set: the answer to a label is the same whoever asks, and
 	// on the wire it is one more answer of the tunnel. A censor that
 	// races the client's query to the node learns nothing, and the
@@ -190,14 +188,19 @@ func (p *dnsProbe) answer(query []byte, name string, questionEnd int, zone strin
 	if large {
 		cost = probeLargeCost
 	}
+	// The rate first: a probe over it costs no parse of the message.
 	if !p.allow(src, cost, now) {
 		return nil, true
+	}
+	q, err := dns.MessageFromWireFormat(query)
+	if err != nil || len(q.Question) != 1 {
+		return nil, false
 	}
 	var nonce [probeNonceLen]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return nil, true
 	}
-	return probeReply(p, q, b, query[13:13+int(query[12])], src, large, nonce), true
+	return probeReply(p, q, b, query[13:13+int(query[12])], src, large, nonce, pad), true
 }
 
 // probeSeal is an answer's TXT data: the nonce, then the plaintext
@@ -212,7 +215,11 @@ func probeSeal(p *dnsProbe, b, plain []byte, nonce [probeNonceLen]byte) []byte {
 // when the query had one. A large one goes out only when dnstt could carry
 // as much TXT data to this requester; else the small one, as dnstt fits its
 // answers to the requester.
-func probeReply(p *dnsProbe, q dns.Message, b, rawLabel []byte, src netip.Addr, large bool, nonce [probeNonceLen]byte) []byte {
+//
+// pad: the zone's dnstt answers are sealed (dnsseal-v1 §6): random bytes
+// after the probe's data up to a multiple of 64, within what the requester
+// can carry, as the zone's answers are padded.
+func probeReply(p *dnsProbe, q dns.Message, b, rawLabel []byte, src netip.Addr, large bool, nonce [probeNonceLen]byte, pad bool) []byte {
 	edns, hasOPT := 0, false
 	for _, rr := range q.Additional {
 		if rr.Type == dns.RRTypeOPT {
@@ -221,8 +228,17 @@ func probeReply(p *dnsProbe, q dns.Message, b, rawLabel []byte, src netip.Addr, 
 		}
 	}
 	mixed := strings.ToLower(string(rawLabel)) != string(rawLabel)
+	room := dnsttserver.MaxTXTData(max(edns, 512))
 	build := func(size int) []byte {
 		data := probeSeal(p, b, probePlain(p.key, b, edns, mixed, src, size), nonce)
+		if pad && room-len(data) > 0 {
+			target := min((len(data)+probeBucket-1)/probeBucket*probeBucket, room)
+			fill := make([]byte, target-len(data))
+			if _, err := rand.Read(fill); err != nil {
+				return nil
+			}
+			data = append(data, fill...)
+		}
 		resp := dns.Message{ID: q.ID, Flags: 0x8400, Question: q.Question,
 			Answer: []dns.RR{{Name: q.Question[0].Name, Type: q.Question[0].Type, Class: q.Question[0].Class, TTL: probeTTL,
 				Data: dns.EncodeRDataTXT(data)}}}
@@ -235,7 +251,7 @@ func probeReply(p *dnsProbe, q dns.Message, b, rawLabel []byte, src netip.Addr, 
 		}
 		return wire
 	}
-	if large && probeNonceLen+probeLarge <= dnsttserver.MaxTXTData(max(edns, 512)) {
+	if large && probeNonceLen+probeLarge <= room {
 		return build(probeLarge)
 	}
 	return build(probeSmall)
