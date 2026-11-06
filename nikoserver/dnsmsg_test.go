@@ -26,9 +26,14 @@ func TestQueryName(t *testing.T) {
 	if name, _, ok := queryName(probeQuery(long, 16, 0)); !ok || name != long {
 		t.Fatalf("a name of 253 characters: %v", ok)
 	}
+	// A dot inside a label: in no zone (REFUSED), the question still ends
+	// where it does.
+	dotted := append(append([]byte{0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 5}, "t.exa"...), 3, 'c', 'o', 'm', 0, 0, 16, 0, 1)
+	if name, end, ok := queryName(dotted); !ok || name != "" || end != len(dotted) || zoneOf(name, []string{"t.example.com", "exa.com"}) != "" {
+		t.Fatalf("a dot in a label: %q %d %v", name, end, ok)
+	}
 	for what, bad := range map[string][]byte{
 		"254 characters":   probeQuery("b"+long, 16, 0),
-		"a dot in a label": append(append([]byte{0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 5}, "t.exa"...), 3, 'c', 'o', 'm', 0, 0, 16, 0, 1),
 		"a response":       func() []byte { r := append([]byte(nil), q...); r[2] |= 0x80; return r }(),
 		"no question":      func() []byte { r := append([]byte(nil), q...); r[5] = 0; return r }(),
 		"compression":      append([]byte{0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 0xc0, 12}, 0, 16, 0, 1),

@@ -3,6 +3,7 @@
 package nikoserver
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -182,6 +183,51 @@ func TestNekoServerConfigZonesNestAndLength(t *testing.T) {
 		strings.Replace(front, "ZONE2", "at.example.com", 1),
 		strings.Replace(strings.Replace(dnstt, "ZONE1", "t.example.com", 1), "ZONE2", "at.example.com", 1),
 		strings.Replace(strings.Replace(dnstt, "ZONE1", strings.Repeat("a.", 125)+"com", 1), "ZONE2", "s.example.net", 1),
+	} {
+		if errs := checkConfig(t, ok); len(errs) > 0 {
+			t.Errorf("%v", errs)
+		}
+	}
+}
+
+// Review 12: a name that folds into ASCII (the Kelvin sign) is no zone; a
+// stats socket on another socket's path, entries of one tunnel unlike,
+// masterdns zones twice or nested, are refused.
+func TestNekoServerConfigReview12(t *testing.T) {
+	front := `{"schema":1,"role":"front","log":{"level":"warn"},
+		"backends":{"dns":{"socket":"/run/niko/dns/packet.sock","mode":"packet","uid":9110}},
+		"dns":{"listen":["0.0.0.0:53"],"probe_key_file":"/run/niko/front/dnsprobe.key","zones":[ZONES]}}`
+	dnstt := `{"schema":1,"role":"backend","kind":"dnstt","log":{"level":"warn"},"socket":"/run/niko/dns/packet.sock",
+		"inner":"/run/niko/inner/vless.sock","options":{"zone":"ZONE1","private_key_file":"/run/credentials/niko-dns.service/dnstt.key"}}`
+	masterdns := `{"schema":1,"role":"backend","kind":"masterdns","log":{"level":"warn"},"socket":"/run/niko/mdns/packet.sock",
+		"inner":"/run/niko/inner/vless.sock","options":{"zones":[MZONES],"encryption_method":5,"encryption_key_file":"/run/credentials/niko-mdns.service/encryption.key"}}`
+	entry := `{"zone":"%s","backend":"dns","probe":%v,"seal_pad":%v,"ns":["ns1.example.com"]}`
+	zones := func(es ...string) string { return strings.Replace(front, "ZONES", strings.Join(es, ","), 1) }
+	for _, c := range []struct{ content, path string }{
+		{strings.Replace(dnstt, "ZONE1", "K.example.com", 1), "options.zone"},
+		{zones(fmt.Sprintf(entry, "K.example.com", true, true)), "dns.zones[0].zone"},
+		{strings.Replace(front, `"zones":[ZONES]`, `"stats_socket":"/run/niko/dns/packet.sock","zones":[`+fmt.Sprintf(entry, "t.example.com", true, true)+`]`, 1), "dns.stats_socket"},
+		{strings.Replace(dnstt, `"inner":`, `"stats_socket":"/run/niko/dns/packet.sock","inner":`, 1), "stats_socket"},
+		{zones(fmt.Sprintf(entry, "t.example.com", true, true), fmt.Sprintf(entry, "s.example.net", true, false)), "dns.zones[1]"},
+		{zones(fmt.Sprintf(entry, "t.example.com", true, true), strings.Replace(fmt.Sprintf(entry, "s.example.net", true, true), "ns1.", "ns2.", 1)), "dns.zones[1]"},
+		{strings.Replace(masterdns, "MZONES", `"m.example.com","M.example.com."`, 1), "options.zones[1]"},
+		{strings.Replace(masterdns, "MZONES", `"m.example.com","x.m.example.com"`, 1), "options.zones[1]"},
+		{strings.Replace(masterdns, "MZONES", `"K.example.com"`, 1), "options.zones[0]"},
+	} {
+		errs := checkConfig(t, c.content)
+		found := false
+		for _, e := range errs {
+			found = found || e.Path == c.path
+		}
+		if !found {
+			t.Errorf("%s: no error at that path, got %v", c.path, errs)
+		}
+	}
+	// Alike entries of one tunnel, and masterdns's spares, pass.
+	for _, ok := range []string{
+		zones(fmt.Sprintf(entry, "t.example.com", true, true), fmt.Sprintf(entry, "S.example.net.", true, true)),
+		strings.Replace(masterdns, "MZONES", `"m.example.com","v.example.net"`, 1),
+		strings.Replace(dnstt, "ZONE1", "T.Example.COM.", 1),
 	} {
 		if errs := checkConfig(t, ok); len(errs) > 0 {
 			t.Errorf("%v", errs)

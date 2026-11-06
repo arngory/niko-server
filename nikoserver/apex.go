@@ -33,7 +33,7 @@ type apexZone struct {
 func newApexZone(zone string, ns []string, serial uint32) *apexZone {
 	names := make([]string, len(ns))
 	for i, n := range ns {
-		names[i] = strings.ToLower(strings.TrimSuffix(n, "."))
+		names[i] = canonicalName(n)
 	}
 	soa := wireName(names[0])
 	soa = append(soa, wireName("hostmaster."+zone)...)

@@ -2,6 +2,8 @@ package dnsttserver
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"net"
 	"strings"
 	"testing"
@@ -150,5 +152,75 @@ func TestSendLoopSealedStashSwap(t *testing.T) {
 		}
 	default:
 		t.Fatal("nothing stashed")
+	}
+}
+
+// pollQuery is a TXT query carrying payload in base32 under zone.
+func pollQuery(t *testing.T, payload []byte, zone string) []byte {
+	t.Helper()
+	text := strings.ToLower(base32Encoding.EncodeToString(payload))
+	var labels [][]byte
+	for len(text) > 0 {
+		n := min(len(text), 40)
+		labels, text = append(labels, []byte(text[:n])), text[n:]
+	}
+	z, _ := dns.ParseName(zone)
+	name, err := dns.NewName(append(labels, z...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := dns.Message{ID: 9, Flags: 0x0100, Question: []dns.Question{{Name: name, Type: dns.RRTypeTXT, Class: dns.ClassIN}},
+		Additional: []dns.RR{{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 1232, TTL: 0, Data: []byte{}}}}
+	w, err := q.WireFormat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w
+}
+
+// Each zone's queries with a device's valid tag are counted apart: which
+// zone of the tunnel clients reach (dnszones-v1), which an untagged query
+// cannot fake. Not counted with auth off.
+func TestRecvLoopZoneTagged(t *testing.T) {
+	var dev [32]byte
+	rand.Read(dev[:])
+	auth := &Auth{Mode: AuthRequired}
+	if err := auth.SetKeys([]byte("d1 " + hex.EncodeToString(dev[:]))); err != nil {
+		t.Fatal(err)
+	}
+	zones := []string{"t.example.com", "s.example.net"}
+	var domains []dns.Name
+	for _, z := range zones {
+		d, _ := dns.ParseName(z)
+		domains = append(domains, d)
+	}
+	stats := &Stats{}
+	stats.setZones(zones)
+	sessions := newSessionTableStats(stats)
+	tt := turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, time.Minute)
+	defer tt.Close()
+	conn := feedConn{in: make(chan []byte, 4), out: make(chan []byte, 4)}
+	ch := make(chan *record, 4)
+	go recvLoop(domains, conn, tt, ch, auth, nil, &clientSizes{}, sessions)
+	id := turbotunnel.ClientID{8, 7, 6, 5, 4, 3, 2, 1}
+	inner := append(id[:], 0xe0) // ClientID, a padding frame of 0 bytes
+	tag := Tag(&dev, EpochOf(time.Now()), inner)
+	send := func(payload []byte, zone string) {
+		conn.in <- pollQuery(t, payload, zone)
+		select {
+		case <-ch:
+		case <-time.After(5 * time.Second):
+			t.Fatal("no record")
+		}
+	}
+	send(append(tag[:], inner...), "s.example.net") // tagged, in the spare zone
+	send(append(tag[:], inner...), "S.EXAMPLE.NET") // again, the zone in another case
+	send(inner, "t.example.com")                    // untagged: refused, not counted
+	snap := stats.Snapshot(auth, nil)
+	if snap.Zones["s.example.net"] != 2 || snap.Zones["t.example.com"] != 0 || len(snap.Zones) != 2 {
+		t.Fatalf("zones %v", snap.Zones)
+	}
+	if off := stats.Snapshot(&Auth{Mode: AuthOff}, nil); off.Zones != nil {
+		t.Fatalf("zones with auth off %v", off.Zones)
 	}
 }

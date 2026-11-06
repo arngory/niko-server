@@ -52,6 +52,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -483,14 +484,19 @@ const optDO = 0x8000
 // zoneOf is the zone of domains a query's name is in, the longest one; the
 // first (the main zone) when none is: responseFor answers that NXDOMAIN.
 func zoneOf(query *dns.Message, domains []dns.Name) dns.Name {
-	best := domains[0]
+	return domains[zoneIndex(query, domains)]
+}
+
+// zoneIndex is zoneOf's index in domains.
+func zoneIndex(query *dns.Message, domains []dns.Name) int {
+	best := 0
 	if len(domains) == 1 || len(query.Question) != 1 {
 		return best
 	}
 	found := false
-	for _, d := range domains {
-		if _, ok := query.Question[0].Name.TrimSuffix(d); ok && (!found || len(d) > len(best)) {
-			best, found = d, true
+	for i, d := range domains {
+		if _, ok := query.Question[0].Name.TrimSuffix(d); ok && (!found || len(d) > len(domains[best])) {
+			best, found = i, true
 		}
 	}
 	return best
@@ -711,7 +717,12 @@ func recvLoop(domains []dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Qu
 		}
 		sessions.stats.Queries.Add(1)
 
-		resp, payload, sealed, key, device := responseFor(&query, zoneOf(&query, domains), auth, seal)
+		zone := zoneIndex(&query, domains)
+		resp, payload, sealed, key, device := responseFor(&query, domains[zone], auth, seal)
+		if device != "" {
+			// A device's valid tag in this zone: its clients reach it.
+			sessions.stats.tagged(zone)
+		}
 		size := requesterSize(&query)
 		// Extract the ClientID from the payload.
 		var clientID turbotunnel.ClientID
@@ -1124,6 +1135,11 @@ func run(privkey []byte, domains []dns.Name, upstream Dialer, dnsConn net.Packet
 	if stats == nil {
 		stats = &Stats{} // counted for no one (review 11: RunZones took nil)
 	}
+	names := make([]string, len(domains))
+	for i, d := range domains {
+		names[i] = strings.TrimSuffix(d.String(), ".")
+	}
+	stats.setZones(names)
 	sessions := newSessionTableStats(stats)
 
 	// Start up the virtual PacketConn for turbotunnel. (neko) Queues

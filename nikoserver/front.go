@@ -124,10 +124,11 @@ func runDNSFront(ctx context.Context, c *FrontConfig, log *Logger) error {
 		if ref.Mode != "packet" || !inDNS[name] {
 			continue
 		}
-		links[name] = &backendLink{name: name, ref: ref, log: log, out: make(chan []byte, 1024), answer: front.answer}
+		links[name] = &backendLink{name: name, ref: ref, log: log, out: make(chan []byte, 1024), answer: front.answer,
+			bad: func() { front.stats.dropped.Add(1) }}
 	}
 	for _, z := range c.DNS.Zones {
-		zone := strings.ToLower(strings.TrimSuffix(z.Zone, "."))
+		zone := canonicalName(z.Zone)
 		front.zones = append(front.zones, zone)
 		front.zoneBackend[zone] = links[z.Backend]
 		if z.Probe {
@@ -141,14 +142,7 @@ func runDNSFront(ctx context.Context, c *FrontConfig, log *Logger) error {
 		}
 	}
 	front.stats = newDNSFrontStats(front.zones)
-	if c.DNS.StatsSocket != "" {
-		stop, err := serveStats(c.DNS.StatsSocket, func() any { return front.stats.snapshot() }, log)
-		if err != nil {
-			front.closeAll()
-			return envError("dns.stats_socket %s: %v", c.DNS.StatsSocket, err)
-		}
-		defer stop()
-	}
+	defer startStats(c.DNS.StatsSocket, func() any { return front.stats.snapshot() }, log)()
 	for _, link := range links {
 		go link.run(ctx)
 	}
@@ -264,13 +258,14 @@ func (f *dnsFront) answer(client, local netip.AddrPort, payload []byte) {
 		f.log.Debugf("an answer to %s no query waits for: dropped", client)
 		return
 	}
+	cut := false
 	if len(payload) > min(size, maxBackendAnswer) {
 		if payload = truncated(payload); payload == nil {
+			f.stats.dropped.Add(1)
 			return
 		}
-		f.stats.truncated.Add(1)
+		cut = true
 	}
-	f.stats.answers.Add(1)
 	conn := f.sockets[local]
 	if conn == nil {
 		for addr, candidate := range f.sockets {
@@ -280,8 +275,17 @@ func (f *dnsFront) answer(client, local netip.AddrPort, payload []byte) {
 			}
 		}
 	}
-	if conn != nil {
-		conn.WriteToUDPAddrPort(payload, client)
+	if conn == nil {
+		f.stats.dropped.Add(1)
+		return
+	}
+	if _, err := conn.WriteToUDPAddrPort(payload, client); err != nil {
+		f.stats.dropped.Add(1)
+		return
+	}
+	f.stats.answers.Add(1)
+	if cut {
+		f.stats.truncated.Add(1)
 	}
 }
 
@@ -293,6 +297,7 @@ type backendLink struct {
 	log    *Logger
 	out    chan []byte
 	answer func(client, local netip.AddrPort, payload []byte)
+	bad    func() // a message from the backend that does not read (the DNS front's counters); nil: none
 
 	access sync.Mutex
 	conn   *net.UnixConn
@@ -366,6 +371,9 @@ func (l *backendLink) serve(ctx context.Context, conn *net.UnixConn) {
 			}
 			client, local, payload, err := decodePacket(buffer[:n])
 			if err != nil {
+				if l.bad != nil {
+					l.bad()
+				}
 				continue
 			}
 			l.answer(client, local, payload)

@@ -198,8 +198,21 @@ var dnsName = regexp.MustCompile(`^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\
 
 // zoneName is a tunnel zone as written: a DNS name of 253 characters at
 // most, which is 255 octets on the wire (review 11: a longer one passed
-// check and stopped the backend at its start).
+// check and stopped the backend at its start). ASCII only, checked before
+// any folding (review 12: a Kelvin sign folds to k).
 func zoneName(z string) bool { return len(z) <= 253 && dnsName.MatchString(z) }
+
+// canonicalName is a name as the front and dnstt compare it: no final dot,
+// lower case in ASCII only (RFC 4343).
+func canonicalName(name string) string {
+	b := []byte(strings.TrimSuffix(name, "."))
+	for i, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			b[i] = c + 'a' - 'A'
+		}
+	}
+	return string(b)
+}
 
 // nestedIn is the zone of zones that z is nested in, or that is nested in
 // z, "" when none: a name under both is either's (review 11: the front
@@ -318,13 +331,22 @@ func (c *FrontConfig) validate() []ConfigError {
 	}
 	if c.DNS.StatsSocket != "" {
 		checkSocket(&e, "dns.stats_socket", c.DNS.StatsSocket)
+		// The front removes what is at the path before it listens there.
+		for name, b := range c.Backends {
+			if b.Socket == c.DNS.StatsSocket {
+				e.add("dns.stats_socket", "the socket of backend %q", name)
+			}
+		}
+		if c.DNS.StatsSocket == c.DNS.ProbeKeyFile {
+			e.add("dns.stats_socket", "the probe key file")
+		}
 	}
 	var seen []string
 	for i, z := range c.DNS.Zones {
 		path := fmt.Sprintf("dns.zones[%d]", i)
-		zone := strings.ToLower(strings.TrimSuffix(z.Zone, "."))
+		zone := canonicalName(z.Zone)
 		switch {
-		case !zoneName(zone):
+		case !zoneName(strings.TrimSuffix(z.Zone, ".")):
 			e.add(path+".zone", "not a DNS name of 253 characters at most: %q", z.Zone)
 		case slices.Contains(seen, zone):
 			e.add(path+".zone", "duplicate zone %q", z.Zone)
@@ -349,8 +371,18 @@ func (c *FrontConfig) validate() []ConfigError {
 		if len(z.NS) > 8 {
 			e.add(path+".ns", "at most 8 names")
 		}
+		// One tunnel's zones answer alike (dnszones-v1): a spare zone
+		// without the main one's padding would answer probes unpadded
+		// beside the tunnel's sealed answers, and an apex of its own
+		// names would set it apart.
+		for j := range i {
+			if o := c.DNS.Zones[j]; o.Backend == z.Backend && (o.Probe != z.Probe || o.SealPad != z.SealPad || !slices.Equal(o.NS, z.NS)) {
+				e.add(path, "probe, seal_pad and ns differ from dns.zones[%d] of the same backend", j)
+				break
+			}
+		}
 		for j, ns := range z.NS {
-			if n := strings.ToLower(strings.TrimSuffix(ns, ".")); !dnsName.MatchString(n) || len(n) > 253 {
+			if n := strings.TrimSuffix(ns, "."); !dnsName.MatchString(n) || len(n) > 253 {
 				e.add(fmt.Sprintf("%s.ns[%d]", path, j), "not a DNS name: %q", ns)
 			}
 		}
@@ -367,8 +399,8 @@ func (c *BackendConfig) validate() []ConfigError {
 	}
 	switch c.Kind {
 	case "dnstt":
-		main := strings.ToLower(strings.TrimSuffix(c.Options.Zone, "."))
-		if !zoneName(main) {
+		main := canonicalName(c.Options.Zone)
+		if !zoneName(strings.TrimSuffix(c.Options.Zone, ".")) {
 			e.add("options.zone", "not a DNS name of 253 characters at most: %q", c.Options.Zone)
 		}
 		// Spare zones of the same tunnel (raycontrol dnszones-v1).
@@ -377,9 +409,9 @@ func (c *BackendConfig) validate() []ConfigError {
 		}
 		all := []string{main}
 		for i, zone := range c.Options.Zones {
-			z := strings.ToLower(strings.TrimSuffix(zone, "."))
+			z := canonicalName(zone)
 			switch {
-			case !zoneName(z):
+			case !zoneName(strings.TrimSuffix(zone, ".")):
 				e.add(fmt.Sprintf("options.zones[%d]", i), "not a DNS name of 253 characters at most: %q", zone)
 			case slices.Contains(all, z):
 				e.add(fmt.Sprintf("options.zones[%d]", i), "%q twice", zone)
@@ -405,10 +437,23 @@ func (c *BackendConfig) validate() []ConfigError {
 		if len(c.Options.Zones) == 0 {
 			e.add("options.zones", "no zones")
 		}
+		if len(c.Options.Zones) > 1+maxSpareZones {
+			e.add("options.zones", "%d zones, %d at most (the main one and %d spares)", len(c.Options.Zones), 1+maxSpareZones, maxSpareZones)
+		}
+		var all []string
 		for i, zone := range c.Options.Zones {
-			if !dnsName.MatchString(strings.TrimSuffix(zone, ".")) {
-				e.add(fmt.Sprintf("options.zones[%d]", i), "not a DNS name: %q", zone)
+			z := canonicalName(zone)
+			switch {
+			case !zoneName(strings.TrimSuffix(zone, ".")):
+				e.add(fmt.Sprintf("options.zones[%d]", i), "not a DNS name of 253 characters at most: %q", zone)
+			case slices.Contains(all, z):
+				e.add(fmt.Sprintf("options.zones[%d]", i), "%q twice", zone)
+			default:
+				if other := nestedIn(z, all); other != "" {
+					e.add(fmt.Sprintf("options.zones[%d]", i), "%q and %q nest: a name under both is either's", zone, other)
+				}
 			}
+			all = append(all, z)
 		}
 		// raycontrol decision R1-8: authenticated encryption only (3-5: AES-GCM)
 		if c.Options.EncryptionMethod == nil || *c.Options.EncryptionMethod < 3 || *c.Options.EncryptionMethod > 5 {
@@ -467,6 +512,10 @@ func (c *BackendConfig) validate() []ConfigError {
 			e.add("stats_socket", "only the Hysteria2 and dnstt backends have stats")
 		} else {
 			checkSocket(&e, "stats_socket", c.StatsSocket)
+		}
+		// The backend removes what is at the path before it listens there.
+		if c.StatsSocket == c.Socket || c.StatsSocket == c.Inner {
+			e.add("stats_socket", "the backend's socket or the inner stage's")
 		}
 	}
 	if c.Options.Probe != nil && c.Kind != "hy2-masq" && c.Kind != "hy2-obfs" {
