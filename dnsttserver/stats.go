@@ -2,6 +2,7 @@ package dnsttserver
 
 import (
 	"sync/atomic"
+	"time"
 )
 
 // Stats counts what the dnstt backend did since it started (neko), for the
@@ -19,6 +20,10 @@ type Stats struct {
 	HandshakeTimeouts atomic.Uint64 // closed with the Noise handshake undone
 	StreamsRefused    atomic.Uint64 // over MaxStreams
 
+	// Started is when the backend started (zero: not said): a reader tells
+	// a restart, whose counters start again from 0, by it.
+	Started time.Time
+
 	// The current sessions and handshakes, from the session table.
 	current func() (sessions, handshakes int)
 }
@@ -26,6 +31,7 @@ type Stats struct {
 // StatsSnapshot is Stats at one moment, as the stats socket gives it (JSON),
 // with the dnsauth-v1 and dnsseal-v1 counters of the service.
 type StatsSnapshot struct {
+	Started           int64  `json:"started,omitempty"` // Unix seconds
 	Queries           uint64 `json:"queries"`
 	MemoHits          uint64 `json:"memo_hits"`
 	Sessions          int    `json:"sessions"`
@@ -54,6 +60,9 @@ func (s *Stats) Snapshot(auth *Auth, seal *Seal) StatsSnapshot {
 		SessionsAdmitted: s.SessionsAdmitted.Load(), RefusedFull: s.RefusedFull.Load(), RefusedRate: s.RefusedRate.Load(),
 		RefusedDevice: s.RefusedDevice.Load(), SessionsEvicted: s.SessionsEvicted.Load(),
 		HandshakeTimeouts: s.HandshakeTimeouts.Load(), StreamsRefused: s.StreamsRefused.Load(),
+	}
+	if !s.Started.IsZero() {
+		out.Started = s.Started.Unix()
 	}
 	if f := s.current; f != nil {
 		out.Sessions, out.Handshakes = f()
