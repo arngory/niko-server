@@ -11,6 +11,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/arngory/niko-server/dnsttserver"
 )
 
 // RunFront serves the front until ctx ends: the DNS front (UDP 53),
@@ -84,7 +86,7 @@ func listenDNS(ctx context.Context, network string, addr netip.AddrPort) (*net.U
 
 func runDNSFront(ctx context.Context, c *FrontConfig, log *Logger) error {
 	front := &dnsFront{log: log, zoneBackend: make(map[string]*backendLink), sockets: make(map[netip.AddrPort]*net.UDPConn),
-		probeZones: map[string]bool{}, padZones: map[string]bool{}, apex: map[string]*apexZone{}}
+		probeZones: map[string]bool{}, padZones: map[string]bool{}, apex: map[string]*apexZone{}, tagged: map[string]*taggedZone{}}
 	if c.DNS.ProbeKeyFile != "" {
 		// Without the key the front answers no probes, and goes on: the
 		// tunnels, TCP and UDP 443 must not stop for a resolver check.
@@ -140,6 +142,16 @@ func runDNSFront(ctx context.Context, c *FrontConfig, log *Logger) error {
 		if len(z.NS) > 0 {
 			front.apex[zone] = newApexZone(zone, z.NS, serial)
 		}
+		if z.Tag != "" {
+			// dnsauth-v2 required: the key by the hint, never a scan.
+			auth := &dnsttserver.DeviceAuth{Hint: dnsttserver.HintRequired}
+			if err := auth.LoadKeys(z.AuthKeysFile); err != nil {
+				front.closeAll()
+				return envError("dns.zones %s auth keys %s: %v", zone, z.AuthKeysFile, err)
+			}
+			go auth.WatchKeys(z.AuthKeysFile, 5*time.Second, ctx.Done(), log.Infof)
+			front.tagged[zone] = &taggedZone{zone: zone, auth: auth}
+		}
 	}
 	front.stats = newDNSFrontStats(front.zones)
 	defer startStats(c.DNS.StatsSocket, func() any { return front.stats.snapshot() }, log)()
@@ -174,6 +186,7 @@ type dnsFront struct {
 	sockets     map[netip.AddrPort]*net.UDPConn
 	pending     pendingQueries // what the backends' answers are for
 	stats       *dnsFrontStats
+	tagged      map[string]*taggedZone // zones whose queries carry a device's tag (slipstream)
 }
 
 func (f *dnsFront) closeAll() {
@@ -231,10 +244,20 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 				continue
 			}
 		}
+		forward := query
+		if t := f.tagged[zone]; t != nil {
+			if forward = t.check(query, name, questionEnd); forward == nil {
+				// Not a device's query: the backend sees nothing of it.
+				f.stats.untagged.Add(1)
+				conn.WriteToUDPAddrPort(nodata(query, questionEnd), client)
+				continue
+			}
+		}
 		// Waiting before the send: the backend's answer can come back
-		// before this goroutine runs again.
+		// before this goroutine runs again. The requester's size is the
+		// query's as it came.
 		f.pending.add(client, query, questionEnd)
-		if !f.zoneBackend[zone].send(encodePacket(message, client, local, query)) {
+		if !f.zoneBackend[zone].send(encodePacket(message, client, local, forward)) {
 			f.pending.take(client, query) // the backend never got it
 			f.stats.backendAway.Add(1)
 			continue

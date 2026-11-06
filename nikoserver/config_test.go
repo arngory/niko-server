@@ -341,3 +341,28 @@ func TestNekoServerConfigAuthHint(t *testing.T) {
 		}
 	}
 }
+
+// dns.zones[].tag (v0.13.0): slipstream only, with the devices' keys.
+func TestNekoServerConfigTaggedZone(t *testing.T) {
+	front := `{"schema":1,"role":"front","log":{"level":"warn"},"dns":{"listen":["0.0.0.0:53"],
+		"zones":[{"zone":"s.example.com","backend":"slip"ZONE}]},
+		"backends":{"slip":{"socket":"/run/niko/slip/packet.sock","mode":"packet","uid":9120}}}`
+	with := func(z string) string { return strings.Replace(front, "ZONE", z, 1) }
+	if errs := checkConfig(t, with(`,"tag":"slipstream","auth_keys_file":"/run/niko/slip-front/auth.keys"`)); len(errs) > 0 {
+		t.Errorf("%v", errs)
+	}
+	for z, path := range map[string]string{
+		`,"tag":"dnstt","auth_keys_file":"/k"`: "dns.zones[0].tag",
+		`,"tag":"slipstream"`:                  "dns.zones[0].auth_keys_file",
+		`,"auth_keys_file":"/run/niko/k"`:      "dns.zones[0].auth_keys_file",
+	} {
+		errs := checkConfig(t, with(z))
+		found := false
+		for _, e := range errs {
+			found = found || e.Path == path
+		}
+		if !found {
+			t.Errorf("%s: no error at %s, got %v", z, path, errs)
+		}
+	}
+}
