@@ -133,7 +133,7 @@ func RunBackend(ctx context.Context, c *BackendConfig, log *Logger) error {
 		if c.Options.Seal != "" && c.Options.Seal != "off" {
 			log.Infof("masterdns: sealed answers (mdseal-v1, %s)", c.Options.Seal)
 		}
-		err := mdvembed.RunServer(ctx, mdvembed.ServerOptions{
+		srv, err := mdvembed.NewServer(mdvembed.ServerOptions{
 			Domains:  c.Options.Zones,
 			Method:   *c.Options.EncryptionMethod,
 			KeyFile:  c.Options.EncryptionKeyFile,
@@ -145,6 +145,14 @@ func RunBackend(ctx context.Context, c *BackendConfig, log *Logger) error {
 			AuthMode: c.Options.Auth,
 			Auth:     auth,
 		})
+		if err != nil {
+			return envError("masterdns: %v", err)
+		}
+		// The service's key changes while it runs (raycontrol
+		// masterdns-key-rotation §3): the file, current key first, the
+		// previous one after it while it is taken.
+		go watchMasterdnsKeys(ctx, c.Options.EncryptionKeyFile, 5*time.Second, srv.SetKeys, log)
+		err = srv.Run(ctx)
 		if ctx.Err() != nil {
 			return nil
 		}
