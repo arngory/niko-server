@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -72,7 +73,7 @@ func TestTaggedZone(t *testing.T) {
 		if !ok {
 			t.Fatal("the query does not read")
 		}
-		out, _, _ := newTaggedZone(zone, auth).check(q, name, end, nil)
+		out, _, _ := newTaggedZone(zone, auth, nil).check(q, name, end, nil, nil)
 		return out
 	}
 
@@ -112,7 +113,7 @@ func TestTaggedZone(t *testing.T) {
 		}(),
 	} {
 		name, end, ok := queryName(q)
-		if out, _, _ := newTaggedZone(zone, auth).check(q, name, end, nil); ok && out != nil {
+		if out, _, _ := newTaggedZone(zone, auth, nil).check(q, name, end, nil, nil); ok && out != nil {
 			t.Errorf("%s: passed on", what)
 		}
 	}
@@ -131,9 +132,9 @@ func TestTaggedZone(t *testing.T) {
 	if _, end, _ = queryName(q); len(nodata(q, end)) != end {
 		t.Fatal("an OPT for a query without one")
 	}
-	// Another opcode: NOTIMP, not authoritative.
+	// Another opcode: NOTIMP, authoritative, as dnstt answers it.
 	q[2] |= 0x28 // UPDATE
-	if a := nodata(q, end); a[2]&0x04 != 0 || a[3]&0x0f != 4 {
+	if a := nodata(q, end); a[2]&0x04 == 0 || a[3]&0x0f != 4 {
 		t.Fatalf("nodata to UPDATE %x", a[:4])
 	}
 }
@@ -150,17 +151,18 @@ func TestTaggedZoneReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	zone := "s.example.com"
-	tz := newTaggedZone(zone, auth)
+	tz := newTaggedZone(zone, auth, nil)
 	tz.now = func() time.Time { return now }
 	packet := bytes.Repeat([]byte{0x41}, 60)
 	epoch := dnsttserver.EpochOf(now)
+	raw := make([]byte, 0, maxNameText)
 	verdict := func(q []byte) int {
 		t.Helper()
 		name, end, ok := queryName(q)
 		if !ok {
 			t.Fatal("the query does not read")
 		}
-		_, _, v := tz.check(q, name, end, make([]byte, 0, 512))
+		_, _, v := tz.check(q, name, end, make([]byte, 0, 512), raw)
 		return v
 	}
 	q := slipQuery(t, dnsttserver.Tag2(&key, epoch, packet), packet, zone, 16, true)
@@ -169,6 +171,12 @@ func TestTaggedZoneReplay(t *testing.T) {
 	}
 	copyOf := slipQuery(t, dnsttserver.Tag2(&key, epoch, packet), packet, zone, 16, false)
 	copyOf[0], copyOf[1] = 0x56, 0x78
+	// Right after the original: a resolver's retry, left without answer
+	// (the original's is on its way); later, a copy: NOERROR.
+	if v := verdict(copyOf); v != tagEcho {
+		t.Fatalf("a copy at once: %d", v)
+	}
+	now = now.Add(seenQuiet)
 	if v := verdict(copyOf); v != tagReplayed {
 		t.Fatalf("a copy with another ID and no OPT: %d", v)
 	}
@@ -178,17 +186,26 @@ func TestTaggedZoneReplay(t *testing.T) {
 	if v := verdict(q); v != tagReplayed {
 		t.Fatalf("a copy an epoch later: %d", v)
 	}
-	// A query that never reached the backend gives its field back.
+	// A query that never reached the backend: one retry within 10 s
+	// passes, and not one more, nor one later.
 	again := append(bytes.Clone(packet), 2)
 	q2 := slipQuery(t, dnsttserver.Tag2(&key, dnsttserver.EpochOf(now), again), again, zone, 16, true)
 	name2, end2, _ := queryName(q2)
-	_, field, v := tz.check(q2, name2, end2, nil)
+	_, field, v := tz.check(q2, name2, end2, nil, nil)
 	if v != tagPassed {
 		t.Fatalf("a new packet: %d", v)
 	}
-	tz.seen.forget(field)
+	tz.seen.forget(field, now)
 	if v := verdict(q2); v != tagPassed {
 		t.Fatalf("a retry of a query the backend never got: %d", v)
+	}
+	if v := verdict(q2); v == tagPassed {
+		t.Fatal("a second retry passed")
+	}
+	tz.seen.forget(field, now)
+	now = now.Add(seenRetry)
+	if v := verdict(q2); v == tagPassed {
+		t.Fatal("a retry after 10 s passed")
 	}
 	// Another packet passes.
 	other := append(bytes.Clone(packet), 1)
@@ -196,25 +213,28 @@ func TestTaggedZoneReplay(t *testing.T) {
 		t.Fatalf("another packet: %d", v)
 	}
 
-	// The memory: a field stays four epochs, and a full generation turns.
+	// The memory: a field stays four epochs, and a full generation turns,
+	// counted.
+	at := func(e uint32) time.Time { return time.Unix(int64(e)*int64(dnsttserver.AuthEpoch/time.Second), 0) }
 	var s seenFields
 	f := [8]byte{1}
-	if !s.first(f, 100) || s.first(f, 100) || s.first(f, 103) {
+	if s.sight(f, at(100)) != tagPassed || s.sight(f, at(100)) == tagPassed || s.sight(f, at(103)) != tagReplayed {
 		t.Fatal("a field seen in epoch 100 passed again by 103")
 	}
-	if !s.first(f, 104) {
+	if s.sight(f, at(104)) != tagPassed {
 		t.Fatal("a field seen in epoch 100 still caught in 104")
 	}
-	var g seenFields
+	var early atomic.Uint64
+	g := seenFields{early: &early}
 	for i := range seenCap + 1 {
 		var x [8]byte
 		binary.BigEndian.PutUint64(x[:], uint64(i))
-		g.first(x, 7)
+		g.sight(x, at(7))
 	}
-	if len(g.gens[0]) != 1 || len(g.gens[1]) != seenCap {
-		t.Fatalf("a full generation did not turn: %d, %d", len(g.gens[0]), len(g.gens[1]))
+	if len(g.gens[0]) != 1 || len(g.gens[1]) != seenCap || early.Load() != 1 {
+		t.Fatalf("a full generation did not turn: %d, %d, %d early", len(g.gens[0]), len(g.gens[1]), early.Load())
 	}
-	if g.first([8]byte{}, 7) {
+	if g.sight([8]byte{}, at(7)) == tagPassed {
 		t.Fatal("a field of the turned generation passed again")
 	}
 }
@@ -344,7 +364,8 @@ func TestTaggedZoneSlipstream(t *testing.T) {
 	if fw == 0 || an == 0 || un != 0 || binary.BigEndian.Uint16(a[10:12]) != 1 {
 		t.Fatalf("the server's answer: forwarded %d, answers %d, untagged %d: %x", fw, an, un, a)
 	}
-	// A copy of the device's query (another ID): the front's NOERROR, the
+	// A copy of the device's query (another ID): no answer within 5 s of
+	// the original (a resolver's retry), then the front's NOERROR; the
 	// server sees nothing of it.
 	device := q
 	device[0] ^= 0x5a
