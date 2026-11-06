@@ -44,6 +44,12 @@ jobs:
           cache: false
       - name: Unit and in-process tests
         run: go vet ./... && go test -race -count=1 -timeout 300s ./...
+      # The vendored dnstt is a module of its own: ./... above does not reach
+      # it (review 12). Only the dns package, which niko changes; vet ./...
+      # there stops on two upstream warnings in noise_test.go.
+      - name: dnstt's dns package (vendored, changed by niko)
+        working-directory: third_party/dnstt
+        run: go vet ./dns && go test -race -count=1 ./dns
       - name: Load through every multiplexer (SPEC §6.6, a minute; NIKO_LOAD=10m for the full run)
         run: NIKO_LOAD=60s go test -count=1 -timeout 300s -run TestNekoServerLoad -v ./nikoserver
       - name: Build niko-server

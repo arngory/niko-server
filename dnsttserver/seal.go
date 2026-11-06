@@ -126,6 +126,10 @@ type Seal struct {
 	Mode SealMode
 	keys atomic.Pointer[[]*sealKey]
 	text atomic.Pointer[[]byte] // what the keys were read from (SetKeys)
+
+	// Counters (neko, the backend's stats): queries a key opened, open
+	// ones taken (optional), open ones refused (required).
+	Opened, Unsealed, Refused atomic.Uint64
 }
 
 // NewSeal makes a seal from keys of 32 bytes, the current first.

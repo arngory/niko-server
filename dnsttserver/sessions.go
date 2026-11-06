@@ -69,6 +69,7 @@ var (
 // outside the table costs no queues, and the queues of the table's
 // ClientIDs are bounded by MaxSessions and NewSessionsPerSecond.
 type sessionTable struct {
+	stats     *Stats
 	mu        sync.Mutex
 	open      map[turbotunnel.ClientID]*sessionEntry
 	handshake int // pending or in the handshake
@@ -103,8 +104,19 @@ var (
 	pendingTimeout = 5 * time.Second
 )
 
-func newSessionTable() *sessionTable {
-	return &sessionTable{open: map[turbotunnel.ClientID]*sessionEntry{}}
+func newSessionTable() *sessionTable { return newSessionTableStats(&Stats{}) }
+
+// newSessionTableStats is a table that counts into stats, and gives it the
+// current sessions and handshakes.
+func newSessionTableStats(stats *Stats) *sessionTable {
+	t := &sessionTable{stats: stats, open: map[turbotunnel.ClientID]*sessionEntry{}}
+	current := func() (int, int) {
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		return len(t.open), t.handshake
+	}
+	stats.current.Store(&current)
+	return t
 }
 
 func (t *sessionTable) has(id turbotunnel.ClientID) bool {
@@ -149,6 +161,7 @@ func (t *sessionTable) admit(id turbotunnel.ClientID, p []byte, device func() st
 		}
 	}
 	if len(t.open) >= MaxSessions || t.handshake >= MaxHandshakes {
+		t.stats.RefusedFull.Add(1)
 		return false
 	}
 	burst := 2 * NewSessionsPerSecond
@@ -159,6 +172,7 @@ func (t *sessionTable) admit(id turbotunnel.ClientID, p []byte, device func() st
 	}
 	t.last = now
 	if t.tokens < 1 {
+		t.stats.RefusedRate.Add(1)
 		return false
 	}
 	var dev string
@@ -178,16 +192,19 @@ func (t *sessionTable) admit(id turbotunnel.ClientID, p []byte, device func() st
 			}
 			if n >= MaxSessionsPerDevice {
 				if idleEntry == nil || now.Sub(idleEntry.seen) < evictIdle {
+					t.stats.RefusedDevice.Add(1)
 					return false
 				}
 				evicted = idleEntry.close
 				t.removeLocked(idle)
+				t.stats.SessionsEvicted.Add(1)
 			}
 		}
 	}
 	t.tokens--
 	t.open[id] = &sessionEntry{state: sessionPending, since: now, seen: now, device: dev}
 	t.handshake++
+	t.stats.SessionsAdmitted.Add(1)
 	return true
 }
 

@@ -147,11 +147,34 @@ func (name Name) TrimSuffix(suffix Name) (Name, bool) {
 	split := len(name) - len(suffix)
 	fore, aft := name[:split], name[split:]
 	for i := 0; i < len(aft); i++ {
-		if !bytes.Equal(bytes.ToLower(aft[i]), bytes.ToLower(suffix[i])) {
+		// (neko) ASCII case only (RFC 4343 §3), and no copies: this runs
+		// for every query, once a zone (review 11: 14 allocations a query
+		// with 5 zones).
+		if !equalFoldASCII(aft[i], suffix[i]) {
 			return nil, false
 		}
 	}
 	return fore, true
+}
+
+// equalFoldASCII reports whether two labels are equal ignoring ASCII case.
+func equalFoldASCII(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		x, y := a[i], b[i]
+		if 'A' <= x && x <= 'Z' {
+			x += 'a' - 'A'
+		}
+		if 'A' <= y && y <= 'Z' {
+			y += 'a' - 'A'
+		}
+		if x != y {
+			return false
+		}
+	}
+	return true
 }
 
 // Message represents a DNS message.

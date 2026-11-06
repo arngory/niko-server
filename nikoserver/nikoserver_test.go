@@ -9,11 +9,14 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,6 +25,8 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 
 	mdvembed "masterdnsvpn-go/embed"
+
+	"github.com/arngory/niko-server/dnsttserver"
 	"www.bamsoftware.com/git/dnstt.git/dns"
 	"www.bamsoftware.com/git/dnstt.git/noise"
 )
@@ -108,6 +113,24 @@ func nsFor(probeKeyFile string) []string {
 // startNodeWith is startNode with the front's dnsprobe-v1 key file (and
 // the zone's NS names, the front answering its apex).
 func startNodeWith(t *testing.T, kind, zone string, options map[string]any, probeKeyFile string) (resolver string) {
+	return startNodeFull(t, kind, zone, options, probeKeyFile, "", "")
+}
+
+// frontZones are the front's zones of a node's backend: its zone, and the
+// spare zones of a dnstt backend (options "zones"), all to the same backend.
+func frontZones(zone string, options map[string]any, probeKeyFile string) []map[string]any {
+	zones := []map[string]any{{"zone": zone, "backend": "dns", "probe": probeKeyFile != "", "ns": nsFor(probeKeyFile)}}
+	if spare, ok := options["zones"].([]string); ok && options["zone"] != nil {
+		for _, z := range spare {
+			zones = append(zones, map[string]any{"zone": z, "backend": "dns", "probe": probeKeyFile != "", "ns": nsFor(probeKeyFile)})
+		}
+	}
+	return zones
+}
+
+// startNodeFull is startNodeWith with the backend's stats socket and the
+// front's (dns.stats_socket).
+func startNodeFull(t *testing.T, kind, zone string, options map[string]any, probeKeyFile, statsSocket, frontStats string) (resolver string) {
 	dir := t.TempDir()
 	uid := os.Getuid()
 	inner := echoInner(t, dir)
@@ -116,16 +139,24 @@ func startNodeWith(t *testing.T, kind, zone string, options map[string]any, prob
 	resolver = freeUDPPort(t)
 
 	backendPath := filepath.Join(dir, "backend.json")
-	writeJSON(t, backendPath, map[string]any{
+	backend := map[string]any{
 		"schema": 1, "role": "backend", "kind": kind, "log": map[string]string{"level": "warn"},
 		"socket": socket, "front_uid": uid, "options": options, "inner": inner,
-	})
+	}
+	if statsSocket != "" {
+		backend["stats_socket"] = statsSocket
+	}
+	writeJSON(t, backendPath, backend)
 	frontPath := filepath.Join(dir, "front.json")
+	dnsFront := map[string]any{"listen": []string{resolver}, "zones": frontZones(zone, options, probeKeyFile),
+		"probe_key_file": probeKeyFile}
+	if frontStats != "" {
+		dnsFront["stats_socket"] = frontStats
+	}
 	writeJSON(t, frontPath, map[string]any{
 		"schema": 1, "role": "front", "log": map[string]string{"level": "warn"},
 		"backends": map[string]any{"dns": map[string]any{"socket": socket, "mode": "packet", "uid": uid}},
-		"dns": map[string]any{"listen": []string{resolver}, "zones": []map[string]any{{"zone": zone, "backend": "dns", "probe": probeKeyFile != "", "ns": nsFor(probeKeyFile)}},
-			"probe_key_file": probeKeyFile},
+		"dns":      dnsFront,
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -432,5 +463,300 @@ func TestNekoServerDNSProbeKeyMissing(t *testing.T) {
 		if data, _ := dns.DecodeRDataTXT(rr.Data); len(data) == probeNonceLen+probeSmall {
 			t.Fatalf("a probe answered with the key missing: %x", data)
 		}
+	}
+}
+
+// The DNS front's counters on dns.stats_socket (v0.11.0): queries by zone,
+// and what became of them: refused outside the zones, the apex, probes,
+// passed to the backend and answered; datagrams that are no query.
+func TestNekoServerDNSFrontStats(t *testing.T) {
+	privkey, _ := noise.GeneratePrivkey()
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "noise.key")
+	os.WriteFile(keyFile, []byte(hex.EncodeToString(privkey)+"\n"), 0o600)
+	probeKey := bytes.Repeat([]byte{5}, 32)
+	probeFile := filepath.Join(dir, "dnsprobe.key")
+	os.WriteFile(probeFile, []byte(hex.EncodeToString(probeKey)+"\n"), 0o600)
+	frontStats := filepath.Join(dir, "front-stats.sock")
+	zone, spare := "t.example.com", "s.example.net"
+	node := startNodeFull(t, "dnstt", zone, map[string]any{"zone": zone, "zones": []string{spare}, "private_key_file": keyFile},
+		probeFile, "", frontStats)
+	c, err := net.Dial("udp", node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	round := func(q []byte) {
+		t.Helper()
+		c.Write(q)
+		c.SetReadDeadline(time.Now().Add(3 * time.Second))
+		if _, err := c.Read(make([]byte, 4096)); err != nil {
+			t.Fatalf("no answer: %v", err)
+		}
+	}
+	round(probeQuery("www.example.org", 1, 1232))                                                                     // refused
+	round(probeQuery(zone, 6, 1232))                                                                                  // the apex
+	round(probeQuery(probeLabel(probeKey, zone, false, uint32(time.Now().Unix()/60), [8]byte{1})+"."+zone, 16, 1232)) // a probe
+	round(probeQuery("x."+spare, 1, 1232))                                                                            // the backend: NODATA
+	round(probeQuery("y."+spare, 16, 1232))                                                                           // the backend: not the tunnel's
+	c.Write([]byte{1, 2, 3})                                                                                          // no query
+	time.Sleep(100 * time.Millisecond)
+	s, err := net.Dial("unix", frontStats)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var st DNSFrontSnapshot
+	if err := json.NewDecoder(s).Decode(&st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Queries[zone] != 2 || st.Queries[spare] != 2 || len(st.Queries) != 2 || st.Refused != 1 || st.Apex != 1 || st.Probes != 1 ||
+		st.ProbesOverRate != 0 || st.Forwarded != 2 || st.Answers != 2 || st.BackendAway != 0 || st.Unmatched != 0 || st.Malformed != 1 ||
+		time.Since(time.Unix(st.Started, 0)) > time.Minute {
+		t.Fatalf("front stats %+v", st)
+	}
+}
+
+// mdClient is a client of the fork against a node, run until stop.
+type mdClient struct {
+	conns  chan net.Conn
+	cancel context.CancelFunc
+	done   chan struct{} // closed when Run returns, err set before
+	err    error
+}
+
+// errNoEcho: the client ran through the wait and no echo came back: what a
+// node refusing it looks like. errClientExited: the client stopped on its
+// own (a config the fork refuses), which says nothing of the node.
+var (
+	errNoEcho       = errors.New("no echo within the wait")
+	errClientExited = errors.New("the client exited")
+)
+
+// startMasterdns runs a client of the fork: seal is NIKO_MDSEAL ("" for
+// none), tagger the device's tags (nil for none).
+func startMasterdns(resolver, key, zone, seal string, tagger func(nonce, frame []byte) [8]byte, dir string) *mdClient {
+	config := map[string]any{
+		"DOMAINS": []string{zone}, "PROTOCOL_TYPE": "TCP",
+		"DATA_ENCRYPTION_METHOD": 5, "ENCRYPTION_KEY": key, "LOG_LEVEL": "ERROR",
+	}
+	if seal != "" {
+		config["NIKO_MDSEAL"] = seal
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	c := &mdClient{conns: make(chan net.Conn), cancel: cancel, done: make(chan struct{})}
+	go func() {
+		c.err = mdvembed.Run(ctx, mdvembed.Options{Config: config, Resolvers: []string{resolver}, WorkDir: dir, Conns: c.conns, Tagger: tagger})
+		close(c.done)
+	}()
+	return c
+}
+
+// stop ends the client and waits for it, a while at most.
+func (c *mdClient) stop() {
+	c.cancel()
+	select {
+	case <-c.done:
+	case <-time.After(10 * time.Second):
+	}
+}
+
+// echo sends an echo round through a new connection of the client, within
+// wait.
+func (c *mdClient) echo(wait time.Duration) error {
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	local, remote := net.Pipe()
+	defer local.Close()
+	select {
+	case c.conns <- remote:
+	case <-c.done:
+		return fmt.Errorf("%w: %v", errClientExited, c.err)
+	case <-timer.C:
+		return fmt.Errorf("%w: the client did not take the connection", errNoEcho)
+	}
+	message := randomBytes(4000)
+	go local.Write(message)
+	read := make(chan error, 1)
+	go func() {
+		echo := make([]byte, len(message))
+		_, err := io.ReadFull(local, echo)
+		if err == nil && !bytes.Equal(echo, message) {
+			err = errors.New("echo differs")
+		}
+		read <- err
+	}()
+	select {
+	case err := <-read:
+		return err
+	case <-c.done:
+		return fmt.Errorf("%w: %v", errClientExited, c.err)
+	case <-timer.C:
+		return errNoEcho
+	}
+}
+
+// masterdnsEcho runs a client against a node for one echo round within
+// wait.
+func masterdnsEcho(resolver, key, zone, seal string, tagger func(nonce, frame []byte) [8]byte, wait time.Duration, dir string) error {
+	c := startMasterdns(resolver, key, zone, seal, tagger, dir)
+	defer c.stop()
+	return c.echo(wait)
+}
+
+// deviceTagger tags masterdns queries with a device's key
+// (dnsauth-masterdns §2).
+func deviceTagger(k [32]byte) func(nonce, frame []byte) [8]byte {
+	return func(nonce, frame []byte) [8]byte {
+		return dnsttserver.Tag(&k, dnsttserver.EpochOf(time.Now()), append(append([]byte(nil), nonce...), frame...))
+	}
+}
+
+// readFrontStats reads the front's counters from its stats socket.
+func readFrontStats(path string) (DNSFrontSnapshot, error) {
+	var st DNSFrontSnapshot
+	c, err := net.Dial("unix", path)
+	if err != nil {
+		return st, err
+	}
+	defer c.Close()
+	c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	return st, json.NewDecoder(c).Decode(&st)
+}
+
+// writeKeys replaces a keys file whole, as raycontrol does (a rename): the
+// reread never sees it half written.
+func writeKeys(t *testing.T, path string, text string) {
+	t.Helper()
+	tmp := path + ".new"
+	if err := os.WriteFile(tmp, []byte(text), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// masterdns with mdseal-v1 and dnsauth (v0.11.0, the client's fork):
+// required, a client that seals and tags with its device's key reaches the
+// inner stage; one that does not seal, does not tag, or tags with another
+// key gets no session. Each refused one on a node of its own, all at once:
+// the client runs through its wait (it did not stop on a config of its
+// own), its queries reach the backend through the front, and no echo
+// comes back.
+func TestNekoServerMasterDNSSealAuth(t *testing.T) {
+	key := hex.EncodeToString(randomBytes(16))
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "encryption.key")
+	os.WriteFile(keyFile, []byte(key), 0o600)
+	var dev, other [32]byte
+	copy(dev[:], randomBytes(32))
+	copy(other[:], randomBytes(32))
+	authFile := filepath.Join(dir, "auth.keys")
+	os.WriteFile(authFile, []byte("d1 "+hex.EncodeToString(dev[:])+"\n"), 0o600)
+	zone := "v.example.com"
+	options := map[string]any{
+		"zones": []string{zone}, "encryption_method": 5, "encryption_key_file": keyFile,
+		"seal": "required", "auth": "required", "auth_keys_file": authFile,
+	}
+	resolver := startNode(t, "masterdns", zone, options)
+	if err := masterdnsEcho(resolver, key, zone, "required", deviceTagger(dev), 60*time.Second, t.TempDir()); err != nil {
+		t.Fatalf("sealed and tagged: %v", err)
+	}
+	var wg sync.WaitGroup
+	for what, c := range map[string]struct {
+		seal   string
+		tagger func(nonce, frame []byte) [8]byte
+	}{
+		"open":        {"", deviceTagger(dev)},
+		"untagged":    {"required", nil},
+		"another key": {"required", deviceTagger(other)},
+	} {
+		stats := filepath.Join(t.TempDir(), "front-stats.sock")
+		resolver := startNodeFull(t, "masterdns", zone, options, "", "", stats)
+		dir := t.TempDir()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := masterdnsEcho(resolver, key, zone, c.seal, c.tagger, 8*time.Second, dir); !errors.Is(err, errNoEcho) {
+				t.Errorf("%s: %v, want no echo with seal and auth required", what, err)
+			}
+			if st, err := readFrontStats(stats); err != nil || st.Forwarded == 0 {
+				t.Errorf("%s: the client's queries did not reach the backend: %+v %v", what, st, err)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// The keys file reread (every 5 s): a device removed loses its live
+// session's answers, one added gets a session.
+func TestNekoServerMasterDNSRevoke(t *testing.T) {
+	key := hex.EncodeToString(randomBytes(16))
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "encryption.key")
+	os.WriteFile(keyFile, []byte(key), 0o600)
+	var dev, late [32]byte
+	copy(dev[:], randomBytes(32))
+	copy(late[:], randomBytes(32))
+	authFile := filepath.Join(dir, "auth.keys")
+	writeKeys(t, authFile, "d1 "+hex.EncodeToString(dev[:])+"\n")
+	zone := "v.example.com"
+	resolver := startNode(t, "masterdns", zone, map[string]any{
+		"zones": []string{zone}, "encryption_method": 5, "encryption_key_file": keyFile,
+		"seal": "required", "auth": "required", "auth_keys_file": authFile,
+	})
+	c := startMasterdns(resolver, key, zone, "required", deviceTagger(dev), t.TempDir())
+	defer c.stop()
+	if err := c.echo(60 * time.Second); err != nil {
+		t.Fatalf("before: %v", err)
+	}
+	writeKeys(t, authFile, "d2 "+hex.EncodeToString(late[:])+"\n")
+	// The keys are reread every 5 s: until then the session answers, and
+	// an echo that comes late before then says nothing (review 14: a fixed
+	// wait left a second of margin, a slow echo ended the wait early).
+	written := time.Now()
+	for {
+		err := c.echo(4 * time.Second)
+		if errors.Is(err, errNoEcho) && time.Since(written) > 6*time.Second {
+			break
+		}
+		if err != nil && !errors.Is(err, errNoEcho) {
+			t.Fatalf("a removed device's live session: %v", err)
+		}
+		if time.Since(written) > 20*time.Second {
+			t.Fatal("a removed device's live session still answers 20 s after its key went")
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if err := c.echo(8 * time.Second); !errors.Is(err, errNoEcho) {
+		t.Fatalf("a removed device's live session afterwards: %v, want no echo", err)
+	}
+	if err := masterdnsEcho(resolver, key, zone, "required", deviceTagger(late), 60*time.Second, t.TempDir()); err != nil {
+		t.Fatalf("a device added: %v", err)
+	}
+}
+
+// optional: a client of before (no seal, no tag) goes on as it did, and
+// one that seals and tags too.
+func TestNekoServerMasterDNSOptional(t *testing.T) {
+	key := hex.EncodeToString(randomBytes(16))
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "encryption.key")
+	os.WriteFile(keyFile, []byte(key), 0o600)
+	var dev [32]byte
+	copy(dev[:], randomBytes(32))
+	authFile := filepath.Join(dir, "auth.keys")
+	os.WriteFile(authFile, []byte("d1 "+hex.EncodeToString(dev[:])+"\n"), 0o600)
+	zone := "v.example.com"
+	resolver := startNode(t, "masterdns", zone, map[string]any{
+		"zones": []string{zone}, "encryption_method": 5, "encryption_key_file": keyFile,
+		"seal": "optional", "auth": "optional", "auth_keys_file": authFile,
+	})
+	if err := masterdnsEcho(resolver, key, zone, "", nil, 60*time.Second, t.TempDir()); err != nil {
+		t.Fatalf("a client of before: %v", err)
+	}
+	if err := masterdnsEcho(resolver, key, zone, "optional", deviceTagger(dev), 60*time.Second, t.TempDir()); err != nil {
+		t.Fatalf("a client that seals and tags: %v", err)
 	}
 }
