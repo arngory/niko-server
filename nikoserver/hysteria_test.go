@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -28,6 +29,10 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )
+
+// isEOF is the end of a stream as a Hysteria2 conn reports it: its Read
+// wraps the stream's errors, io.EOF among them.
+func isEOF(err error) bool { return errors.Is(err, io.EOF) || err != nil && err.Error() == "EOF" }
 
 func writeUsers(t *testing.T, path string, passwords ...string) {
 	t.Helper()
@@ -276,6 +281,81 @@ func TestNekoServerHysteria(t *testing.T) {
 		if err := fetch(args[0], args[1], args[2]); err == nil {
 			t.Errorf("%s: got through", name)
 		}
+	}
+
+	// Half-closes pass through, one side at a time (the client's fork
+	// 26325f0): the client ends its question and still reads the answer, and
+	// a target that answers first and closes its side still gets the rest of
+	// the client's upload.
+	halfCloseTarget := func(answerFirst bool) (string, <-chan string) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { ln.Close() })
+		got := make(chan string, 1)
+		go func() {
+			c, err := ln.Accept()
+			if err != nil {
+				got <- err.Error()
+				return
+			}
+			defer c.Close()
+			c.SetDeadline(time.Now().Add(10 * time.Second))
+			if answerFirst {
+				first := make([]byte, 5)
+				io.ReadFull(c, first)
+				c.Write([]byte("answer"))
+				c.(*net.TCPConn).CloseWrite()
+				rest, _ := io.ReadAll(c)
+				got <- string(first) + string(rest)
+				return
+			}
+			question, _ := io.ReadAll(c)
+			c.Write([]byte("answer"))
+			got <- string(question)
+		}()
+		return ln.Addr().String(), got
+	}
+	hcl := probeClient()
+	defer hcl.CloseWithError(nil)
+	for _, answerFirst := range []bool{false, true} {
+		addr, got := halfCloseTarget(answerFirst)
+		hc, err := hcl.DialConn(ctx, M.ParseSocksaddr(addr))
+		if err != nil {
+			t.Fatal(err)
+		}
+		hc.SetDeadline(time.Now().Add(10 * time.Second))
+		hc.Write([]byte("part1"))
+		if answerFirst {
+			answer := make([]byte, 6)
+			if _, err := io.ReadFull(hc, answer); err != nil || string(answer) != "answer" {
+				t.Fatalf("the target's answer before its half-close: %q %v", answer, err)
+			}
+			if n, err := hc.Read(make([]byte, 1)); n != 0 || !isEOF(err) {
+				t.Fatalf("after the target's half-close: %d %v, want EOF", n, err)
+			}
+			if _, err := hc.Write([]byte("part2")); err != nil {
+				t.Fatalf("the client's upload after the target's half-close: %v", err)
+			}
+		}
+		if err := hc.(interface{ CloseWrite() error }).CloseWrite(); err != nil {
+			t.Fatalf("CloseWrite: %v", err)
+		}
+		if !answerFirst {
+			if answer, err := io.ReadAll(hc); (err != nil && !isEOF(err)) || string(answer) != "answer" {
+				t.Fatalf("the answer after the client's half-close: %q %v", answer, err)
+			}
+		}
+		select {
+		case question := <-got:
+			if want := map[bool]string{false: "part1", true: "part1part2"}[answerFirst]; question != want {
+				t.Fatalf("answer first %v: the target got %q, want %q", answerFirst, question, want)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("answer first %v: the target never got the client's end", answerFirst)
+		}
+		hc.Close()
 	}
 
 	// A rotated password: the users file changes, SIGHUP reloads it (the

@@ -464,6 +464,19 @@ func (c *serverConn) Write(p []byte) (n int, err error) {
 	return n, qtls.WrapError(err)
 }
 
+// CloseWrite ends this side of the stream and keeps reading the client's
+// (neko, from the client's fork arngory/sing-box 26325f0): bufio.CopyConn
+// passes the target's half-close on to a connection that has CloseWrite and
+// closes the others whole, so a target that finished first cancelled the
+// client's upload still under way. The response goes out first if it has
+// not.
+func (c *serverConn) CloseWrite() error {
+	if err := c.HandshakeSuccess(); err != nil {
+		return err
+	}
+	return qtls.WrapError(c.Stream.Close())
+}
+
 func (c *serverConn) LocalAddr() net.Addr {
 	return M.Socksaddr{}
 }

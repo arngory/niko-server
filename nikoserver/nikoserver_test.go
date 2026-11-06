@@ -612,6 +612,44 @@ func deviceTagger(k [32]byte) func(nonce, frame []byte) [8]byte {
 	}
 }
 
+// deviceTagger2 tags masterdns queries with a device's dnsauth-v2 field
+// (raycontrol dnsauth-v2.md): the hint, then the tag.
+func deviceTagger2(k [32]byte) func(nonce, frame []byte) [8]byte {
+	return func(nonce, frame []byte) [8]byte {
+		return dnsttserver.Tag2(&k, dnsttserver.EpochOf(time.Now()), append(append([]byte(nil), nonce...), frame...))
+	}
+}
+
+// masterdns with dnsauth-v2 required (v0.12.0): a client whose tags carry
+// the hint gets in; one with dnsauth-v1 tags does not, with the same key.
+func TestNekoServerMasterDNSAuthHint(t *testing.T) {
+	key := hex.EncodeToString(randomBytes(16))
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "encryption.key")
+	os.WriteFile(keyFile, []byte(key), 0o600)
+	var dev [32]byte
+	copy(dev[:], randomBytes(32))
+	authFile := filepath.Join(dir, "auth.keys")
+	os.WriteFile(authFile, []byte("d1 "+hex.EncodeToString(dev[:])+"\n"), 0o600)
+	zone := "v.example.com"
+	options := map[string]any{
+		"zones": []string{zone}, "encryption_method": 5, "encryption_key_file": keyFile,
+		"seal": "required", "auth": "required", "auth_keys_file": authFile, "auth_hint": "required",
+	}
+	resolver := startNode(t, "masterdns", zone, options)
+	if err := masterdnsEcho(resolver, key, zone, "required", deviceTagger2(dev), 60*time.Second, t.TempDir()); err != nil {
+		t.Fatalf("v2 tags: %v", err)
+	}
+	stats := filepath.Join(t.TempDir(), "front-stats.sock")
+	resolver = startNodeFull(t, "masterdns", zone, options, "", "", stats)
+	if err := masterdnsEcho(resolver, key, zone, "required", deviceTagger(dev), 8*time.Second, t.TempDir()); !errors.Is(err, errNoEcho) {
+		t.Fatalf("v1 tags with the hint required: %v, want no echo", err)
+	}
+	if st, err := readFrontStats(stats); err != nil || st.Forwarded == 0 {
+		t.Fatalf("the v1 client's queries did not reach the backend: %+v %v", st, err)
+	}
+}
+
 // readFrontStats reads the front's counters from its stats socket.
 func readFrontStats(path string) (DNSFrontSnapshot, error) {
 	var st DNSFrontSnapshot

@@ -87,9 +87,14 @@ type DeviceAuth struct {
 	// scans a second at least: with many devices the floors together can
 	// pass ScanHMACs.
 	ScanHMACs float64
+	// Hint takes dnsauth-v2 tags (raycontrol dnsauth-v2.md): Device and Scan
+	// look the key up by the hint, outside the budgets; HintRequired takes
+	// no dnsauth-v1 tag and scans nothing.
+	Hint HintMode
 
-	keys atomic.Pointer[deviceKeys]
-	text atomic.Pointer[[]byte] // the keys file's text in force
+	keys  atomic.Pointer[deviceKeys]
+	text  atomic.Pointer[[]byte] // the keys file's text in force
+	hints hintIndexes            // dnsauth-v2's, for the keys in force
 
 	slots [scanKinds]scanSlot
 
@@ -126,7 +131,18 @@ func (a *DeviceAuth) SetKeys(text []byte) error {
 	a.keys.Store(dk)
 	kept := slices.Clone(text)
 	a.text.Store(&kept)
+	if a.Hint != HintOff {
+		a.hints.get(k, EpochOf(a.clock())) // at once: a key gone is not found
+	}
 	return nil
+}
+
+// match2 checks a v2 tag with key i's own HMAC, under its lock.
+func (k *deviceKeys) match2(i int, epoch uint32, field *[AuthTagLen]byte, msg []byte) bool {
+	m := k.device[i]
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return match2(m.h, epoch, field, msg, &m.scratch)
 }
 
 // Devices is the number of keys in force.
@@ -183,7 +199,21 @@ func (a *DeviceAuth) Device(id string, tag [AuthTagLen]byte, msg []byte) bool {
 		a.Refused.Add(1) // revoked, or never there
 		return false
 	}
-	es := epochs(a.clock())
+	now := a.clock()
+	if a.Hint != HintOff {
+		x := a.hints.get(k.authKeys, EpochOf(now))
+		for _, i := range idx {
+			if x.keyMatches(i, &tag, func(epoch uint32) bool { return k.match2(i, epoch, &tag, msg) }) {
+				a.Valid.Add(1)
+				return true
+			}
+		}
+		if a.Hint == HintRequired {
+			a.Refused.Add(1)
+			return false
+		}
+	}
+	es := epochs(now)
 	var t [AuthTagLen]byte
 	for _, i := range idx {
 		m := k.device[i]
@@ -217,6 +247,20 @@ func (a *DeviceAuth) Scan(kind ScanKind, tag [AuthTagLen]byte, msg []byte) (stri
 	if k == nil || len(k.keys) == 0 {
 		a.Refused.Add(1)
 		return "", false
+	}
+	// dnsauth-v2: the key the hint names, before the budget and the scan.
+	if a.Hint != HintOff {
+		x := a.hints.get(k.authKeys, EpochOf(a.clock()))
+		if i := x.find(&tag, func(i int, epoch uint32) bool { return k.match2(i, epoch, &tag, msg) }); i >= 0 {
+			// Not among the recent ones: those are for the v1 pass, and
+			// v2 devices would push v1 ones out of it.
+			a.Valid.Add(1)
+			return k.keys[i].id, true
+		}
+		if a.Hint == HintRequired {
+			a.Refused.Add(1) // no dnsauth-v1 tag is taken: nothing to scan
+			return "", false
+		}
 	}
 	if !a.budget(slot, kind, len(k.keys)) {
 		a.Throttled.Add(1)
