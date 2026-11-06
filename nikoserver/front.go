@@ -189,6 +189,9 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 			}
 			return envError("read %s: %v", local, err)
 		}
+		if n > maxDNSQuery {
+			continue
+		}
 		query := buffer[:n]
 		name, questionEnd, ok := queryName(query)
 		if !ok {
@@ -220,6 +223,11 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 		f.zoneBackend[zone].send(encodePacket(message, client, local, query))
 	}
 }
+
+// maxDNSQuery: a query over UDP is a few hundred bytes, and dnstt reads
+// 4096 at most. Larger datagrams were copied whole into the queues to the
+// backend (1024 each way, up to 64 MiB each).
+const maxDNSQuery = 4096
 
 // answer sends a backend's answer from the socket the query came in on:
 // only to a query that waits for it, and within its requester's size

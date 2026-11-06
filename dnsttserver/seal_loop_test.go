@@ -32,7 +32,6 @@ func (c feedConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 	return len(p), nil
 }
 
-
 func sealedPollQuery(t *testing.T, k *sealKey, nonce, inner []byte, zone string) []byte {
 	t.Helper()
 	payload := sealQuery(k, nonce, inner)
@@ -72,10 +71,14 @@ func TestSealedPollsNotMemoized(t *testing.T) {
 	defer tt.Close()
 	conn := feedConn{in: make(chan []byte, 4), out: make(chan []byte, 4)}
 	ch := make(chan *record, 4)
-	go recvLoop(domain, conn, tt, ch, nil, seal, &clientSizes{overhead: seal.overhead()})
-	go sendLoop(conn, tt, ch)
-
 	id := turbotunnel.ClientID{1, 2, 3, 4, 5, 6, 7, 8}
+	// The client's session is in the table (its polls carry no packets
+	// that would admit it): sendLoop answers it from its queues.
+	sessions := newSessionTable()
+	sessions.admit(id)
+	go recvLoop(domain, conn, tt, ch, nil, seal, &clientSizes{overhead: seal.overhead()}, sessions)
+	go sendLoop(conn, tt, ch, sessions)
+
 	inner := append(id[:], 0xe0) // ClientID, a padding frame of 0 bytes
 	ask := func(nonce []byte) []byte {
 		conn.in <- sealedPollQuery(t, k, nonce, inner, zone)
@@ -109,6 +112,7 @@ func TestSealedPollsNotMemoized(t *testing.T) {
 		t.Errorf("a new poll (another N) got the earlier answer replayed; the queued packet did not go out")
 	}
 }
+
 // TestSendLoopStashSwap with a seal: the stash holds a packet too large for
 // this requester; a packet too large for a sealed answer to it (though it
 // would fit an open one) does not take its place.
@@ -129,7 +133,7 @@ func TestSendLoopSealedStashSwap(t *testing.T) {
 	tt.WriteTo(small, id)
 	out := make(chan []byte, 4)
 	ch := make(chan *record, 1)
-	go sendLoop(capture{out: out}, tt, ch)
+	go sendLoop(capture{out: out}, tt, ch, nil)
 	zone, _ := dns.ParseName("x.t.example.com")
 	ch <- &record{Resp: &dns.Message{ID: 1, Flags: 0x8400, Question: []dns.Question{{Name: zone, Type: dns.RRTypeTXT, Class: dns.ClassIN}}},
 		Addr: turbotunnel.DummyAddr{}, ClientID: id, Size: 512, Seal: s.list()[0]}
