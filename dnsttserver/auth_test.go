@@ -211,7 +211,7 @@ func TestNoDataForOtherTypes(t *testing.T) {
 		for _, qtype := range []uint16{1 /* A */, 2 /* NS */, 28 /* AAAA */} {
 			q := &dns.Message{ID: 1, Flags: 0x0100, Question: []dns.Question{{Name: n, Type: qtype, Class: dns.ClassIN}},
 				Additional: []dns.RR{{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 1232}}}
-			resp, payload := responseFor(q, zone, nil)
+			resp, payload, _ := responseFor(q, zone, nil, nil)
 			if resp == nil || resp.Rcode() != dns.RcodeNoError || resp.Flags&0x0400 == 0 || payload != nil || carriesData(resp) {
 				t.Errorf("%s type %d: %+v", name, qtype, resp)
 			}
@@ -221,7 +221,7 @@ func TestNoDataForOtherTypes(t *testing.T) {
 	n, _ := dns.ParseName("aaaaaaaaaaaaaaaa.t.example.com")
 	q := &dns.Message{ID: 1, Flags: 0x0100, Question: []dns.Question{{Name: n, Type: dns.RRTypeTXT, Class: dns.ClassIN}},
 		Additional: []dns.RR{{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 1232}}}
-	if resp, _ := responseFor(q, zone, nil); resp == nil || !carriesData(resp) {
+	if resp, _, _ := responseFor(q, zone, nil, nil); resp == nil || !carriesData(resp) {
 		t.Errorf("TXT: %+v", resp)
 	}
 }

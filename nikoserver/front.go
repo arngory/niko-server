@@ -84,7 +84,7 @@ func listenDNS(ctx context.Context, network string, addr netip.AddrPort) (*net.U
 
 func runDNSFront(ctx context.Context, c *FrontConfig, log *Logger) error {
 	front := &dnsFront{log: log, zoneBackend: make(map[string]*backendLink), sockets: make(map[netip.AddrPort]*net.UDPConn),
-		probeZones: map[string]bool{}, apex: map[string]*apexZone{}}
+		probeZones: map[string]bool{}, padZones: map[string]bool{}, apex: map[string]*apexZone{}}
 	if c.DNS.ProbeKeyFile != "" {
 		// Without the key the front answers no probes, and goes on: the
 		// tunnels, TCP and UDP 443 must not stop for a resolver check.
@@ -133,6 +133,9 @@ func runDNSFront(ctx context.Context, c *FrontConfig, log *Logger) error {
 		if z.Probe {
 			front.probeZones[zone] = true
 		}
+		if z.SealPad {
+			front.padZones[zone] = true
+		}
 		if len(z.NS) > 0 {
 			front.apex[zone] = newApexZone(zone, z.NS, serial)
 		}
@@ -161,6 +164,7 @@ type dnsFront struct {
 	log         *Logger
 	probe       *dnsProbe       // dnsprobe-v1, nil without a key
 	probeZones  map[string]bool // the zones it answers in
+	padZones    map[string]bool // those with sealed answers (dnsseal-v1): probe answers padded as theirs
 	apex        map[string]*apexZone
 	zones       []string
 	zoneBackend map[string]*backendLink
@@ -203,7 +207,7 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 			}
 		}
 		if f.probe != nil && f.probeZones[zone] {
-			if reply, probe := f.probe.answer(query, name, questionEnd, zone, client.Addr()); probe {
+			if reply, probe := f.probe.answer(query, name, questionEnd, zone, client.Addr(), f.padZones[zone]); probe {
 				if reply != nil {
 					conn.WriteToUDPAddrPort(reply, client)
 				}
