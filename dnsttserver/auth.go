@@ -166,6 +166,7 @@ func (a *Auth) LoadKeys(file string) error {
 // in force. Every hour it logs the counters, when they moved.
 func (a *Auth) WatchKeys(file string, every time.Duration, stop <-chan struct{}, logf func(string, ...any)) {
 	var bad []byte
+	var readErr string // the last read error logged, once
 	t := time.NewTicker(every)
 	defer t.Stop()
 	report := time.Now().Add(time.Hour)
@@ -186,9 +187,17 @@ func (a *Auth) WatchKeys(file string, every time.Duration, stop <-chan struct{},
 		}
 		b, err := os.ReadFile(file) //nolint:gosec // G304: the configured file
 		if err != nil {
-			continue // being replaced, or gone: the keys stay
+			// Being replaced, or gone: the keys stay, said once.
+			if err.Error() != readErr {
+				readErr = err.Error()
+				logf("auth keys %s not read, the %d in force stay: %v", file, a.Devices(), err)
+			}
+			continue
 		}
-		if cur := a.text.Load(); (cur != nil && bytes.Equal(b, *cur)) || bytes.Equal(b, bad) {
+		readErr = ""
+		// bad != nil: an empty file is not the bad one (review 9: a file
+		// emptied of its last device was never taken).
+		if cur := a.text.Load(); (cur != nil && bytes.Equal(b, *cur)) || (bad != nil && bytes.Equal(b, bad)) {
 			continue
 		}
 		if err := a.SetKeys(b); err != nil {

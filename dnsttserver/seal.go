@@ -232,7 +232,7 @@ func (s *Seal) WatchKeys(path string, every time.Duration, stop <-chan struct{},
 		if err != nil {
 			continue // being replaced, or gone: the keys stay
 		}
-		if cur := s.text.Load(); (cur != nil && bytes.Equal(b, *cur)) || bytes.Equal(b, bad) {
+		if cur := s.text.Load(); (cur != nil && bytes.Equal(b, *cur)) || (bad != nil && bytes.Equal(b, bad)) {
 			continue
 		}
 		if err := s.SetKeys(b); err != nil {

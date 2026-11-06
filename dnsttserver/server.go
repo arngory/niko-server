@@ -245,7 +245,7 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream Dialer, 
 		// (neko) Not admitted by recvLoop (or no longer): closed at
 		// once; its last ACKs go nowhere (sessionConn).
 		id, _ := conn.RemoteAddr().(turbotunnel.ClientID)
-		if !sessions.add(id) {
+		if !sessions.add(id, conn.Close) {
 			conn.Close()
 			continue
 		}

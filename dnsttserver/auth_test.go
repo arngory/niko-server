@@ -724,4 +724,18 @@ func TestAuthWatchKeysContent(t *testing.T) {
 	if a.Devices() != 1 || a.keys.Load().keys[0].key[0] != 0x22 {
 		t.Fatal("a bad file replaced the keys")
 	}
+	// Emptied, the last device revoked: no key (review 9: an empty file
+	// matched the nil bad one and was never taken).
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for range 200 {
+		if a.Devices() == 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if a.Devices() != 0 {
+		t.Fatalf("an emptied file kept %d devices", a.Devices())
+	}
 }
