@@ -127,9 +127,10 @@ func TestDeviceAuthRecent(t *testing.T) {
 	}
 }
 
-// A kind's scan under way refuses another of the kind at once, not after
-// it (review 13: the workers waited behind a scan of garbage); the other
-// kinds and Device go on.
+// A kind's full pass under way refuses another of the kind at once, not
+// after it (review 13: the workers waited behind a scan of garbage); the
+// recent devices are found beside it (review 14), and the other kinds and
+// Device go on.
 func TestDeviceAuthScanBusy(t *testing.T) {
 	now := time.Unix(1767268800, 0)
 	keys, text := devKeys(t, 20)
@@ -137,7 +138,7 @@ func TestDeviceAuthScanBusy(t *testing.T) {
 	a.SetKeys(text)
 	msg := []byte("busy")
 	tagOf := func(i int) [AuthTagLen]byte { return Tag(&keys[i], EpochOf(now), msg) }
-	a.slots[ScanProbe].mu.Lock() // a probe's scan under way
+	a.slots[ScanProbe].full.Lock() // a probe's full pass under way
 	done := make(chan bool)
 	go func() {
 		_, ok := a.Scan(ScanProbe, tagOf(3), msg)
@@ -157,9 +158,36 @@ func TestDeviceAuthScanBusy(t *testing.T) {
 	if !a.Device("d4", tagOf(4), msg) {
 		t.Fatal("a session's check beside a probe's scan")
 	}
-	a.slots[ScanProbe].mu.Unlock()
-	if id, ok := a.Scan(ScanProbe, tagOf(3), msg); !ok || id != "d3" {
+	// d3 is recent now (its INIT): its probes are found beside the pass.
+	if id, ok := a.Scan(ScanProbe, tagOf(3), msg); !ok || id != "d3" || a.Throttled.Load() != 1 {
+		t.Fatalf("a recent device's probe beside a probe's scan: %q %v, throttled %d", id, ok, a.Throttled.Load())
+	}
+	a.slots[ScanProbe].full.Unlock()
+	if id, ok := a.Scan(ScanProbe, tagOf(5), msg); !ok || id != "d5" {
 		t.Fatalf("a probe after the scan: %q %v", id, ok)
+	}
+}
+
+// The recent pass is charged to the kind's budget and refused with it:
+// with the budget spent, no HMAC is done.
+func TestDeviceAuthRecentCharged(t *testing.T) {
+	now := time.Unix(1767268800, 0)
+	keys, text := devKeys(t, 300)
+	a := &DeviceAuth{Now: func() time.Time { return now }, ScanHMACs: 1}
+	a.SetKeys(text)
+	msg := []byte("charged")
+	tag := Tag(&keys[7], EpochOf(now), msg)
+	if id, ok := a.Scan(ScanInit, tag, msg); !ok || id != "d7" {
+		t.Fatalf("first: %q %v", id, ok)
+	}
+	before := a.slots[ScanInit].tokens
+	if id, ok := a.Scan(ScanInit, tag, msg); !ok || id != "d7" || before-a.slots[ScanInit].tokens != 1 {
+		t.Fatalf("recent: %q %v, charged %v", id, ok, before-a.slots[ScanInit].tokens)
+	}
+	a.slots[ScanInit].tokens = 0
+	throttled := a.Throttled.Load()
+	if _, ok := a.Scan(ScanInit, tag, msg); ok || a.Throttled.Load() != throttled+1 || a.slots[ScanInit].tokens != 0 {
+		t.Fatalf("a recent device with the budget spent: %v, tokens %v", ok, a.slots[ScanInit].tokens)
 	}
 }
 

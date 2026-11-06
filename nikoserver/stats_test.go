@@ -36,7 +36,13 @@ func TestAcceptBackoff(t *testing.T) {
 	if d := b.next(); d != time.Second {
 		t.Fatalf("the cap: %v", d)
 	}
-	if b.delay = 0; b.next() != 5*time.Millisecond {
+	if b.ok(); b.next() != 5*time.Millisecond {
 		t.Fatal("from the start after an accept that works")
+	}
+	// A later episode is said again.
+	b.ok()
+	b.again(emfile, log)
+	if n := strings.Count(buf.String(), "too many open files"); n != 2 {
+		t.Fatalf("a second episode: said %d times in all", n)
 	}
 }

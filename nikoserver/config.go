@@ -557,12 +557,20 @@ func (c *BackendConfig) validate() []ConfigError {
 		} else {
 			checkSocket(&e, "stats_socket", c.StatsSocket)
 		}
-		// The backend removes what is at the path before it listens there.
-		for _, f := range []struct{ path, what string }{
-			{c.Socket, "the backend's socket"}, {c.Inner, "the inner stage's socket"},
+		// The backend removes what is at the path before it listens there:
+		// none of the files it reads (review 14: the Hysteria2 backends'
+		// TLS key went at their next start).
+		files := []struct{ path, what string }{
+			{c.Socket, "the backend's socket"}, {c.Inner, "the inner stage's socket"}, {c.UsersFile, "users_file"},
 			{c.Options.PrivateKeyFile, "options.private_key_file"}, {c.Options.AuthKeysFile, "options.auth_keys_file"},
 			{c.Options.SealKeyFile, "options.seal_key_file"}, {c.Options.EncryptionKeyFile, "options.encryption_key_file"},
-		} {
+			{c.Options.ObfsPasswordFile, "options.obfs_password_file"},
+		}
+		if c.TLS != nil {
+			files = append(files, struct{ path, what string }{c.TLS.CertificateFile, "tls.certificate_file"},
+				struct{ path, what string }{c.TLS.KeyFile, "tls.key_file"})
+		}
+		for _, f := range files {
 			if samePath(c.StatsSocket, f.path) {
 				e.add("stats_socket", "the path of %s", f.what)
 			}

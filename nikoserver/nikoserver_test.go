@@ -712,9 +712,24 @@ func TestNekoServerMasterDNSRevoke(t *testing.T) {
 		t.Fatalf("before: %v", err)
 	}
 	writeKeys(t, authFile, "d2 "+hex.EncodeToString(late[:])+"\n")
-	time.Sleep(6 * time.Second) // a reread
+	// The keys are reread every 5 s: until then the session answers
+	// (review 14: a fixed wait left a second of margin).
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		err := c.echo(4 * time.Second)
+		if errors.Is(err, errNoEcho) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("a removed device's live session: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("a removed device's live session still answers 20 s after its key went")
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 	if err := c.echo(8 * time.Second); !errors.Is(err, errNoEcho) {
-		t.Fatalf("a removed device's live session: %v, want no echo", err)
+		t.Fatalf("a removed device's live session afterwards: %v, want no echo", err)
 	}
 	if err := masterdnsEcho(resolver, key, zone, "required", deviceTagger(late), 60*time.Second, t.TempDir()); err != nil {
 		t.Fatalf("a device added: %v", err)

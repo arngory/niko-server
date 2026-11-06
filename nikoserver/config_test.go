@@ -257,6 +257,9 @@ func TestNekoServerConfigReview13(t *testing.T) {
 		"inner":"/run/niko/inner/vless.sock","options":{"zone":"t.example.com","private_key_file":"/run/credentials/niko-dns.service/dnstt.key",
 		"auth":"optional","auth_keys_file":"/run/niko/dns-in/auth.keys","seal":"optional","seal_key_file":"/run/niko/dns-in/seal.keys"}}`
 	entry := `{"zone":"%s","backend":"dns","ns":["%s"]}`
+	hy2 := `{"schema":1,"role":"backend","kind":"hy2-masq","socket":"/run/niko/h/packet.sock","front_uid":9100,
+		"users_file":"/r/h/users.json","tls":{"certificate_file":"/r/h/chain.pem","key_file":"/run/niko/h/key.pem"},
+		"stats_socket":"STATS","options":{"obfs_password_file":"/r/h/obfs.pass"}}`
 	zones := func(es ...string) string { return strings.Replace(front, "ZONES", strings.Join(es, ","), 1) }
 	stats := func(path string) string {
 		return strings.Replace(dnstt, `"inner":`, `"stats_socket":"`+path+`","inner":`, 1)
@@ -272,6 +275,11 @@ func TestNekoServerConfigReview13(t *testing.T) {
 		{stats("/run/niko/dns-in/auth.keys"), "stats_socket"},
 		{stats("/run/niko/dns-in/./seal.keys"), "stats_socket"},
 		{stats("/run/niko/inner/vless.sock"), "stats_socket"},
+		// Review 14: the Hysteria2 backends' own files.
+		{strings.Replace(hy2, "STATS", "/r/h//users.json", 1), "stats_socket"},
+		{strings.Replace(hy2, "STATS", "/r/h/chain.pem", 1), "stats_socket"},
+		{strings.Replace(hy2, "STATS", "/run/niko/h/./key.pem", 1), "stats_socket"},
+		{strings.Replace(strings.Replace(hy2, "hy2-masq", "hy2-obfs", 1), "STATS", "/r/h/obfs.pass", 1), "stats_socket"},
 	} {
 		errs := checkConfig(t, c.content)
 		found := false
@@ -287,6 +295,7 @@ func TestNekoServerConfigReview13(t *testing.T) {
 		zones(fmt.Sprintf(entry, "t.ns.example.com", "ns.example.com")),
 		zones(fmt.Sprintf(entry, "t.example.com", "NS.example.net."), fmt.Sprintf(entry, "s.example.org", "ns.example.net")),
 		stats("/run/niko/dns/stats.sock"),
+		strings.Replace(strings.Replace(hy2, "hy2-masq", "hy2-obfs", 1), "STATS", "/run/niko/h/stats.sock", 1),
 	} {
 		if errs := checkConfig(t, ok); len(errs) > 0 {
 			t.Errorf("%v", errs)
