@@ -125,7 +125,7 @@ func FuzzResponseFor(f *testing.F) {
 			t.Fatalf("answer: %v", err)
 		}
 		size := requesterSize(&query)
-		if size < 512 || size > maxUDPPayload || encodedPayload(size) <= sealNonceLen+2 {
+		if size < 512 || size > maxUDPPayload || encodedPayload(size) <= sealHeadLen+2 {
 			t.Fatalf("requester size %d, payload %d", size, encodedPayload(size))
 		}
 		// The packets, as recvLoop takes them.
@@ -194,7 +194,7 @@ func FuzzSealAnswer(f *testing.F) {
 	f.Add(bytes.Repeat([]byte{1}, 54), uint16(1000))
 	f.Fuzz(func(t *testing.T, frames []byte, room uint16) {
 		out := k.answer(frames, int(room))
-		n := sealNonceLen + len(frames)
+		n := sealHeadLen + len(frames)
 		if len(out) < n || len(out) > max(int(room), n) {
 			t.Fatalf("%d bytes for %d of frames, room %d", len(out), len(frames), room)
 		}
@@ -204,13 +204,12 @@ func FuzzSealAnswer(f *testing.F) {
 		if int(room)-n < 2 && len(out) != n {
 			t.Fatalf("%d bytes, room %d: padded without room", len(out), room)
 		}
-		plain := append([]byte(nil), out...)
-		sealXOR(&k.down, plain[:sealNonceLen], plain[sealNonceLen:])
-		if !bytes.Equal(plain[sealNonceLen:n], frames) {
+		plain := openAnswer(k, out)
+		if plain == nil || !bytes.Equal(plain[:len(frames)], frames) {
 			t.Fatal("frames do not open")
 		}
-		if bytes.ContainsFunc(plain[n:], func(r rune) bool { return r != 0 }) {
-			t.Fatalf("padding %x", plain[n:])
+		if bytes.ContainsFunc(plain[len(frames):], func(r rune) bool { return r != 0 }) {
+			t.Fatalf("padding %x", plain[len(frames):])
 		}
 	})
 }

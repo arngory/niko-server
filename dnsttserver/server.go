@@ -723,7 +723,7 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 			// and R of a sealed answer.
 			capacity := encodedPayload(rec.Size)
 			if rec.Seal != nil {
-				capacity -= sealNonceLen
+				capacity -= sealHeadLen
 			}
 			limit := capacity
 			// We loop and bundle as many packets from OutgoingQueue

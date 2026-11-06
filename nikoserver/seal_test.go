@@ -65,6 +65,13 @@ func sealingResolver(t *testing.T, node, clientZone, zone string, key []byte) st
 		t.Fatal(err)
 	}
 	ku, kd := specMAC(key, "dnsseal-v1 up"), specMAC(key, "dnsseal-v1 down")
+	kut, kdt := specMAC(key, "dnsseal-v1 up tag"), specMAC(key, "dnsseal-v1 down tag")
+	tag := func(k, nonce, c []byte) []byte {
+		m := hmac.New(sha256.New, k)
+		m.Write(nonce)
+		m.Write(c)
+		return m.Sum(nil)[:4]
+	}
 	cz, _ := dns.ParseName(clientZone)
 	nz, _ := dns.ParseName(zone)
 	go func() {
@@ -92,11 +99,12 @@ func sealingResolver(t *testing.T, node, clientZone, zone string, key []byte) st
 			if len(payload) > 8 && payload[8] >= 224 {
 				payload = append(payload[:8:8], payload[min(len(payload), 9+int(payload[8]-224)):]...)
 			}
-			sealed := make([]byte, 8, 8+4+len(payload))
-			rand.Read(sealed)
-			sealed = append(sealed, 0, 0, 0, 0)
-			sealed = append(sealed, payload...)
-			specSealXOR(ku, sealed[:8], sealed[8:])
+			// N, the tag, the ciphertext (§3).
+			nonce := make([]byte, 8)
+			rand.Read(nonce)
+			c := append([]byte(nil), payload...)
+			specSealXOR(ku, nonce, c)
+			sealed := append(append(nonce, tag(kut, nonce, c)...), c...)
 			text := strings.ToLower(sealB32.EncodeToString(sealed))
 			var labels [][]byte
 			for len(text) > 0 {
@@ -136,14 +144,20 @@ func sealingResolver(t *testing.T, node, clientZone, zone string, key []byte) st
 				for i := range resp.Answer {
 					resp.Answer[i].Name = asked.Name
 					data, err := dns.DecodeRDataTXT(resp.Answer[i].Data)
-					if err != nil || len(data) < 8 {
+					if err != nil || len(data) < 12 {
 						t.Errorf("a sealed answer of %d bytes", len(data))
 						return
 					}
 					if len(data)%64 != 0 && len(data) < 900 {
 						t.Errorf("TXT data of %d bytes: not padded to 64", len(data))
 					}
-					plain := append([]byte(nil), data[8:]...)
+					// R, the tag, the ciphertext (§4): a tag that does
+					// not fit, and the answer is dropped.
+					if !bytes.Equal(data[8:12], tag(kdt, data[:8], data[12:])) {
+						t.Errorf("an answer whose tag does not fit")
+						return
+					}
+					plain := append([]byte(nil), data[12:]...)
 					specSealXOR(kd, data[:8], plain)
 					var frames []byte
 					for i := 0; i+2 <= len(plain); {
