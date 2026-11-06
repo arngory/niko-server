@@ -712,18 +712,19 @@ func TestNekoServerMasterDNSRevoke(t *testing.T) {
 		t.Fatalf("before: %v", err)
 	}
 	writeKeys(t, authFile, "d2 "+hex.EncodeToString(late[:])+"\n")
-	// The keys are reread every 5 s: until then the session answers
-	// (review 14: a fixed wait left a second of margin).
-	deadline := time.Now().Add(20 * time.Second)
+	// The keys are reread every 5 s: until then the session answers, and
+	// an echo that comes late before then says nothing (review 14: a fixed
+	// wait left a second of margin, a slow echo ended the wait early).
+	written := time.Now()
 	for {
 		err := c.echo(4 * time.Second)
-		if errors.Is(err, errNoEcho) {
+		if errors.Is(err, errNoEcho) && time.Since(written) > 6*time.Second {
 			break
 		}
-		if err != nil {
+		if err != nil && !errors.Is(err, errNoEcho) {
 			t.Fatalf("a removed device's live session: %v", err)
 		}
-		if time.Now().After(deadline) {
+		if time.Since(written) > 20*time.Second {
 			t.Fatal("a removed device's live session still answers 20 s after its key went")
 		}
 		time.Sleep(500 * time.Millisecond)
