@@ -195,6 +195,10 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream Dialer, sessio
 	}
 	defer sess.Close()
 
+	// (neko) Each stream dials the inner stage: a socket and goroutines on
+	// the node for as long as it is open. A session gets MaxStreams at
+	// once (review 8: one took as many as it opened).
+	open := make(chan struct{}, MaxStreams)
 	for {
 		stream, err := sess.AcceptStream()
 		if err != nil {
@@ -204,11 +208,19 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream Dialer, sessio
 			}
 			return err
 		}
+		select {
+		case open <- struct{}{}:
+		default:
+			queryLog.Printf("stream %08x:%d refused: %d open", conn.GetConv(), stream.ID(), MaxStreams)
+			stream.Close()
+			continue
+		}
 		log.Printf("begin stream %08x:%d", conn.GetConv(), stream.ID())
 		go func() {
 			defer func() {
 				log.Printf("end stream %08x:%d", conn.GetConv(), stream.ID())
 				stream.Close()
+				<-open
 			}()
 			err := handleStream(stream, upstream, conn.GetConv())
 			if err != nil {
@@ -686,7 +698,7 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 				}
 				// (neko) KCP sees a new ClientID's packets only once
 				// the session table admits it.
-				if first && !sessions.admit(clientID, p) {
+				if first && !sessions.admit(clientID, p, func() string { return auth.DeviceOf(clientID) }) {
 					break
 				}
 				// Feed the incoming packet to KCP.

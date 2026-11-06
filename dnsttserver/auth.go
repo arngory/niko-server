@@ -87,6 +87,7 @@ type Auth struct {
 	ScanHMACs float64
 
 	keys atomic.Pointer[authKeys]
+	text atomic.Pointer[[]byte] // the keys file's text in force (WatchKeys)
 
 	mu sync.Mutex // the macs, the caches and the scan budget
 	// ClientID -> device id of its last valid tag, in two generations: a
@@ -135,6 +136,8 @@ func (a *Auth) SetKeys(text []byte) error {
 		return err
 	}
 	a.keys.Store(k)
+	kept := bytes.Clone(text)
+	a.text.Store(&kept)
 	return nil
 }
 
@@ -155,18 +158,14 @@ func (a *Auth) LoadKeys(file string) error {
 	return a.SetKeys(b)
 }
 
-// WatchKeys reloads the file when its modification time or size changes,
-// until stop is closed. A file that does not parse keeps the keys in force.
-// Every hour it logs the counters, when they moved.
+// WatchKeys reads the file again every period, until stop is closed, and
+// takes it when its text differs from the keys in force: by content, not
+// modification time and size (review 8: a file rewritten before the first
+// look, or at the same size within a tick, kept a revoked device's key, as
+// the seal's watcher did before). A file that does not parse keeps the keys
+// in force. Every hour it logs the counters, when they moved.
 func (a *Auth) WatchKeys(file string, every time.Duration, stop <-chan struct{}, logf func(string, ...any)) {
-	stat := func() (time.Time, int64) {
-		fi, err := os.Stat(file)
-		if err != nil {
-			return time.Time{}, -1
-		}
-		return fi.ModTime(), fi.Size()
-	}
-	mod, size := stat()
+	var bad []byte
 	t := time.NewTicker(every)
 	defer t.Stop()
 	report := time.Now().Add(time.Hour)
@@ -185,15 +184,19 @@ func (a *Auth) WatchKeys(file string, every time.Duration, stop <-chan struct{},
 				logf("auth: %d valid, %d untagged, %d refused (%d over the scan budget) since the start", now[0], now[1], now[2], now[3])
 			}
 		}
-		m, s := stat()
-		if m.Equal(mod) && s == size {
+		b, err := os.ReadFile(file) //nolint:gosec // G304: the configured file
+		if err != nil {
+			continue // being replaced, or gone: the keys stay
+		}
+		if cur := a.text.Load(); (cur != nil && bytes.Equal(b, *cur)) || bytes.Equal(b, bad) {
 			continue
 		}
-		mod, size = m, s
-		if err := a.LoadKeys(file); err != nil {
+		if err := a.SetKeys(b); err != nil {
+			bad = b
 			logf("auth keys %s not reloaded: %v", file, err)
 			continue
 		}
+		bad = nil
 		logf("auth keys reloaded: %d devices", a.Devices())
 	}
 }
@@ -389,6 +392,20 @@ func (a *Auth) refill(now time.Time, n int) (tokens, burst float64) {
 	}
 	a.last = now
 	return a.tokens, burst
+}
+
+// DeviceOf is the device whose valid tag id's queries carried last, ""
+// for none (auth off, untagged in optional mode, not seen).
+func (a *Auth) DeviceOf(id turbotunnel.ClientID) string {
+	if a == nil || a.Mode == AuthOff {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if dev, ok := a.cache[id]; ok {
+		return dev
+	}
+	return a.prev[id]
 }
 
 // cacheSession remembers the device a session's tag was valid for.
