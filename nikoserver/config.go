@@ -71,6 +71,9 @@ type FrontDNS struct {
 	// docs/spec/dnsprobe-v1.md), 32 bytes in hex. With it the front answers
 	// a client's check of a resolver itself, before the zone's backend.
 	ProbeKeyFile string `json:"probe_key_file,omitempty"`
+	// StatsSocket (v0.11.0): where the front gives its counters, one JSON
+	// line to each connection (DNSFrontSnapshot), for the node's metrics.
+	StatsSocket string `json:"stats_socket,omitempty"`
 }
 
 // TCPRoute sends TLS connections with one of these server names, or
@@ -312,6 +315,9 @@ func (c *FrontConfig) validate() []ConfigError {
 	}
 	if c.DNS.ProbeKeyFile != "" {
 		checkSocket(&e, "dns.probe_key_file", c.DNS.ProbeKeyFile)
+	}
+	if c.DNS.StatsSocket != "" {
+		checkSocket(&e, "dns.stats_socket", c.DNS.StatsSocket)
 	}
 	var seen []string
 	for i, z := range c.DNS.Zones {

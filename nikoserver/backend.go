@@ -98,7 +98,7 @@ func RunBackend(ctx context.Context, c *BackendConfig, log *Logger) error {
 		// The counters on the stats socket, for the node's metrics.
 		stats := &dnsttserver.Stats{Started: time.Now()}
 		if c.StatsSocket != "" {
-			stop, err := serveDNSTTStats(c.StatsSocket, stats, auth, seal, log)
+			stop, err := serveStats(c.StatsSocket, func() any { return stats.Snapshot(auth, seal) }, log)
 			if err != nil {
 				return envError("dnstt stats socket %s: %v", c.StatsSocket, err)
 			}

@@ -108,7 +108,7 @@ func nsFor(probeKeyFile string) []string {
 // startNodeWith is startNode with the front's dnsprobe-v1 key file (and
 // the zone's NS names, the front answering its apex).
 func startNodeWith(t *testing.T, kind, zone string, options map[string]any, probeKeyFile string) (resolver string) {
-	return startNodeFull(t, kind, zone, options, probeKeyFile, "")
+	return startNodeFull(t, kind, zone, options, probeKeyFile, "", "")
 }
 
 // frontZones are the front's zones of a node's backend: its zone, and the
@@ -123,8 +123,9 @@ func frontZones(zone string, options map[string]any, probeKeyFile string) []map[
 	return zones
 }
 
-// startNodeFull is startNodeWith with the backend's stats socket.
-func startNodeFull(t *testing.T, kind, zone string, options map[string]any, probeKeyFile, statsSocket string) (resolver string) {
+// startNodeFull is startNodeWith with the backend's stats socket and the
+// front's (dns.stats_socket).
+func startNodeFull(t *testing.T, kind, zone string, options map[string]any, probeKeyFile, statsSocket, frontStats string) (resolver string) {
 	dir := t.TempDir()
 	uid := os.Getuid()
 	inner := echoInner(t, dir)
@@ -142,11 +143,15 @@ func startNodeFull(t *testing.T, kind, zone string, options map[string]any, prob
 	}
 	writeJSON(t, backendPath, backend)
 	frontPath := filepath.Join(dir, "front.json")
+	dnsFront := map[string]any{"listen": []string{resolver}, "zones": frontZones(zone, options, probeKeyFile),
+		"probe_key_file": probeKeyFile}
+	if frontStats != "" {
+		dnsFront["stats_socket"] = frontStats
+	}
 	writeJSON(t, frontPath, map[string]any{
 		"schema": 1, "role": "front", "log": map[string]string{"level": "warn"},
 		"backends": map[string]any{"dns": map[string]any{"socket": socket, "mode": "packet", "uid": uid}},
-		"dns": map[string]any{"listen": []string{resolver}, "zones": frontZones(zone, options, probeKeyFile),
-			"probe_key_file": probeKeyFile},
+		"dns":      dnsFront,
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -453,5 +458,56 @@ func TestNekoServerDNSProbeKeyMissing(t *testing.T) {
 		if data, _ := dns.DecodeRDataTXT(rr.Data); len(data) == probeNonceLen+probeSmall {
 			t.Fatalf("a probe answered with the key missing: %x", data)
 		}
+	}
+}
+
+// The DNS front's counters on dns.stats_socket (v0.11.0): queries by zone,
+// and what became of them: refused outside the zones, the apex, probes,
+// passed to the backend and answered; datagrams that are no query.
+func TestNekoServerDNSFrontStats(t *testing.T) {
+	privkey, _ := noise.GeneratePrivkey()
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "noise.key")
+	os.WriteFile(keyFile, []byte(hex.EncodeToString(privkey)+"\n"), 0o600)
+	probeKey := bytes.Repeat([]byte{5}, 32)
+	probeFile := filepath.Join(dir, "dnsprobe.key")
+	os.WriteFile(probeFile, []byte(hex.EncodeToString(probeKey)+"\n"), 0o600)
+	frontStats := filepath.Join(dir, "front-stats.sock")
+	zone, spare := "t.example.com", "s.example.net"
+	node := startNodeFull(t, "dnstt", zone, map[string]any{"zone": zone, "zones": []string{spare}, "private_key_file": keyFile},
+		probeFile, "", frontStats)
+	c, err := net.Dial("udp", node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	round := func(q []byte) {
+		t.Helper()
+		c.Write(q)
+		c.SetReadDeadline(time.Now().Add(3 * time.Second))
+		if _, err := c.Read(make([]byte, 4096)); err != nil {
+			t.Fatalf("no answer: %v", err)
+		}
+	}
+	round(probeQuery("www.example.org", 1, 1232))                                                                     // refused
+	round(probeQuery(zone, 6, 1232))                                                                                  // the apex
+	round(probeQuery(probeLabel(probeKey, zone, false, uint32(time.Now().Unix()/60), [8]byte{1})+"."+zone, 16, 1232)) // a probe
+	round(probeQuery("x."+spare, 1, 1232))                                                                            // the backend: NODATA
+	round(probeQuery("y."+spare, 16, 1232))                                                                           // the backend: not the tunnel's
+	c.Write([]byte{1, 2, 3})                                                                                          // no query
+	time.Sleep(100 * time.Millisecond)
+	s, err := net.Dial("unix", frontStats)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var st DNSFrontSnapshot
+	if err := json.NewDecoder(s).Decode(&st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Queries[zone] != 2 || st.Queries[spare] != 2 || len(st.Queries) != 2 || st.Refused != 1 || st.Apex != 1 || st.Probes != 1 ||
+		st.ProbesOverRate != 0 || st.Forwarded != 2 || st.Answers != 2 || st.BackendAway != 0 || st.Unmatched != 0 || st.Malformed != 1 ||
+		time.Since(time.Unix(st.Started, 0)) > time.Minute {
+		t.Fatalf("front stats %+v", st)
 	}
 }

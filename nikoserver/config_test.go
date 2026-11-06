@@ -106,6 +106,7 @@ func TestNekoServerConfigCheck(t *testing.T) {
 		"tcp.routes[1].sni[0]":      strings.Replace(tcpFront, `"sni":["n.example.com"]`, `"sni":["R.example.com."]`, 1),
 		"udp.routes":                strings.Replace(front, `"dns":{"listen"`, `"udp":{"listen":["0.0.0.0:443"]},"dns":{"listen"`, 1),
 		"dns.zones[0].backend":      strings.Replace(front, `"backend":"dns"}]`, `"backend":"nope"}]`, 1),
+		"dns.stats_socket":          strings.Replace(front, `"dns":{"listen"`, `"dns":{"stats_socket":"front-stats.sock","listen"`, 1),
 		"dns.zones[0].probe":        strings.Replace(front, `"backend":"dns"}]`, `"backend":"dns","probe":true}]`, 1),
 		"dns.zones[0].ns[1]":        strings.Replace(front, `"backend":"dns"}]`, `"backend":"dns","ns":["ns1.example.com","bad name"]}]`, 1),
 		"dns.zones[0].seal_pad":     strings.Replace(front, `"backend":"dns"}]`, `"backend":"dns","seal_pad":true}]`, 1),
