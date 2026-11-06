@@ -71,7 +71,11 @@ type authKeys struct {
 	keys []authKey
 	macs []hash.Hash
 	byID map[string][]int
+	gen  uint64 // later keys have a larger one (hintIndexes.get)
 }
+
+// keysGen numbers the generations of keys as they are read.
+var keysGen atomic.Uint64
 
 // Auth checks the tags of queries against the keys of the devices allowed
 // on the service. Safe for concurrent use (the checks take turns); the keys
@@ -132,7 +136,7 @@ func (a *Auth) SetKeys(text []byte) error {
 
 // parseAuthKeys reads a keys file's text (SetKeys).
 func parseAuthKeys(text []byte) (*authKeys, error) {
-	k := &authKeys{byID: map[string][]int{}}
+	k := &authKeys{byID: map[string][]int{}, gen: keysGen.Add(1)}
 	sc := bufio.NewScanner(bytes.NewReader(text))
 	for line := 1; sc.Scan(); line++ {
 		f := strings.Fields(sc.Text())
@@ -394,7 +398,8 @@ func (a *Auth) validLocked(payload []byte, head turbotunnel.ClientID) tagResult 
 				return tagValid
 			}
 		}
-		if i := x.find(&tag, match2Key); i >= 0 {
+		// The session's keys were tried above: not again.
+		if i := x.find(&tag, func(i int, epoch uint32) bool { return !slices.Contains(tried, i) && match2Key(i, epoch) }); i >= 0 {
 			a.cacheSession(cid, keys.keys[i].id)
 			return tagValid
 		}
