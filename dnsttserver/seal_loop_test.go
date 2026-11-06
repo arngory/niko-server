@@ -97,8 +97,10 @@ func TestSealedPollsNotMemoized(t *testing.T) {
 	tt.WriteTo([]byte("downstream packet"), id)
 	second := ask(seq(0x20, 8)) // another poll: other N, same inner
 	plain := func(d []byte) []byte {
-		p := append([]byte(nil), d[8:]...)
-		sealXOR(&k.down, d[:8], p)
+		p := openAnswer(k, d)
+		if p == nil {
+			t.Fatalf("an answer whose tag does not fit: %x", d)
+		}
 		return p
 	}
 	t.Logf("first  R=%x plain[:20]=%x", first[:8], plain(first)[:20])
@@ -116,8 +118,8 @@ func TestSendLoopSealedStashSwap(t *testing.T) {
 	defer tt.Close()
 	id := turbotunnel.ClientID{9}
 	room := encodedPayload(512)
-	big := bytes.Repeat([]byte{1}, encodedPayload(maxUDPPayload)-2-8)
-	// 2+len > room-8 (does not fit a sealed answer), 2+len <= room
+	big := bytes.Repeat([]byte{1}, encodedPayload(maxUDPPayload)-2-sealHeadLen)
+	// 2+len > room-12 (does not fit a sealed answer), 2+len <= room
 	mid := bytes.Repeat([]byte{2}, room-2-4)
 	small := []byte("ack")
 	if !tt.Stash(big, id) {

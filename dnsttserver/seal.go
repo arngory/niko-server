@@ -9,8 +9,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -22,11 +24,16 @@ import (
 // not the key sees no ClientID, no padding byte, no packet lengths and no
 // KCP headers. Not a protection of the data: Noise does that.
 //
-//	query:  N (8) || ChaCha20(Ku, N||0^4)(00 00 00 00 || inner)
-//	answer: R (8) || ChaCha20(Kd, R||0^4)(frames || 00 00 || padding)
+//	query:  N (8) || T (4) || C,  C = ChaCha20(Ku, N||0^4)(inner),
+//	                              T = HMAC-SHA256(Kut, N || C)[:4]
+//	answer: R (8) || T (4) || C,  C = ChaCha20(Kd, R||0^4)(frames || 00 00 || padding),
+//	                              T = HMAC-SHA256(Kdt, R || C)[:4]
 //
 // inner is what dnstt sends without the seal (with the dnsauth-v1 tag in
-// front when that is on); frames are dnstt's (uint16 length, packet).
+// front when that is on); frames are dnstt's (uint16 length, packet). The
+// tag (encrypt-then-MAC, the client's proposal) tells the key: a query no
+// key's tag fits is open or garbage, one in 2^32 per key whatever its
+// first bytes; and nothing under the seal can be changed on the way.
 
 // SealMode says which queries a zone takes.
 type SealMode int
@@ -56,29 +63,44 @@ func ParseSealMode(s string) (SealMode, error) {
 
 const (
 	sealNonceLen = 8
-	// sealCheckLen: zeros under the seal, the check of the key. Four, not
-	// two: an open query's first 8 bytes (what the seal takes for N) are
-	// its ClientID, the same in every query of a session, so its keystream
-	// is too, and the next byte is dnstt's padding prefix (0xE3 or 0xE8),
-	// also fixed. With two, about 1 session in 128 would see 1 query in 256
-	// opened as sealed in optional mode; with four, 1 in 2^24 of those.
-	sealCheckLen = 4
+	sealTagLen   = 4
+	// sealHeadLen is what the seal adds to a query and to an answer.
+	sealHeadLen = sealNonceLen + sealTagLen
 	// sealBucket: sealed answers are padded to a multiple of it.
 	sealBucket = 64
 	// sealKeysMax: the current key and those still accepted.
 	sealKeysMax = 4
 )
 
-// sealKey is one key of the zone, as its two directions.
+// sealKey is one key of the zone, as its two directions: the ChaCha20
+// keys and the tags' HMACs, keyed once (Reset brings each back to its key).
 type sealKey struct {
 	up, down [32]byte
+	mu       sync.Mutex // the MACs and sum
+	upTag    hash.Hash
+	downTag  hash.Hash
+	sum      [sha256.Size]byte
 }
 
 func newSealKey(k []byte) *sealKey {
-	var s sealKey
+	s := &sealKey{
+		upTag:   hmac.New(sha256.New, sealMAC(k, "dnsseal-v1 up tag")),
+		downTag: hmac.New(sha256.New, sealMAC(k, "dnsseal-v1 down tag")),
+	}
 	copy(s.up[:], sealMAC(k, "dnsseal-v1 up"))
 	copy(s.down[:], sealMAC(k, "dnsseal-v1 down"))
-	return &s
+	return s
+}
+
+// tag is HMAC(m's key, nonce || c), cut to sealTagLen.
+func (k *sealKey) tag(m hash.Hash, nonce, c []byte) (t [sealTagLen]byte) {
+	k.mu.Lock()
+	m.Reset()
+	m.Write(nonce)
+	m.Write(c)
+	copy(t[:], m.Sum(k.sum[:0]))
+	k.mu.Unlock()
+	return t
 }
 
 func sealMAC(k []byte, label string) []byte {
@@ -226,35 +248,37 @@ func (s *Seal) WatchKeys(path string, every time.Duration, stop <-chan struct{},
 // open takes the seal off a query's payload: the inner payload and the key
 // that opened it, or nil when no key does (an open query, or garbage).
 func (s *Seal) open(payload []byte) ([]byte, *sealKey) {
-	if s == nil || s.Mode == SealOff || len(payload) < sealNonceLen+sealCheckLen {
+	if s == nil || s.Mode == SealOff || len(payload) < sealHeadLen {
 		return nil, nil
 	}
-	nonce, sealed := payload[:sealNonceLen], payload[sealNonceLen:]
-	buf := make([]byte, len(sealed))
+	nonce, tag, c := payload[:sealNonceLen], payload[sealNonceLen:sealHeadLen], payload[sealHeadLen:]
 	for _, k := range s.list() {
-		copy(buf, sealed)
-		sealXOR(&k.up, nonce, buf)
-		if buf[0]|buf[1]|buf[2]|buf[3] == 0 {
-			return buf[sealCheckLen:], k
+		if t := k.tag(k.upTag, nonce, c); hmac.Equal(t[:], tag) {
+			inner := bytes.Clone(c)
+			if inner == nil {
+				inner = []byte{} // opened, though empty
+			}
+			sealXOR(&k.up, nonce, inner)
+			return inner, k
 		}
 	}
 	return nil, nil
 }
 
 // answer seals the frames of an answer whose TXT data may take room bytes:
-// a random R, then the frames, a zero length and padding up to a multiple
-// of sealBucket (or up to room, when the next multiple is past it), all
-// encrypted. The frames must leave room for R.
+// a random R and the tag, then the frames, a zero length and padding up to
+// a multiple of sealBucket (or up to room, when the next multiple is past
+// it), encrypted. The frames must leave room for R and the tag.
 func (k *sealKey) answer(frames []byte, room int) []byte {
 	return k.answerWith(frames, room, nil)
 }
 
 // answerWith is answer with R given (the tests' vectors); nil draws it.
 func (k *sealKey) answerWith(frames []byte, room int, r []byte) []byte {
-	out := make([]byte, sealNonceLen, max(room, sealNonceLen+len(frames)))
+	out := make([]byte, sealHeadLen, max(room, sealHeadLen+len(frames)))
 	if r != nil {
 		copy(out, r)
-	} else if _, err := rand.Read(out); err != nil {
+	} else if _, err := rand.Read(out[:sealNonceLen]); err != nil {
 		panic(err)
 	}
 	out = append(out, frames...)
@@ -262,14 +286,16 @@ func (k *sealKey) answerWith(frames []byte, room int, r []byte) []byte {
 		target := min((len(out)+2+sealBucket-1)/sealBucket*sealBucket, room)
 		out = append(out, make([]byte, target-len(out))...) // 00 00 and padding
 	}
-	sealXOR(&k.down, out[:sealNonceLen], out[sealNonceLen:])
+	sealXOR(&k.down, out[:sealNonceLen], out[sealHeadLen:])
+	t := k.tag(k.downTag, out[:sealNonceLen], out[sealHeadLen:])
+	copy(out[sealNonceLen:sealHeadLen], t[:])
 	return out
 }
 
-// Overhead is what the seal takes from each answer: R.
+// overhead is what the seal takes from each answer: R and the tag.
 func (s *Seal) overhead() int {
 	if s == nil || s.Mode == SealOff {
 		return 0
 	}
-	return sealNonceLen
+	return sealHeadLen
 }

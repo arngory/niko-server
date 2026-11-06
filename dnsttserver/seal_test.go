@@ -2,7 +2,6 @@ package dnsttserver
 
 import (
 	"bytes"
-	"encoding/binary"
 	"encoding/hex"
 	"os"
 	"path/filepath"
@@ -20,9 +19,24 @@ func seq(from byte, n int) []byte {
 
 // sealQuery seals a query's inner payload as a client does (§3).
 func sealQuery(k *sealKey, nonce, inner []byte) []byte {
-	body := append(make([]byte, sealCheckLen), inner...)
-	sealXOR(&k.up, nonce, body)
-	return append(append([]byte(nil), nonce...), body...)
+	c := bytes.Clone(inner)
+	sealXOR(&k.up, nonce, c)
+	t := k.tag(k.upTag, nonce, c)
+	return append(append(append([]byte(nil), nonce...), t[:]...), c...)
+}
+
+// openAnswer checks an answer's tag and takes its seal off, as a client
+// does (§4): the plaintext after R and the tag, or nil.
+func openAnswer(k *sealKey, a []byte) []byte {
+	if len(a) < sealHeadLen {
+		return nil
+	}
+	if t := k.tag(k.downTag, a[:sealNonceLen], a[sealHeadLen:]); !bytes.Equal(t[:], a[sealNonceLen:sealHeadLen]) {
+		return nil
+	}
+	plain := bytes.Clone(a[sealHeadLen:])
+	sealXOR(&k.down, a[:sealNonceLen], plain)
+	return plain
 }
 
 // The spec's example (raycontrol docs/spec/dnsseal-v1.md §9), worked out
@@ -38,8 +52,8 @@ func TestSealVectors(t *testing.T) {
 	answer := k.answerWith([]byte{0x00, 0x02, 0xaa, 0xbb}, 1000, seq(0xb0, 8))
 	t.Logf("query payload %x", query)
 	t.Logf("answer data %x", answer)
-	const wantQuery = "a0a1a2a3a4a5a6a751843fdcf8328cbad3f8132199b4"
-	const wantAnswer = "b0b1b2b3b4b5b6b7f77002e5cc82e741ca69b3f568b5facff046fa764c1646d7395735e3f34ca5e0f2082aeae570f04304a4571256c325042f0d9dd5cec5c254"
+	const wantQuery = "a0a1a2a3a4a5a6a70c56c1a39145fd1ffc3688be16c2"
+	const wantAnswer = "b0b1b2b3b4b5b6b7d119c872f77002e5cc82e741ca69b3f568b5facff046fa764c1646d7395735e3f34ca5e0f2082aeae570f04304a4571256c325042f0d9dd5"
 	if hex.EncodeToString(query) != wantQuery || hex.EncodeToString(answer) != wantAnswer {
 		t.Fatalf("vectors changed")
 	}
@@ -71,20 +85,27 @@ func TestSeal(t *testing.T) {
 			t.Errorf("%s: key %p (want %p), inner %x", name, key, c.key, got)
 		}
 	}
-	// An open query whose ClientID makes the keystream start with its
-	// padding prefix (0xE3): with a check of two bytes, 1 in 256 of the
-	// session's queries passed; with four, only those whose three random
-	// padding bytes match too.
-	id := findClientID(t, s.list()[0], 0xe3)
+	// Open queries of one session (one ClientID, the padding prefix): each
+	// passes a key's tag one time in 2^32, whatever its first bytes.
 	opened := 0
 	for i := range 1 << 16 {
-		q := append(id[:], 0xe3, byte(i), byte(i>>8), 0x5a, 1, 2)
+		q := append(seq(0x40, 8), 0xe3, byte(i), byte(i>>8), 0x5a, 1, 2)
 		if _, key := s.open(q); key != nil {
 			opened++
 		}
 	}
-	if opened > 1 {
+	if opened != 0 {
 		t.Errorf("%d of 65536 open queries of one session opened", opened)
+	}
+	// Nothing under the seal can be changed on the way: a flipped bit in
+	// N, the tag or the ciphertext, and no key opens the query.
+	sealed := sealQuery(s.list()[0], seq(1, 8), inner)
+	for i := range sealed {
+		bad := bytes.Clone(sealed)
+		bad[i] ^= 0x10
+		if _, key := s.open(bad); key != nil {
+			t.Errorf("byte %d changed, and the query opened", i)
+		}
 	}
 	off, _ := NewSeal(SealOff)
 	if _, key := off.open(sealQuery(s.list()[0], seq(1, 8), inner)); key != nil {
@@ -95,21 +116,24 @@ func TestSeal(t *testing.T) {
 	for _, c := range []struct{ frames, room, want int }{
 		{0, 934, 64},    // an empty answer
 		{4, 934, 64},    // a small one
-		{60, 934, 128},  // 8+60+2 > 64
+		{52, 934, 128},  // 12+52+2 > 64
 		{900, 934, 934}, // the next multiple is past the room: up to it
-		{925, 934, 933}, // one byte left: no zero length, no padding
-		{926, 934, 934}, // fills the room exactly: no zero length
-		{0, 9, 8},       // one byte of room: R alone
+		{921, 934, 933}, // one byte left: no zero length, no padding
+		{922, 934, 934}, // fills the room exactly: no zero length
+		{0, 13, 12},     // one byte of room: R and the tag alone
 	} {
 		a := k.answerWith(make([]byte, c.frames), c.room, seq(0, 8))
 		if len(a) != c.want {
 			t.Errorf("frames %d, room %d: %d bytes, want %d", c.frames, c.room, len(a), c.want)
 		}
-		// Back: R, then the frames, then zeros.
-		plain := append([]byte(nil), a[sealNonceLen:]...)
-		sealXOR(&k.down, a[:sealNonceLen], plain)
-		if !bytes.Equal(plain, make([]byte, len(plain))) {
+		// Back: R and the tag, then the frames, then zeros.
+		plain := openAnswer(k, a)
+		if plain == nil || !bytes.Equal(plain, make([]byte, len(plain))) {
 			t.Errorf("frames %d: plaintext %x", c.frames, plain)
+		}
+		a[len(a)-1] ^= 1
+		if openAnswer(k, a) != nil {
+			t.Errorf("frames %d: a changed answer opened", c.frames)
 		}
 	}
 	// Two answers to the same frames differ (R).
@@ -142,23 +166,6 @@ func TestLoadSeal(t *testing.T) {
 	if _, err := ParseSealMode("on"); err == nil {
 		t.Error("seal mode on taken")
 	}
-}
-
-// findClientID finds a ClientID whose keystream under k begins with b: an
-// open query of that session puts b where the seal's check starts.
-func findClientID(t *testing.T, k *sealKey, b byte) [8]byte {
-	t.Helper()
-	for i := range uint64(1 << 20) {
-		var id [8]byte
-		binary.BigEndian.PutUint64(id[:], i)
-		ks := make([]byte, 1)
-		sealXOR(&k.up, id[:], ks)
-		if ks[0] == b {
-			return id
-		}
-	}
-	t.Fatal("no ClientID found")
-	return [8]byte{}
 }
 
 // The keys change under a running seal: a new current key, the previous
@@ -202,4 +209,39 @@ func TestSealWatchKeys(t *testing.T) {
 	}
 	os.WriteFile(path, []byte(hex.EncodeToString(b)+"\n"), 0o600)
 	wait("the previous key gone", func() bool { return s.Keys() == 1 && !opens(a) && opens(b) })
+}
+
+// What a query costs that no key opens (garbage, or an open query in
+// optional mode), with the most keys a seal takes.
+func BenchmarkSealOpenGarbage(b *testing.B) {
+	var keys [][]byte
+	for i := range sealKeysMax {
+		keys = append(keys, seq(byte(i), 32))
+	}
+	s, err := NewSeal(SealOptional, keys...)
+	if err != nil {
+		b.Fatal(err)
+	}
+	q := seq(7, 140)
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, k := s.open(q); k != nil {
+			b.Fatal("opened")
+		}
+	}
+}
+
+// What opening a sealed query costs, the current key first.
+func BenchmarkSealOpen(b *testing.B) {
+	s, err := NewSeal(SealRequired, seq(0, 32), seq(1, 32))
+	if err != nil {
+		b.Fatal(err)
+	}
+	q := sealQuery(s.list()[0], seq(9, 8), seq(7, 128))
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, k := s.open(q); k == nil {
+			b.Fatal("not opened")
+		}
+	}
 }
