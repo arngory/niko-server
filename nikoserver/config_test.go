@@ -81,8 +81,12 @@ func TestNekoServerConfigCheck(t *testing.T) {
 	if errs := checkConfig(t, hy2); len(errs) > 0 {
 		t.Fatal(errs)
 	}
+	// dnstt has its counters on a stats socket (v0.11.0).
+	if errs := checkConfig(t, strings.Replace(dnstt, `"inner":`, `"stats_socket":"/run/niko/dns/stats.sock","inner":`, 1)); len(errs) > 0 {
+		t.Fatalf("dnstt with a stats socket: %v", errs)
+	}
 	for want, content := range map[string]string{
-		"stats_socket":              strings.Replace(dnstt, `"inner":`, `"stats_socket":"/run/niko/dns/stats.sock","inner":`, 1),
+		"stats_socket":              strings.Replace(masterdns, `"inner":`, `"stats_socket":"/run/niko/mdns/stats.sock","inner":`, 1),
 		"options.probe.address":     strings.Replace(hy2, `127.0.0.1:34567`, `203.0.113.7:34567`, 1),
 		"options.probe.name":        strings.Replace(hy2, `"probe.raycontrol.invalid"`, `"bad name"`, 1),
 		"options.probe":             strings.Replace(ygg, `"exit_ports":[4433]`, `"exit_ports":[4433],"probe":{"name":"p.invalid","address":"127.0.0.1:1"}`, 1),

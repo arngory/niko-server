@@ -108,6 +108,11 @@ func nsFor(probeKeyFile string) []string {
 // startNodeWith is startNode with the front's dnsprobe-v1 key file (and
 // the zone's NS names, the front answering its apex).
 func startNodeWith(t *testing.T, kind, zone string, options map[string]any, probeKeyFile string) (resolver string) {
+	return startNodeFull(t, kind, zone, options, probeKeyFile, "")
+}
+
+// startNodeFull is startNodeWith with the backend's stats socket.
+func startNodeFull(t *testing.T, kind, zone string, options map[string]any, probeKeyFile, statsSocket string) (resolver string) {
 	dir := t.TempDir()
 	uid := os.Getuid()
 	inner := echoInner(t, dir)
@@ -116,10 +121,14 @@ func startNodeWith(t *testing.T, kind, zone string, options map[string]any, prob
 	resolver = freeUDPPort(t)
 
 	backendPath := filepath.Join(dir, "backend.json")
-	writeJSON(t, backendPath, map[string]any{
+	backend := map[string]any{
 		"schema": 1, "role": "backend", "kind": kind, "log": map[string]string{"level": "warn"},
 		"socket": socket, "front_uid": uid, "options": options, "inner": inner,
-	})
+	}
+	if statsSocket != "" {
+		backend["stats_socket"] = statsSocket
+	}
+	writeJSON(t, backendPath, backend)
 	frontPath := filepath.Join(dir, "front.json")
 	writeJSON(t, frontPath, map[string]any{
 		"schema": 1, "role": "front", "log": map[string]string{"level": "warn"},

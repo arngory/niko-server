@@ -172,6 +172,7 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream Dialer, sessio
 	limit := time.AfterFunc(HandshakeTimeout, func() { conn.Close() })
 	rw, err := noise.NewServer(&handshakeReader{ReadWriteCloser: conn}, privkey)
 	if !limit.Stop() {
+		sessions.stats.HandshakeTimeouts.Add(1)
 		return errHandshakeTimeout // the session is closed
 	}
 	if err != nil {
@@ -211,6 +212,7 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream Dialer, sessio
 		select {
 		case open <- struct{}{}:
 		default:
+			sessions.stats.StreamsRefused.Add(1)
 			queryLog.Printf("stream %08x:%d refused: %d open", conn.GetConv(), stream.ID(), MaxStreams)
 			stream.Close()
 			continue
@@ -446,8 +448,12 @@ func responseFor(query *dns.Message, domain dns.Name, auth *Auth, seal *Seal) (*
 	if seal != nil && seal.Mode != SealOff {
 		if inner, key := seal.open(payload); key != nil {
 			payload, sealed = inner, key
+			seal.Opened.Add(1)
 		} else if seal.Mode == SealRequired {
+			seal.Refused.Add(1)
 			return resp, nil, nil, "", ""
+		} else {
+			seal.Unsealed.Add(1)
 		}
 	}
 
@@ -687,6 +693,7 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 			queryLog.Printf("cannot parse DNS query: %v", err)
 			continue
 		}
+		sessions.stats.Queries.Add(1)
 
 		resp, payload, sealed, key, device := responseFor(&query, domain, auth, seal)
 		size := requesterSize(&query)
@@ -750,6 +757,9 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 		}
 
 		if rec.Resp.Rcode() == dns.RcodeNoError && carriesData(rec.Resp) && !rec.NoData && memo.answer(rec) {
+			if sessions != nil {
+				sessions.stats.MemoHits.Add(1)
+			}
 			// (neko) A query asked before (a resolver's retry): the
 			// same data as the first answer, which the resolver may
 			// already have taken.
@@ -1043,14 +1053,20 @@ func RunAuth(privkey []byte, domain string, dnsConn net.PacketConn, upstream Dia
 // RunWith is RunAuth with dnsseal-v1 (neko): seal takes the seal off
 // queries and puts it on answers; nil is dnstt as it is.
 func RunWith(privkey []byte, domain string, dnsConn net.PacketConn, upstream Dialer, auth *Auth, seal *Seal) error {
+	return RunWithStats(privkey, domain, dnsConn, upstream, auth, seal, &Stats{})
+}
+
+// RunWithStats is RunWith counting into stats (neko): the backend's stats
+// socket reads them.
+func RunWithStats(privkey []byte, domain string, dnsConn net.PacketConn, upstream Dialer, auth *Auth, seal *Seal, stats *Stats) error {
 	name, err := dns.ParseName(domain)
 	if err != nil {
 		return fmt.Errorf("invalid domain %+q: %v", domain, err)
 	}
-	return run(privkey, name, upstream, dnsConn, auth, seal)
+	return run(privkey, name, upstream, dnsConn, auth, seal, stats)
 }
 
-func run(privkey []byte, domain dns.Name, upstream Dialer, dnsConn net.PacketConn, auth *Auth, seal *Seal) error {
+func run(privkey []byte, domain dns.Name, upstream Dialer, dnsConn net.PacketConn, auth *Auth, seal *Seal, stats *Stats) error {
 	defer dnsConn.Close()
 
 	log.Printf("pubkey %x", noise.PubkeyFromPrivkey(privkey))
@@ -1075,7 +1091,7 @@ func run(privkey []byte, domain dns.Name, upstream Dialer, dnsConn net.PacketCon
 
 	// The smallest requester size of each client (neko).
 	sizes := &clientSizes{overhead: seal.overhead()}
-	sessions := newSessionTable()
+	sessions := newSessionTableStats(stats)
 
 	// Start up the virtual PacketConn for turbotunnel. (neko) Queues
 	// outlive their ClientID's last activity by remoteTimeout.
