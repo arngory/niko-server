@@ -12,10 +12,12 @@ type Stats struct {
 	Queries  atomic.Uint64 // DNS queries parsed
 	MemoHits atomic.Uint64 // retries answered from the memo
 
-	SessionsAdmitted  atomic.Uint64 // new ClientIDs let in
-	RefusedFull       atomic.Uint64 // not admitted: MaxSessions or MaxHandshakes reached
-	RefusedRate       atomic.Uint64 // not admitted: NewSessionsPerSecond
-	RefusedDevice     atomic.Uint64 // not admitted: the device's MaxSessionsPerDevice
+	SessionsAdmitted atomic.Uint64 // new ClientIDs let in
+	// Session starts refused: start packets of a ClientID not let in, so a
+	// client's retries (KCP's, a resolver's) count again.
+	RefusedFull       atomic.Uint64 // MaxSessions or MaxHandshakes reached
+	RefusedRate       atomic.Uint64 // over NewSessionsPerSecond
+	RefusedDevice     atomic.Uint64 // the device's MaxSessionsPerDevice
 	SessionsEvicted   atomic.Uint64 // a device's silent session closed for its new one
 	HandshakeTimeouts atomic.Uint64 // closed with the Noise handshake undone
 	StreamsRefused    atomic.Uint64 // over MaxStreams
@@ -24,8 +26,9 @@ type Stats struct {
 	// a restart, whose counters start again from 0, by it.
 	Started time.Time
 
-	// The current sessions and handshakes, from the session table.
-	current func() (sessions, handshakes int)
+	// The current sessions and handshakes, from the session table, which
+	// comes after the stats socket may already read (review 11: a race).
+	current atomic.Pointer[func() (sessions, handshakes int)]
 }
 
 // StatsSnapshot is Stats at one moment, as the stats socket gives it (JSON),
@@ -37,9 +40,9 @@ type StatsSnapshot struct {
 	Sessions          int    `json:"sessions"`
 	Handshakes        int    `json:"handshakes"`
 	SessionsAdmitted  uint64 `json:"sessions_admitted"`
-	RefusedFull       uint64 `json:"sessions_refused_full"`
-	RefusedRate       uint64 `json:"sessions_refused_rate"`
-	RefusedDevice     uint64 `json:"sessions_refused_device"`
+	RefusedFull       uint64 `json:"starts_refused_full"`
+	RefusedRate       uint64 `json:"starts_refused_rate"`
+	RefusedDevice     uint64 `json:"starts_refused_device"`
 	SessionsEvicted   uint64 `json:"sessions_evicted"`
 	HandshakeTimeouts uint64 `json:"handshake_timeouts"`
 	StreamsRefused    uint64 `json:"streams_refused"`
@@ -64,8 +67,8 @@ func (s *Stats) Snapshot(auth *Auth, seal *Seal) StatsSnapshot {
 	if !s.Started.IsZero() {
 		out.Started = s.Started.Unix()
 	}
-	if f := s.current; f != nil {
-		out.Sessions, out.Handshakes = f()
+	if f := s.current.Load(); f != nil {
+		out.Sessions, out.Handshakes = (*f)()
 	}
 	if auth != nil {
 		out.AuthValid, out.AuthUntagged = auth.Valid.Load(), auth.Untagged.Load()

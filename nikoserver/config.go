@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 )
@@ -192,6 +193,24 @@ const maxSpareZones = 4
 
 var dnsName = regexp.MustCompile(`^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
 
+// zoneName is a tunnel zone as written: a DNS name of 253 characters at
+// most, which is 255 octets on the wire (review 11: a longer one passed
+// check and stopped the backend at its start).
+func zoneName(z string) bool { return len(z) <= 253 && dnsName.MatchString(z) }
+
+// nestedIn is the zone of zones that z is nested in, or that is nested in
+// z, "" when none: a name under both is either's (review 11: the front
+// took the first listed, dnstt the longest, and a label of the outer
+// zone's data can spell the inner one).
+func nestedIn(z string, zones []string) string {
+	for _, other := range zones {
+		if other != z && (strings.HasSuffix(z, "."+other) || strings.HasSuffix(other, "."+z)) {
+			return other
+		}
+	}
+	return ""
+}
+
 // header reads schema and role first, so an unknown schema gives one clear error.
 type header struct {
 	Schema int    `json:"schema"`
@@ -294,17 +313,21 @@ func (c *FrontConfig) validate() []ConfigError {
 	if c.DNS.ProbeKeyFile != "" {
 		checkSocket(&e, "dns.probe_key_file", c.DNS.ProbeKeyFile)
 	}
-	seen := map[string]bool{}
+	var seen []string
 	for i, z := range c.DNS.Zones {
 		path := fmt.Sprintf("dns.zones[%d]", i)
 		zone := strings.ToLower(strings.TrimSuffix(z.Zone, "."))
-		if !dnsName.MatchString(zone) {
-			e.add(path+".zone", "not a DNS name: %q", z.Zone)
-		}
-		if seen[zone] {
+		switch {
+		case !zoneName(zone):
+			e.add(path+".zone", "not a DNS name of 253 characters at most: %q", z.Zone)
+		case slices.Contains(seen, zone):
 			e.add(path+".zone", "duplicate zone %q", z.Zone)
+		default:
+			if other := nestedIn(zone, seen); other != "" {
+				e.add(path+".zone", "%q and %q nest: a name under both is either's", z.Zone, other)
+			}
 		}
-		seen[zone] = true
+		seen = append(seen, zone)
 		b, ok := c.Backends[z.Backend]
 		if !ok {
 			e.add(path+".backend", "no backend %q in backends", z.Backend)
@@ -338,23 +361,28 @@ func (c *BackendConfig) validate() []ConfigError {
 	}
 	switch c.Kind {
 	case "dnstt":
-		if !dnsName.MatchString(strings.TrimSuffix(c.Options.Zone, ".")) {
-			e.add("options.zone", "not a DNS name: %q", c.Options.Zone)
+		main := strings.ToLower(strings.TrimSuffix(c.Options.Zone, "."))
+		if !zoneName(main) {
+			e.add("options.zone", "not a DNS name of 253 characters at most: %q", c.Options.Zone)
 		}
 		// Spare zones of the same tunnel (raycontrol dnszones-v1).
 		if len(c.Options.Zones) > maxSpareZones {
 			e.add("options.zones", "%d spare zones, %d at most", len(c.Options.Zones), maxSpareZones)
 		}
-		seen := map[string]bool{strings.ToLower(strings.TrimSuffix(c.Options.Zone, ".")): true}
+		all := []string{main}
 		for i, zone := range c.Options.Zones {
 			z := strings.ToLower(strings.TrimSuffix(zone, "."))
 			switch {
-			case !dnsName.MatchString(z):
-				e.add(fmt.Sprintf("options.zones[%d]", i), "not a DNS name: %q", zone)
-			case seen[z]:
+			case !zoneName(z):
+				e.add(fmt.Sprintf("options.zones[%d]", i), "not a DNS name of 253 characters at most: %q", zone)
+			case slices.Contains(all, z):
 				e.add(fmt.Sprintf("options.zones[%d]", i), "%q twice", zone)
+			default:
+				if other := nestedIn(z, all); other != "" {
+					e.add(fmt.Sprintf("options.zones[%d]", i), "%q and %q nest: a name under both is either's", zone, other)
+				}
 			}
-			seen[z] = true
+			all = append(all, z)
 		}
 		checkSocket(&e, "options.private_key_file", c.Options.PrivateKeyFile)
 		if mode, err := dnsttserver.ParseAuthMode(c.Options.Auth); err != nil {
