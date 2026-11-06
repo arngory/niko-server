@@ -134,6 +134,10 @@ type BackendOptions struct {
 	// a query no session explains (dnsttserver.Auth.ScanHMACs); 0: the
 	// default, 100000 or 20 full scans a second.
 	AuthScanHMACs int `json:"auth_scan_hmacs,omitempty"`
+	// AuthHint (v0.12.0, dnstt and masterdns): dnsauth-v2 tags, whose hint
+	// names the key (raycontrol docs/spec/dnsauth-v2.md): off, optional (v2
+	// by the hint, v1 by a scan) or required (v2 only, no scan). Needs auth.
+	AuthHint string `json:"auth_hint,omitempty"`
 	// dnstt: dnsseal-v1 (raycontrol docs/spec/dnsseal-v1.md): off,
 	// optional or required, and the zone's keys (64 hex digits a line, the
 	// current first). masterdns (v0.11.0): mdseal-v1 (raycontrol
@@ -215,6 +219,19 @@ func canonicalName(name string) string {
 		}
 	}
 	return string(b)
+}
+
+// checkAuthHint checks dnsauth-v2's mode: a value it knows, and only where
+// tags are checked at all.
+func checkAuthHint(e *configErrors, o BackendOptions) {
+	hint, err := dnsttserver.ParseHintMode(o.AuthHint)
+	if err != nil {
+		e.add("options.auth_hint", "%v", err)
+		return
+	}
+	if mode, _ := dnsttserver.ParseAuthMode(o.Auth); hint != dnsttserver.HintOff && mode == dnsttserver.AuthOff {
+		e.add("options.auth_hint", "needs auth: the hint is a tag's")
+	}
 }
 
 // sameName reports whether two names are one as the front and dnstt
@@ -462,6 +479,7 @@ func (c *BackendConfig) validate() []ConfigError {
 		} else if mode != dnsttserver.AuthOff {
 			checkSocket(&e, "options.auth_keys_file", c.Options.AuthKeysFile)
 		}
+		checkAuthHint(&e, c.Options)
 		if mode, err := dnsttserver.ParseSealMode(c.Options.Seal); err != nil {
 			e.add("options.seal", "%v", err)
 		} else if mode != dnsttserver.SealOff {
@@ -504,6 +522,7 @@ func (c *BackendConfig) validate() []ConfigError {
 		} else if mode != dnsttserver.AuthOff {
 			checkSocket(&e, "options.auth_keys_file", c.Options.AuthKeysFile)
 		}
+		checkAuthHint(&e, c.Options)
 	case "hy2-masq", "hy2-obfs":
 		checkSocket(&e, "users_file", c.UsersFile)
 		checkBackendTLS(&e, c.TLS, "a Hysteria2 backend needs its certificate")
@@ -586,8 +605,8 @@ func (c *BackendConfig) validate() []ConfigError {
 		e.add("options.auth_scan_hmacs", "not below 0")
 	}
 	dns := c.Kind == "dnstt" || c.Kind == "masterdns"
-	if !dns && (c.Options.Auth != "" || c.Options.AuthKeysFile != "" || c.Options.AuthScanHMACs != 0) {
-		e.add("options", "auth, auth_keys_file and auth_scan_hmacs are options of the DNS tunnels")
+	if !dns && (c.Options.Auth != "" || c.Options.AuthKeysFile != "" || c.Options.AuthScanHMACs != 0 || c.Options.AuthHint != "") {
+		e.add("options", "auth, auth_keys_file, auth_scan_hmacs and auth_hint are options of the DNS tunnels")
 	}
 	if !dns && c.Options.Seal != "" {
 		e.add("options", "seal is an option of the DNS tunnels")

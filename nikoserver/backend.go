@@ -76,12 +76,13 @@ func RunBackend(ctx context.Context, c *BackendConfig, log *Logger) error {
 		mode, _ := dnsttserver.ParseAuthMode(c.Options.Auth)
 		var auth *dnsttserver.Auth
 		if mode != dnsttserver.AuthOff {
-			auth = &dnsttserver.Auth{Mode: mode, ScanHMACs: float64(c.Options.AuthScanHMACs)}
+			hint, _ := dnsttserver.ParseHintMode(c.Options.AuthHint)
+			auth = &dnsttserver.Auth{Mode: mode, Hint: hint, ScanHMACs: float64(c.Options.AuthScanHMACs)}
 			if err := auth.LoadKeys(c.Options.AuthKeysFile); err != nil {
 				return envError("dnstt auth keys %s: %v", c.Options.AuthKeysFile, err)
 			}
 			go auth.WatchKeys(c.Options.AuthKeysFile, 5*time.Second, ctx.Done(), log.Infof)
-			log.Infof("dnstt: queries need the device's tag (dnsauth-v1, %s)", c.Options.Auth)
+			log.Infof("dnstt: queries need the device's tag (dnsauth-v1, %s; v2 hint %s)", c.Options.Auth, orOff(c.Options.AuthHint))
 		}
 		// dnsseal-v1: the framing sealed with the zone's key.
 		smode, _ := dnsttserver.ParseSealMode(c.Options.Seal)
@@ -120,13 +121,14 @@ func RunBackend(ctx context.Context, c *BackendConfig, log *Logger) error {
 		// keys file as dnstt's (raycontrol docs/spec/dnsauth-masterdns.md).
 		var auth mdvembed.Authenticator
 		if mode, _ := dnsttserver.ParseAuthMode(c.Options.Auth); mode != dnsttserver.AuthOff {
-			da := &dnsttserver.DeviceAuth{ScanHMACs: float64(c.Options.AuthScanHMACs)}
+			hint, _ := dnsttserver.ParseHintMode(c.Options.AuthHint)
+			da := &dnsttserver.DeviceAuth{ScanHMACs: float64(c.Options.AuthScanHMACs), Hint: hint}
 			if err := da.LoadKeys(c.Options.AuthKeysFile); err != nil {
 				return envError("masterdns auth keys %s: %v", c.Options.AuthKeysFile, err)
 			}
 			go da.WatchKeys(c.Options.AuthKeysFile, 5*time.Second, ctx.Done(), log.Infof)
 			auth = masterdnsAuth{da}
-			log.Infof("masterdns: queries need the device's tag (dnsauth, %s)", c.Options.Auth)
+			log.Infof("masterdns: queries need the device's tag (dnsauth, %s; v2 hint %s)", c.Options.Auth, orOff(c.Options.AuthHint))
 		}
 		if c.Options.Seal != "" && c.Options.Seal != "off" {
 			log.Infof("masterdns: sealed answers (mdseal-v1, %s)", c.Options.Seal)
@@ -393,3 +395,11 @@ func DNSTTKeypair() (private, public string, err error) {
 const unsafeAnyDestination = "NIKO_SERVER_UNSAFE_ANY_DESTINATION"
 
 func anyDestination() bool { return os.Getenv(unsafeAnyDestination) == "1" }
+
+// orOff is a mode as said in the log: "off" when unset.
+func orOff(mode string) string {
+	if mode == "" {
+		return "off"
+	}
+	return mode
+}
