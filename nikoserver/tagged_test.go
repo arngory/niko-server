@@ -392,9 +392,14 @@ func TestTaggedZoneSlipstream(t *testing.T) {
 
 // A backend with devices (v0.14.0) gets each query in IPC version 2 with
 // the token of the device whose tag it carried, the same for all its
-// queries and another for another device; without devices, version 1 as
-// before. The server's --max-connections-per-device counts by it.
+// queries and another for another device, then the query as check()
+// builds it; without devices, version 1 as before. The server's
+// --max-connections-per-device counts by it.
 func TestTaggedZoneDevices(t *testing.T) {
+	// The token is a contract with the server and docs/IPC.md.
+	if d := deviceToken("d1"); hex.EncodeToString(d[:]) != "d88741ec56ed78ad" {
+		t.Fatalf("deviceToken(d1) %x", d)
+	}
 	for _, devices := range []bool{false, true} {
 		ctx, cancel := context.WithCancel(context.Background())
 		dir := t.TempDir()
@@ -403,6 +408,10 @@ func TestTaggedZoneDevices(t *testing.T) {
 		rand.Read(k2[:])
 		keys := filepath.Join(dir, "auth.keys")
 		os.WriteFile(keys, []byte("d1 "+hex.EncodeToString(k1[:])+"\nd2 "+hex.EncodeToString(k2[:])+"\n"), 0o600)
+		auth := &dnsttserver.DeviceAuth{Hint: dnsttserver.HintRequired}
+		if err := auth.LoadKeys(keys); err != nil {
+			t.Fatal(err)
+		}
 		sock := filepath.Join(dir, "slip.sock")
 		ln, err := net.ListenUnix("unixpacket", &net.UnixAddr{Name: sock, Net: "unixpacket"})
 		if err != nil {
@@ -429,34 +438,54 @@ func TestTaggedZoneDevices(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		got := func(key *[32]byte, n byte) []byte {
+		n := byte(0)
+		// got sends a fresh query of the device until the backend reads
+		// one (the front takes the backend a moment after the accept),
+		// and returns the message with the query check() makes of it.
+		got := func(key *[32]byte) (msg, want []byte) {
 			t.Helper()
-			packet := append([]byte{0xc0, 0, 0, 0, 1, 8, n}, bytes.Repeat([]byte{7}, 100)...)
-			q := slipQuery(t, dnsttserver.Tag2(key, dnsttserver.EpochOf(time.Now()), packet), packet, "s.example.com", 16, true)
-			conn.Write(q)
-			be.SetReadDeadline(time.Now().Add(3 * time.Second))
-			msg := make([]byte, 70000)
-			m, err := be.Read(msg)
-			if err != nil {
-				t.Fatalf("devices %v: the backend got nothing: %v", devices, err)
+			buf := make([]byte, 70000)
+			for range 30 {
+				n++
+				packet := append([]byte{0xc0, 0, 0, 0, 1, 8, n}, bytes.Repeat([]byte{7}, 100)...)
+				q := slipQuery(t, dnsttserver.Tag2(key, dnsttserver.EpochOf(time.Now()), packet), packet, "s.example.com", 16, true)
+				name, end, _ := queryName(q)
+				want, _, _, _ = newTaggedZone("s.example.com", auth, nil).check(q, name, end, nil, nil)
+				conn.Write(q)
+				be.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+				if m, err := be.Read(buf); err == nil {
+					return buf[:m:m], want
+				}
 			}
-			return msg[:m]
+			t.Fatalf("devices %v: the backend got nothing", devices)
+			return nil, nil
 		}
-		m1, m1b, m2 := got(&k1, 1), got(&k1, 2), got(&k2, 3)
-		if !devices {
-			if m1[2] != 1 || len(m1) <= packetHeader {
-				t.Fatalf("without devices: %x", m1[:3])
+		check := func(m, want []byte, token *[deviceSize]byte) {
+			t.Helper()
+			head := packetHeader
+			version := byte(1)
+			if token != nil {
+				head, version = packetHeader+deviceSize, 2
 			}
+			if len(m) != head+len(want) || m[0] != 'N' || m[1] != 'U' || m[2] != version || !bytes.Equal(m[head:], want) ||
+				(token != nil && !bytes.Equal(m[packetHeader:head], token[:])) {
+				t.Fatalf("devices %v: %x\nwant the query %x", devices, m, want)
+			}
+		}
+		m1, w1 := got(&k1)
+		m1b, w1b := got(&k1)
+		m2, w2 := got(&k2)
+		if !devices {
+			check(m1, w1, nil)
+			check(m1b, w1b, nil)
+			check(m2, w2, nil)
 		} else {
 			d1, d2 := deviceToken("d1"), deviceToken("d2")
-			if m1[2] != 2 || !bytes.Equal(m1[packetHeader:packetHeader+deviceSize], d1[:]) ||
-				!bytes.Equal(m1b[packetHeader:packetHeader+deviceSize], d1[:]) || !bytes.Equal(m2[packetHeader:packetHeader+deviceSize], d2[:]) ||
-				d1 == d2 {
-				t.Fatalf("devices: %x %x %x", m1[:packetHeader+deviceSize], m1b[:packetHeader+deviceSize], m2[:packetHeader+deviceSize])
-			}
-			// The DNS message follows the device, as in version 1 after the addresses.
-			if m1[packetHeader+deviceSize+2] != m1b[packetHeader+deviceSize+2] {
-				t.Fatalf("the query after the device: %x", m1[packetHeader+deviceSize:packetHeader+deviceSize+12])
+			check(m1, w1, &d1)
+			check(m1b, w1b, &d1)
+			check(m2, w2, &d2)
+			if d1 == d2 {
+				t.Fatal("two devices, one token")
 			}
 		}
 		conn.Close()
@@ -465,15 +494,32 @@ func TestTaggedZoneDevices(t *testing.T) {
 		cancel()
 	}
 
-	// devices only on a tagged zone's backend.
-	for _, c := range []*FrontConfig{
-		{Schema: 1, Role: "front", DNS: &FrontDNS{Listen: []string{"127.0.0.1:53"}, Zones: []DNSZone{{Zone: "t.example.com", Backend: "dns"}}},
-			Backends: map[string]BackendRef{"dns": {Socket: "/run/x/packet.sock", Mode: "packet", Devices: true}}},
-		{Schema: 1, Role: "front", TCP: &FrontTCP{Listen: []string{"0.0.0.0:443"}, Routes: []TCPRoute{{SNI: []string{"a.example.com"}, Backend: "x"}}},
-			Backends: map[string]BackendRef{"x": {Socket: "/run/x/fd.sock", Mode: "fd", Devices: true}}},
+	// devices only on a tagged zone's backend; one socket, one backend.
+	tagged := func(zone string) DNSZone {
+		return DNSZone{Zone: zone, Backend: "slip", Tag: "slipstream", AuthKeysFile: "/run/x/auth.keys"}
+	}
+	slip := map[string]BackendRef{"slip": {Socket: "/run/x/packet.sock", Mode: "packet", Devices: true}}
+	for _, c := range []struct {
+		cfg   *FrontConfig
+		field string
+	}{
+		{&FrontConfig{Schema: 1, Role: "front", DNS: &FrontDNS{Listen: []string{"127.0.0.1:53"}, Zones: []DNSZone{{Zone: "t.example.com", Backend: "dns"}}},
+			Backends: map[string]BackendRef{"dns": {Socket: "/run/x/packet.sock", Mode: "packet", Devices: true}}}, ".devices"},
+		{&FrontConfig{Schema: 1, Role: "front", TCP: &FrontTCP{Listen: []string{"0.0.0.0:443"}, Routes: []TCPRoute{{SNI: []string{"a.example.com"}, Backend: "x"}}},
+			Backends: map[string]BackendRef{"x": {Socket: "/run/x/fd.sock", Mode: "fd", Devices: true}}}, ".devices"},
+		{&FrontConfig{Schema: 1, Role: "front", DNS: &FrontDNS{Listen: []string{"127.0.0.1:53"}, Zones: []DNSZone{tagged("s.example.com")}},
+			UDP:      &FrontUDP{Listen: []string{"0.0.0.0:443"}, Routes: []UDPRoute{{SNI: []string{"q.example.com"}, Backend: "slip"}}},
+			Backends: slip}, ".devices"},
+		{&FrontConfig{Schema: 1, Role: "front", DNS: &FrontDNS{Listen: []string{"127.0.0.1:53"}, Zones: []DNSZone{tagged("s.example.com"), {Zone: "t.example.com", Backend: "dns"}}},
+			Backends: map[string]BackendRef{"slip": slip["slip"], "dns": {Socket: "/run/x/packet.sock", Mode: "packet"}}}, ".socket"},
 	} {
-		if errs := c.validate(); !strings.Contains(fmt.Sprint(errs), ".devices") {
-			t.Errorf("devices accepted: %v", errs)
+		if errs := c.cfg.validate(); !strings.Contains(fmt.Sprint(errs), c.field) {
+			t.Errorf("accepted (want %s refused): %v", c.field, errs)
 		}
+	}
+	two := &FrontConfig{Schema: 1, Role: "front", DNS: &FrontDNS{Listen: []string{"127.0.0.1:53"},
+		Zones: []DNSZone{tagged("s.example.com"), tagged("u.example.org")}}, Backends: slip}
+	if errs := two.validate(); len(errs) != 0 {
+		t.Errorf("two tagged zones of a backend with devices: %v", errs)
 	}
 }

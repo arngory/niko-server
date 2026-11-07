@@ -341,6 +341,13 @@ func (c *FrontConfig) validate() []ConfigError {
 	for name, b := range c.Backends {
 		path := "backends." + name
 		checkSocket(&e, path+".socket", b.Socket)
+		// One socket, one backend: a second name for it would take
+		// traffic past the first one's rules (devices, tags; review).
+		for other, o := range c.Backends {
+			if other < name && samePath(o.Socket, b.Socket) {
+				e.add(path+".socket", "the socket of backends.%s too", other)
+			}
+		}
 		switch b.Mode {
 		case "packet", "fd", "proxy-v2":
 		default:

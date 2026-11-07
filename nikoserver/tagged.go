@@ -103,7 +103,8 @@ func (t *taggedZone) check(query []byte, name string, questionEnd int, buf, raw 
 // deviceToken names a device to a backend with devices (IPC version 2):
 // the same for all its queries, its ID not given away.
 func deviceToken(id string) [deviceSize]byte {
-	h := sha256.Sum256([]byte("niko-server device\x00" + id))
+	var b [128]byte // on the stack for the IDs raycontrol gives (16 hex)
+	h := sha256.Sum256(append(append(b[:0], "niko-server device\x00"...), id...))
 	return [deviceSize]byte(h[:deviceSize])
 }
 
