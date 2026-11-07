@@ -285,9 +285,11 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 		// query's as it came.
 		f.pending.add(client, query, questionEnd)
 		link := f.zoneBackend[zone]
-		msg := encodePacket(message, client, local, forward)
+		var msg []byte
 		if t != nil && link.ref.Devices {
 			msg = encodePacketDevice(message, client, local, device, forward)
+		} else {
+			msg = encodePacket(message, client, local, forward)
 		}
 		if !link.send(msg) {
 			f.pending.take(client, query) // the backend never got it
