@@ -1,6 +1,7 @@
 package nikoserver
 
 import (
+	"crypto/sha256"
 	"encoding/base32"
 	"encoding/binary"
 	"strings"
@@ -45,9 +46,9 @@ const (
 	tagEcho     // a copy within seenQuiet of the original: no answer, the original's comes
 )
 
-// check returns the query as its backend gets it, built in buf, its field
-// and tagPassed; or tagRefused, or tagReplayed or tagEcho for a field seen
-// before. raw is scratch for the decoded name (maxNameText). A query passed
+// check returns the query as its backend gets it, built in buf, its field,
+// its device's token (deviceToken) and tagPassed; or tagRefused, or
+// tagReplayed or tagEcho for a field seen before. raw is scratch for the decoded name (maxNameText). A query passed
 // on that never reaches the backend gives its field back (forget): one
 // retry of it within 10 s is no copy. It
 // takes one question, IN TXT, in the zone and below it, with a device's tag
@@ -55,35 +56,38 @@ const (
 // header (ID, RD, CD), the question as it came (the case kept: resolvers
 // check it in answers) and an OPT with the requester's size and DO when the
 // query had one, without options.
-func (t *taggedZone) check(query []byte, name string, questionEnd int, buf, raw []byte) ([]byte, [dnsttserver.AuthTagLen]byte, int) {
+func (t *taggedZone) check(query []byte, name string, questionEnd int, buf, raw []byte) ([]byte, [dnsttserver.AuthTagLen]byte, [deviceSize]byte, int) {
 	var field [dnsttserver.AuthTagLen]byte
+	var device [deviceSize]byte
 	if len(query) < 12 || query[2]&0x78 != 0 || binary.BigEndian.Uint16(query[4:6]) != 1 ||
 		binary.BigEndian.Uint16(query[6:8]) != 0 || binary.BigEndian.Uint16(query[8:10]) != 0 ||
 		binary.BigEndian.Uint16(query[10:12]) > 1 {
-		return nil, field, tagRefused
+		return nil, field, device, tagRefused
 	}
 	if binary.BigEndian.Uint16(query[questionEnd-4:]) != 16 || binary.BigEndian.Uint16(query[questionEnd-2:]) != 1 {
-		return nil, field, tagRefused // TXT, IN
+		return nil, field, device, tagRefused // TXT, IN
 	}
 	labels, ok := strings.CutSuffix(name, t.suffix)
 	if !ok || labels == "" {
-		return nil, field, tagRefused
+		return nil, field, device, tagRefused
 	}
 	raw, ok = slipDecode(labels, raw[:0])
 	if !ok || len(raw) <= dnsttserver.AuthTagLen {
-		return nil, field, tagRefused
+		return nil, field, device, tagRefused
 	}
 	field = [dnsttserver.AuthTagLen]byte(raw[:dnsttserver.AuthTagLen])
-	if _, ok := t.auth.Scan(dnsttserver.ScanSession, field, raw[dnsttserver.AuthTagLen:]); !ok {
-		return nil, field, tagRefused
+	id, ok := t.auth.Scan(dnsttserver.ScanSession, field, raw[dnsttserver.AuthTagLen:])
+	if !ok {
+		return nil, field, device, tagRefused
 	}
 	now := time.Now
 	if t.now != nil {
 		now = t.now
 	}
 	if v := t.seen.sight(field, now()); v != tagPassed {
-		return nil, field, v
+		return nil, field, device, v
 	}
+	device = deviceToken(id)
 	out := append(buf[:0], query[:questionEnd]...)
 	out[2] &= 0x01 // RD
 	out[3] &= 0x10 // CD
@@ -93,7 +97,15 @@ func (t *taggedZone) check(query []byte, name string, questionEnd int, buf, raw 
 		// root, OPT, the requester's size, extended RCODE and version 0, DO, no data
 		out = append(out, 0, 0, 41, query[i+2], query[i+3], 0, 0, query[i+6]&0x80, 0, 0, 0)
 	}
-	return out, field, tagPassed
+	return out, field, device, tagPassed
+}
+
+// deviceToken names a device to a backend with devices (IPC version 2):
+// the same for all its queries, its ID not given away.
+func deviceToken(id string) [deviceSize]byte {
+	var b [128]byte // on the stack for the IDs raycontrol gives (16 hex)
+	h := sha256.Sum256(append(append(b[:0], "niko-server device\x00"...), id...))
+	return [deviceSize]byte(h[:deviceSize])
 }
 
 // slipDecode decodes the labels before a slipstream zone into dst: base32

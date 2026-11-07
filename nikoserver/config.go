@@ -45,6 +45,10 @@ type BackendRef struct {
 	Socket string `json:"socket"`
 	Mode   string `json:"mode"`
 	UID    int    `json:"uid"`
+	// Devices (v0.14.0): the front names each query's device to the
+	// backend (IPC version 2), the device whose tag it checked: a tagged
+	// zone's backend only (slipstream-server --max-connections-per-device).
+	Devices bool `json:"devices,omitempty"`
 }
 
 type DNSZone struct {
@@ -337,6 +341,13 @@ func (c *FrontConfig) validate() []ConfigError {
 	for name, b := range c.Backends {
 		path := "backends." + name
 		checkSocket(&e, path+".socket", b.Socket)
+		// One socket, one backend: a second name for it would take
+		// traffic past the first one's rules (devices, tags; review).
+		for other, o := range c.Backends {
+			if other < name && samePath(o.Socket, b.Socket) {
+				e.add(path+".socket", "the socket of backends.%s too", other)
+			}
+		}
 		switch b.Mode {
 		case "packet", "fd", "proxy-v2":
 		default:
@@ -344,6 +355,31 @@ func (c *FrontConfig) validate() []ConfigError {
 		}
 		if b.UID < 0 {
 			e.add(path+".uid", "must be the backend's UID")
+		}
+		if b.Devices {
+			// The device comes from a zone's tag: every zone of the
+			// backend tagged, and no other traffic to it.
+			tagged := false
+			if c.DNS != nil {
+				for _, z := range c.DNS.Zones {
+					if z.Backend == name {
+						tagged = z.Tag != ""
+						if !tagged {
+							break
+						}
+					}
+				}
+			}
+			if c.UDP != nil {
+				for _, r := range c.UDP.Routes {
+					if r.Backend == name {
+						tagged = false
+					}
+				}
+			}
+			if b.Mode != "packet" || !tagged {
+				e.add(path+".devices", "a tagged zone's backend only (mode packet, all its zones tagged): the device comes from the tag")
+			}
 		}
 	}
 	if c.DNS == nil && c.TCP == nil && c.UDP == nil {
