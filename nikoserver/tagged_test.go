@@ -73,7 +73,7 @@ func TestTaggedZone(t *testing.T) {
 		if !ok {
 			t.Fatal("the query does not read")
 		}
-		out, _, _ := newTaggedZone(zone, auth, nil).check(q, name, end, nil, nil)
+		out, _, _, _ := newTaggedZone(zone, auth, nil).check(q, name, end, nil, nil)
 		return out
 	}
 
@@ -113,7 +113,7 @@ func TestTaggedZone(t *testing.T) {
 		}(),
 	} {
 		name, end, ok := queryName(q)
-		if out, _, _ := newTaggedZone(zone, auth, nil).check(q, name, end, nil, nil); ok && out != nil {
+		if out, _, _, _ := newTaggedZone(zone, auth, nil).check(q, name, end, nil, nil); ok && out != nil {
 			t.Errorf("%s: passed on", what)
 		}
 	}
@@ -162,7 +162,7 @@ func TestTaggedZoneReplay(t *testing.T) {
 		if !ok {
 			t.Fatal("the query does not read")
 		}
-		_, _, v := tz.check(q, name, end, make([]byte, 0, 512), raw)
+		_, _, _, v := tz.check(q, name, end, make([]byte, 0, 512), raw)
 		return v
 	}
 	q := slipQuery(t, dnsttserver.Tag2(&key, epoch, packet), packet, zone, 16, true)
@@ -191,7 +191,7 @@ func TestTaggedZoneReplay(t *testing.T) {
 	again := append(bytes.Clone(packet), 2)
 	q2 := slipQuery(t, dnsttserver.Tag2(&key, dnsttserver.EpochOf(now), again), again, zone, 16, true)
 	name2, end2, _ := queryName(q2)
-	_, field, v := tz.check(q2, name2, end2, nil, nil)
+	_, field, _, v := tz.check(q2, name2, end2, nil, nil)
 	if v != tagPassed {
 		t.Fatalf("a new packet: %d", v)
 	}
@@ -275,7 +275,7 @@ func TestSlipDecode(t *testing.T) {
 func TestTaggedZoneSlipstream(t *testing.T) {
 	bin := os.Getenv("SLIPSTREAM_SERVER")
 	if bin == "" {
-		t.Skip("SLIPSTREAM_SERVER: the fork's slipstream-server")
+		t.Skip("SLIPSTREAM_SERVER: the fork's slipstream-server (server-v0.2.0 or later)")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -291,6 +291,7 @@ func TestTaggedZoneSlipstream(t *testing.T) {
 	}
 	sock := filepath.Join(dir, "slip.sock")
 	srv := exec.CommandContext(ctx, bin, "--front-socket", sock, "--front-uid", strconv.Itoa(os.Getuid()), "--tag-len", "8",
+		"--max-connections-per-device", "4",
 		"-a", "127.0.0.1:9", "-c", cert, "-k", certKey, "-d", "s.example.com", "-n", "abcdefgh")
 	srv.Stderr = os.Stderr
 	if err := srv.Start(); err != nil {
@@ -316,7 +317,8 @@ func TestTaggedZoneSlipstream(t *testing.T) {
 	statsSock := filepath.Join(dir, "front-stats.sock")
 	c := &FrontConfig{Schema: 1, Role: "front", DNS: &FrontDNS{Listen: []string{fmt.Sprintf("127.0.0.1:%d", port)}, StatsSocket: statsSock,
 		Zones: []DNSZone{{Zone: "s.example.com", Backend: "slip", Tag: "slipstream", AuthKeysFile: keys}}},
-		Backends: map[string]BackendRef{"slip": {Socket: sock, Mode: "packet", UID: os.Getuid()}}}
+		// The device named (IPC version 2): server-v0.2.0 or later.
+		Backends: map[string]BackendRef{"slip": {Socket: sock, Mode: "packet", UID: os.Getuid(), Devices: true}}}
 	go RunFront(ctx, c, NewLogger("warn", io.Discard))
 	conn, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
 	if err != nil {
@@ -385,5 +387,93 @@ func TestTaggedZoneSlipstream(t *testing.T) {
 	}
 	if fw2, _, un, _ := stats(); fw2 != fw || un != 1 {
 		t.Fatalf("an untagged query: forwarded %d (was %d), untagged %d", fw2, fw, un)
+	}
+}
+
+// A backend with devices (v0.14.0) gets each query in IPC version 2 with
+// the token of the device whose tag it carried, the same for all its
+// queries and another for another device; without devices, version 1 as
+// before. The server's --max-connections-per-device counts by it.
+func TestTaggedZoneDevices(t *testing.T) {
+	for _, devices := range []bool{false, true} {
+		ctx, cancel := context.WithCancel(context.Background())
+		dir := t.TempDir()
+		var k1, k2 [32]byte
+		rand.Read(k1[:])
+		rand.Read(k2[:])
+		keys := filepath.Join(dir, "auth.keys")
+		os.WriteFile(keys, []byte("d1 "+hex.EncodeToString(k1[:])+"\nd2 "+hex.EncodeToString(k2[:])+"\n"), 0o600)
+		sock := filepath.Join(dir, "slip.sock")
+		ln, err := net.ListenUnix("unixpacket", &net.UnixAddr{Name: sock, Net: "unixpacket"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := udp.LocalAddr().(*net.UDPAddr).Port
+		udp.Close()
+		c := &FrontConfig{Schema: 1, Role: "front", DNS: &FrontDNS{Listen: []string{fmt.Sprintf("127.0.0.1:%d", port)},
+			Zones: []DNSZone{{Zone: "s.example.com", Backend: "slip", Tag: "slipstream", AuthKeysFile: keys}}},
+			Backends: map[string]BackendRef{"slip": {Socket: sock, Mode: "packet", UID: os.Getuid(), Devices: devices}}}
+		if errs := c.validate(); len(errs) != 0 {
+			t.Fatalf("devices %v: %v", devices, errs)
+		}
+		go RunFront(ctx, c, NewLogger("warn", io.Discard))
+		be, err := ln.AcceptUnix()
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := func(key *[32]byte, n byte) []byte {
+			t.Helper()
+			packet := append([]byte{0xc0, 0, 0, 0, 1, 8, n}, bytes.Repeat([]byte{7}, 100)...)
+			q := slipQuery(t, dnsttserver.Tag2(key, dnsttserver.EpochOf(time.Now()), packet), packet, "s.example.com", 16, true)
+			conn.Write(q)
+			be.SetReadDeadline(time.Now().Add(3 * time.Second))
+			msg := make([]byte, 70000)
+			m, err := be.Read(msg)
+			if err != nil {
+				t.Fatalf("devices %v: the backend got nothing: %v", devices, err)
+			}
+			return msg[:m]
+		}
+		m1, m1b, m2 := got(&k1, 1), got(&k1, 2), got(&k2, 3)
+		if !devices {
+			if m1[2] != 1 || len(m1) <= packetHeader {
+				t.Fatalf("without devices: %x", m1[:3])
+			}
+		} else {
+			d1, d2 := deviceToken("d1"), deviceToken("d2")
+			if m1[2] != 2 || !bytes.Equal(m1[packetHeader:packetHeader+deviceSize], d1[:]) ||
+				!bytes.Equal(m1b[packetHeader:packetHeader+deviceSize], d1[:]) || !bytes.Equal(m2[packetHeader:packetHeader+deviceSize], d2[:]) ||
+				d1 == d2 {
+				t.Fatalf("devices: %x %x %x", m1[:packetHeader+deviceSize], m1b[:packetHeader+deviceSize], m2[:packetHeader+deviceSize])
+			}
+			// The DNS message follows the device, as in version 1 after the addresses.
+			if m1[packetHeader+deviceSize+2] != m1b[packetHeader+deviceSize+2] {
+				t.Fatalf("the query after the device: %x", m1[packetHeader+deviceSize:packetHeader+deviceSize+12])
+			}
+		}
+		conn.Close()
+		be.Close()
+		ln.Close()
+		cancel()
+	}
+
+	// devices only on a tagged zone's backend.
+	for _, c := range []*FrontConfig{
+		{Schema: 1, Role: "front", DNS: &FrontDNS{Listen: []string{"127.0.0.1:53"}, Zones: []DNSZone{{Zone: "t.example.com", Backend: "dns"}}},
+			Backends: map[string]BackendRef{"dns": {Socket: "/run/x/packet.sock", Mode: "packet", Devices: true}}},
+		{Schema: 1, Role: "front", TCP: &FrontTCP{Listen: []string{"0.0.0.0:443"}, Routes: []TCPRoute{{SNI: []string{"a.example.com"}, Backend: "x"}}},
+			Backends: map[string]BackendRef{"x": {Socket: "/run/x/fd.sock", Mode: "fd", Devices: true}}},
+	} {
+		if errs := c.validate(); !strings.Contains(fmt.Sprint(errs), ".devices") {
+			t.Errorf("devices accepted: %v", errs)
+		}
 	}
 }

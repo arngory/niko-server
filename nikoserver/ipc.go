@@ -67,6 +67,23 @@ func encodePacket(buf []byte, client, local netip.AddrPort, payload []byte) []by
 	return append(buf, payload...)
 }
 
+// IPC version 2, from the DNS front to a backend with devices (a tagged
+// zone's): the device whose tag the query carried, as a token of the
+// front's (deviceToken); the answers stay in version 1.
+//
+//	magic "NU" | version 2 | client (19) | local (19) | device (8) | payload
+const (
+	packetVersionDevice = 2
+	deviceSize          = 8
+)
+
+func encodePacketDevice(buf []byte, client, local netip.AddrPort, device [deviceSize]byte, payload []byte) []byte {
+	buf = encodePacket(buf, client, local, nil)
+	buf[2] = packetVersionDevice
+	buf = append(buf, device[:]...)
+	return append(buf, payload...)
+}
+
 func decodePacket(msg []byte) (client, local netip.AddrPort, payload []byte, err error) {
 	if len(msg) < packetHeader || msg[0] != 'N' || msg[1] != 'U' || msg[2] != packetVersion {
 		return client, local, nil, errBadPacket

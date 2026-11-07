@@ -208,7 +208,7 @@ func (f *dnsFront) closeAll() {
 
 func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 	buffer := make([]byte, maxDatagram)
-	message := make([]byte, 0, packetHeader+maxDatagram)
+	message := make([]byte, 0, packetHeader+deviceSize+maxDatagram)
 	rebuilt := make([]byte, 0, maxDNSQuery) // a tagged zone's query as its backend gets it
 	raw := make([]byte, 0, maxNameText)     // its name decoded
 	for {
@@ -260,9 +260,10 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 		forward := query
 		t := f.tagged[zone]
 		var field [dnsttserver.AuthTagLen]byte
+		var device [deviceSize]byte
 		if t != nil {
 			var verdict int
-			if forward, field, verdict = t.check(query, name, questionEnd, rebuilt, raw); verdict != tagPassed {
+			if forward, field, device, verdict = t.check(query, name, questionEnd, rebuilt, raw); verdict != tagPassed {
 				// Not a device's query, or a copy of one: the backend
 				// sees nothing of it. A copy right after the original
 				// gets nothing: the original's answer is on its way.
@@ -283,7 +284,12 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 		// before this goroutine runs again. The requester's size is the
 		// query's as it came.
 		f.pending.add(client, query, questionEnd)
-		if !f.zoneBackend[zone].send(encodePacket(message, client, local, forward)) {
+		link := f.zoneBackend[zone]
+		msg := encodePacket(message, client, local, forward)
+		if t != nil && link.ref.Devices {
+			msg = encodePacketDevice(message, client, local, device, forward)
+		}
+		if !link.send(msg) {
 			f.pending.take(client, query) // the backend never got it
 			if t != nil {
 				t.seen.forget(field, time.Now()) // nor its packet: one retry is no copy
