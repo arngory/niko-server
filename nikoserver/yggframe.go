@@ -23,15 +23,23 @@ import (
 // the bloom filters): without them there is no route at all. The filter
 // says nothing in any log: counters only (§4.3).
 //
-// Two leaks are left, known and accepted (docs/SPEC.md §3.4):
+// Left, known and accepted (docs/SPEC.md §3.4):
 //   - the node's bloom filter to a client holds every other on-tree peer's
 //     key as the core transforms it, its /64 (iw: bloomfilter.go:216-234,
 //     ygg: src/core/core.go:96-98): a client can tell whether an address
 //     it already knows is at the node, not list who is;
+//   - the same bloom filters are a channel between two clients that agree
+//     to use one: the bits A sets in its own, the node ORs into B's, up to
+//     8192 bits an update. Through the node they have the internet anyway;
 //   - the tree: a peer gets the announcements of the node's ancestry and
 //     its own (iw: router.go:332-389). The root is the least key; with no
 //     public peers that is usually a client, and every client gets its key
-//     (traffic to it is filtered all the same).
+//     (traffic to it is filtered all the same);
+//   - memory: while a large frame comes in pieces, a link holds a buffer of
+//     the largest frame, 131080 bytes, each way.
+//
+// A frame dropped is answered (yggLinkFilter.answer): ironwood ends a link
+// whose frame gets nothing back in 3 s.
 //
 // The wire, as ironwood 0712ecc reads it (iw: its network package):
 //   - a frame is a uvarint length, then that many bytes: a type and its
@@ -227,20 +235,50 @@ var (
 	yggFrameBufs = sync.Pool{New: func() any { b := make([]byte, binary.MaxVarintLen64+yggFrameMax); return &b }}
 )
 
-// yggLinkFilter is the filter on one client's link.
+// yggLinkFilter is the filter on one client's link: the rule, and the two
+// ends it writes to.
 type yggLinkFilter struct {
 	rule    yggRule
 	dropped *atomic.Uint64 // the backend's: frames dropped by the rule
+	core    yggOut         // the link's side to the core
+	client  yggOut         // the link's side to the client
+	done    chan struct{}
 }
+
+func newYggLinkFilter(rule yggRule, dropped *atomic.Uint64, core, client io.Writer) *yggLinkFilter {
+	f := &yggLinkFilter{rule: rule, dropped: dropped}
+	f.attach(core, client)
+	return f
+}
+
+// attach gives the filter the two ends it writes to.
+func (f *yggLinkFilter) attach(core, client io.Writer) {
+	f.done = make(chan struct{})
+	f.core.init(core)
+	f.client.init(client)
+}
+
+// close ends the goroutines that write the injected frames.
+func (f *yggLinkFilter) close() { close(f.done) }
 
 // up copies the client's frames to the core, until either fails or a frame
 // is one the core would refuse.
-func (f *yggLinkFilter) up(core io.Writer, client io.Reader) error {
-	return f.copy(core, client, true)
+func (f *yggLinkFilter) up(client io.Reader) error {
+	go f.core.run(f.done)
+	return f.copy(&f.core, client, true)
 }
 
 // down copies the core's handshake and then its frames to the client.
-func (f *yggLinkFilter) down(client io.Writer, core io.Reader) error {
+func (f *yggLinkFilter) down(core io.Reader) error {
+	if err := f.handshake(core); err != nil {
+		return err
+	}
+	go f.client.run(f.done) // injected frames only after the handshake
+	return f.copy(&f.client, core, false)
+}
+
+// handshake passes the core's handshake to the client as it is.
+func (f *yggLinkFilter) handshake(core io.Reader) error {
 	bp := yggReadBufs.Get().(*[]byte)
 	buf := *bp
 	_, err := io.ReadFull(core, buf[:6])
@@ -251,21 +289,22 @@ func (f *yggLinkFilter) down(client io.Writer, core io.Reader) error {
 		err = errYggFrame
 	default:
 		if _, err = io.ReadFull(core, buf[6:6+size]); err == nil {
-			_, err = client.Write(buf[:6+size])
+			err = f.client.write(buf[:6+size])
 		}
 	}
 	yggReadBufs.Put(bp)
-	if err != nil {
-		return err
-	}
-	return f.copy(client, core, false)
+	return err
 }
 
 // copy passes src's frames to dst, those the rule lets through, as they
 // came: runs of them in one write. A frame the core would refuse, or a
 // length over its largest frame, ends the copy (what passed before it is
-// written).
-func (f *yggLinkFilter) copy(dst io.Writer, src io.Reader, fromClient bool) error {
+// written). For each frame it drops it injects the answers (answer).
+func (f *yggLinkFilter) copy(dst *yggOut, src io.Reader, fromClient bool) error {
+	sender := &f.core // the end whose frames these are
+	if fromClient {
+		sender = &f.client
+	}
 	small := yggReadBufs.Get().(*[]byte)
 	defer yggReadBufs.Put(small)
 	var large *[]byte
@@ -280,6 +319,7 @@ func (f *yggLinkFilter) copy(dst io.Writer, src io.Reader, fromClient bool) erro
 		n, rerr := src.Read(buf[w:])
 		w += n
 		start, need := r, 0 // buf[start:r]: frames to send; need: what the next one takes from r
+		asks := false       // a frame in buf[start:r] asks for an answer
 		var bad bool
 		for r < w {
 			size, sn := binary.Uvarint(buf[r:w])
@@ -306,15 +346,18 @@ func (f *yggLinkFilter) copy(dst io.Writer, src io.Reader, fromClient bool) erro
 				break
 			}
 			if keyed && !f.rule.passes(fromClient, frame[0], source, dest) {
-				if err := yggWrite(dst, buf[start:r]); err != nil {
+				if err := yggSend(dst, sender, buf[start:r], asks); err != nil {
 					return err
 				}
-				start = end
+				start, asks = end, false
 				f.dropped.Add(1)
+				f.answer(fromClient, frame, source, dest)
+			} else if frame[0] > yggKeepAlive {
+				asks = true
 			}
 			r = end
 		}
-		if err := yggWrite(dst, buf[start:r]); err != nil {
+		if err := yggSend(dst, sender, buf[start:r], asks); err != nil {
 			return err
 		}
 		switch {
@@ -343,10 +386,173 @@ func (f *yggLinkFilter) copy(dst io.Writer, src io.Reader, fromClient bool) erro
 	}
 }
 
-func yggWrite(w io.Writer, b []byte) error {
+// yggSend writes a run of frames on: if one of them asks for an answer, its
+// sender now waits for one.
+func yggSend(dst, sender *yggOut, b []byte, asks bool) error {
+	if err := dst.write(b); err != nil {
+		return err
+	}
+	if asks && !sender.waits.Load() {
+		sender.waits.Store(true)
+	}
+	return nil
+}
+
+// answer stands in for a frame the filter dropped, as far as ironwood's
+// peers keep each other alive (iw: peers.go:127-181). A peer that sends any
+// frame but a keepalive (or a dummy) ends the link unless some frame comes
+// back within peerTimeout, 3 s; a peer that gets one owes a keepalive within
+// a second, and any frame it sends pays that debt. So:
+//   - the dropped frame's sender gets the answer its receiver would have
+//     given, on this link: to the client, a keepalive; to the core, for
+//     traffic from or to the node, the pathBroken the client's ironwood
+//     sends for traffic it cannot pass on (iw: pathfinder.go:228-236), which
+//     also puts right the stale path that brought it; for anything else a
+//     keepalive, which tells whoever sent it nothing about this link;
+//   - the dropped frame's receiver, if it waits for an answer (the debt the
+//     dropped frame paid), gets a keepalive.
+//
+// So one answer per dropped frame, to its sender, never elsewhere than this
+// link; and a keepalive owed only while the other end waits, once for each
+// of its frames that passed.
+func (f *yggLinkFilter) answer(fromClient bool, frame []byte, source, dest *[yggKeySize]byte) {
+	if fromClient {
+		f.client.injectKeepalive()
+		if f.core.waits.Load() {
+			f.core.injectKeepalive()
+		}
+		return
+	}
+	if frame[0] == yggTraffic && (*source == f.rule.node || *dest == f.rule.node) {
+		f.core.injectBroken(yggTrafficFrom(frame), source, dest)
+	} else {
+		f.core.injectKeepalive()
+	}
+	if f.client.waits.Load() {
+		f.client.injectKeepalive()
+	}
+}
+
+// yggTrafficFrom is the from path of a traffic frame the parser took, as
+// it came.
+func yggTrafficFrom(frame []byte) []byte {
+	b, _ := yggSkipPath(frame[1:])
+	rest, _ := yggSkipPath(b)
+	return b[:len(b)-len(rest)]
+}
+
+// yggKeepAlive is ironwood's keepalive type; below it, the dummy. Neither
+// asks for an answer (iw: peers.go:140-181).
+const yggKeepAlive = 1
+
+// yggKeepAliveFrame is ironwood's keepalive frame: the length 1, the type
+// (iw: peers.go:135).
+var yggKeepAliveFrame = []byte{0x01, yggKeepAlive}
+
+// yggInjectMax bounds the injected frames waiting at one end: past it a
+// pathBroken becomes a keepalive, and a keepalive waits only once.
+const yggInjectMax = 16 << 10
+
+// yggOut is one end the filter writes to, the core or the client. The copier
+// writes runs of whole frames to it, answer injects frames; one lock around
+// every Write keeps frames whole. Injecting never blocks the copier that
+// drops: the frames wait, yggInjectMax bytes at most, for the end's own
+// goroutine (run).
+type yggOut struct {
+	mu sync.Mutex // around every Write to w
+	w  io.Writer
+	// waits: this end sent a frame that asks for an answer, and has had
+	// nothing since.
+	waits atomic.Bool
+
+	pmu       sync.Mutex // around pending, spare, keepalive
+	pending   []byte     // injected frames, not yet written
+	spare     []byte
+	keepalive bool // pending holds a keepalive
+	wake      chan struct{}
+}
+
+func (o *yggOut) init(w io.Writer) {
+	o.w = w
+	o.wake = make(chan struct{}, 1)
+}
+
+// write sends whole frames to the end.
+func (o *yggOut) write(b []byte) error {
 	if len(b) == 0 {
 		return nil
 	}
-	_, err := w.Write(b)
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.waits.Load() {
+		o.waits.Store(false)
+	}
+	_, err := o.w.Write(b)
 	return err
+}
+
+func (o *yggOut) injectKeepalive() {
+	o.pmu.Lock()
+	if !o.keepalive && len(o.pending)+len(yggKeepAliveFrame) <= yggInjectMax {
+		o.pending = append(o.pending, yggKeepAliveFrame...)
+		o.keepalive = true
+	}
+	o.pmu.Unlock()
+	o.signal()
+}
+
+// injectBroken injects pathBroken as ironwood's _doBroken makes it for
+// traffic (iw: pathfinder.go:228-236): the path the traffic's from, the
+// watermark ^uint64(0), the traffic's source and dest; encoded as
+// pathfinder.go:514-525 does, the from path as it came.
+func (o *yggOut) injectBroken(from []byte, source, dest *[yggKeySize]byte) {
+	size := 1 + len(from) + binary.MaxVarintLen64 + 2*yggKeySize // ^uint64(0) takes 10 bytes
+	var head [binary.MaxVarintLen64]byte
+	hn := binary.PutUvarint(head[:], uint64(size))
+	o.pmu.Lock()
+	if len(o.pending)+hn+size > yggInjectMax {
+		o.pmu.Unlock()
+		o.injectKeepalive()
+		return
+	}
+	o.pending = append(o.pending, head[:hn]...)
+	o.pending = append(o.pending, yggPathBroken)
+	o.pending = append(o.pending, from...)
+	o.pending = binary.AppendUvarint(o.pending, ^uint64(0))
+	o.pending = append(o.pending, source[:]...)
+	o.pending = append(o.pending, dest[:]...)
+	o.pmu.Unlock()
+	o.signal()
+}
+
+func (o *yggOut) signal() {
+	select {
+	case o.wake <- struct{}{}:
+	default:
+	}
+}
+
+// run writes the injected frames as they come, until done or a failed
+// write.
+func (o *yggOut) run(done <-chan struct{}) {
+	for {
+		select {
+		case <-done:
+			return
+		case <-o.wake:
+		}
+		if o.flush() != nil {
+			return
+		}
+	}
+}
+
+// flush writes the injected frames that wait; one goroutine at a time.
+func (o *yggOut) flush() error {
+	o.pmu.Lock()
+	b := o.pending
+	o.pending, o.spare = o.spare[:0], b
+	o.keepalive = false
+	o.pmu.Unlock()
+	return o.write(b)
 }
