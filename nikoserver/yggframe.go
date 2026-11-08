@@ -3,31 +3,43 @@
 package nikoserver
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"io"
 	"sync"
 	"sync/atomic"
+
+	"github.com/yggdrasil-network/yggdrasil-go/src/address"
 )
 
 // The frame filter on a client's link (raycontrol docs/spec/lan-v1.md §2.2).
 // The core would carry ironwood frames between any two of its peers: one
 // user's device to another user's, or to anyone through the node. On each
 // client's link the backend reads the frames as ironwood frames them, and
-// of traffic, pathNotify and pathBroken it lets through only those between
-// the client and the node; in LAN (later) also those within the client's
-// group. Everything else passes as it is: without the tree, the bloom
-// filters and the lookups there is no route at all. Those carry keys too:
-// a lookup its requester's, the node's bloom filter to a client the
-// others' under the node, the tree the node's ancestry (a client, when its
-// key is the least). Whether to filter them is lan-v1's to decide; here
-// they pass. The filter says nothing in any log: counters only (§4.3).
+// of traffic, pathNotify, pathBroken and pathLookup it lets through only
+// those between the client and the node; in LAN (later) also those within
+// the client's group. Everything else passes as it is (keepalive, the tree,
+// the bloom filters): without them there is no route at all. The filter
+// says nothing in any log: counters only (§4.3).
+//
+// Two leaks are left, known and accepted (docs/SPEC.md §3.4):
+//   - the node's bloom filter to a client holds every other on-tree peer's
+//     key as the core transforms it, its /64 (iw: bloomfilter.go:216-234,
+//     ygg: src/core/core.go:96-98): a client can tell whether an address
+//     it already knows is at the node, not list who is;
+//   - the tree: a peer gets the announcements of the node's ancestry and
+//     its own (iw: router.go:332-389). The root is the least key; with no
+//     public peers that is usually a client, and every client gets its key
+//     (traffic to it is filtered all the same).
 //
 // The wire, as ironwood 0712ecc reads it (iw: its network package):
 //   - a frame is a uvarint length, then that many bytes: a type and its
 //     body (peers.go:247-269); binary.ReadUvarint, so a length need not be
 //     minimal; over peerMaxMessageSize, or empty, it ends the link
 //     (peers.go:253, 275), as does a frame its type's decoder refuses;
+//   - pathLookup (6): source, dest, the path from, nothing after
+//     (pathfinder.go:297-336); dest may be a key from an address;
 //   - traffic (9): path, from, source, dest, a uvarint watermark, the
 //     payload (traffic.go:36-69);
 //   - pathNotify (7): path, a uvarint watermark, source, dest, then the
@@ -48,6 +60,7 @@ const yggFrameMax = 65535 * 2
 
 // ironwood's frame types with a source and a destination (iw: wire.go:7-18).
 const (
+	yggPathLookup = 6
 	yggPathNotify = 7
 	yggPathBroken = 8
 	yggTraffic    = 9
@@ -60,9 +73,9 @@ const yggKeySize = 32
 var errYggFrame = errors.New("not an ironwood frame")
 
 // yggFrameKeys reads the source and the destination of a frame (its type
-// byte and body) of type traffic, pathNotify or pathBroken, as ironwood
-// decodes it, in place. keyed is false for any other type, ok false for a
-// frame of those three that ironwood would refuse.
+// byte and body) of type pathLookup, pathNotify, pathBroken or traffic, as
+// ironwood decodes it, in place. keyed is false for any other type, ok
+// false for a frame of those four that ironwood would refuse.
 func yggFrameKeys(frame []byte) (source, dest *[yggKeySize]byte, keyed, ok bool) {
 	if len(frame) == 0 {
 		return nil, nil, false, false
@@ -81,6 +94,15 @@ func yggFrameKeys(frame []byte) (source, dest *[yggKeySize]byte, keyed, ok bool)
 		}
 		source, dest = (*[yggKeySize]byte)(b), (*[yggKeySize]byte)(b[yggKeySize:])
 		if _, ok = yggSkipUint(b[2*yggKeySize:]); !ok { // watermark; the payload is the rest
+			return nil, nil, true, false
+		}
+		return source, dest, true, true
+	case yggPathLookup:
+		if len(b) < 2*yggKeySize {
+			return nil, nil, true, false
+		}
+		source, dest = (*[yggKeySize]byte)(b), (*[yggKeySize]byte)(b[yggKeySize:])
+		if b, ok = yggSkipPath(b[2*yggKeySize:]); !ok || len(b) != 0 { // from, nothing after
 			return nil, nil, true, false
 		}
 		return source, dest, true, true
@@ -148,21 +170,41 @@ type yggRule struct {
 	group     func(*[yggKeySize]byte) yggGroup
 }
 
-// passes is the rule for a frame of type traffic, pathNotify or pathBroken
-// with its source and dest. From the client (K to the core): the source is
-// K, the dest N. To the client (the core to K): the source is N, the dest
-// K. Either end may instead be a key of K's group, when K has one.
-// pathBroken carries the source and dest of the traffic it reports on, but
-// goes back to that source (iw: pathfinder.go:228-236): for it the two
-// trade places.
+// passes is the rule for a frame of type pathLookup, pathNotify,
+// pathBroken or traffic with its source and dest. From the client (K to the
+// core): the source is K, the dest N. To the client (the core to K): the
+// source is N, the dest K. Either end may instead be a key of K's group,
+// when K has one. pathBroken carries the source and dest of the traffic it
+// reports on, but goes back to that source (iw: pathfinder.go:228-236): for
+// it the two trade places. A lookup goes out to whoever might answer it:
+// from the client only its source is held to the rule, K's lookups for
+// anyone pass; to the client the source is N and the dest one K would
+// answer. Else a client that claims every key in its bloom filter (iw:
+// bloomfilter.go:301-329) would get every other client's lookup for the
+// node, and the node's own for each of them, keys and all.
 func (r *yggRule) passes(fromClient bool, typ byte, source, dest *[yggKeySize]byte) bool {
-	if typ == yggPathBroken {
+	switch typ {
+	case yggPathLookup:
+		if fromClient {
+			return r.is(source, &r.key)
+		}
+		return r.is(source, &r.node) && (r.is(dest, &r.key) || r.answers(dest))
+	case yggPathBroken:
 		source, dest = dest, source
 	}
 	if fromClient {
 		return r.is(source, &r.key) && r.is(dest, &r.node)
 	}
 	return r.is(source, &r.node) && r.is(dest, &r.key)
+}
+
+// answers: K would answer a lookup for dest, as ironwood decides it
+// (iw: pathfinder.go:62-64) with the core's bloom transform (ygg:
+// src/core/core.go:96-98), dest being a whole key or one from an address.
+// Only for the node's lookups and not for K's very key: never on the way
+// of traffic. A group of LAN will want G of such a key too.
+func (r *yggRule) answers(dest *[yggKeySize]byte) bool {
+	return bytes.Equal(address.SubnetForKey(dest[:]).GetKey(), address.SubnetForKey(r.key[:]).GetKey())
 }
 
 // is: x is want, or G(x) = G(K) ≠ ∅.

@@ -20,12 +20,14 @@ import (
 
 	iwn "github.com/Arceliar/ironwood/network"
 	iwt "github.com/Arceliar/ironwood/types"
+	"github.com/yggdrasil-network/yggdrasil-go/src/address"
 )
 
 // Frames byte for byte as ironwood 0712ecc encodes them: a path
-// (network/wire.go:80-86), traffic (traffic.go:36-49), pathNotify and its
-// info (pathfinder.go:448-463, 395-405), pathBroken (pathfinder.go:514-525),
-// the length before the type (peers.go:205-214).
+// (network/wire.go:80-86), traffic (traffic.go:36-49), pathLookup
+// (pathfinder.go:310-320), pathNotify and its info (pathfinder.go:448-463,
+// 395-405), pathBroken (pathfinder.go:514-525), the length before the type
+// (peers.go:205-214).
 
 func iwPath(b []byte, ports ...uint64) []byte {
 	for _, p := range ports {
@@ -49,6 +51,11 @@ func iwNotify(path []uint64, watermark uint64, source, dest [32]byte, seq uint64
 	b = binary.AppendUvarint(b, seq)
 	b = iwPath(b, coords...)
 	return append(b, sig[:]...)
+}
+
+func iwLookup(source, dest [32]byte, from ...uint64) []byte {
+	b := append(append([]byte{yggPathLookup}, source[:]...), dest[:]...)
+	return iwPath(b, from...)
 }
 
 func iwBroken(path []uint64, watermark uint64, source, dest [32]byte) []byte {
@@ -77,6 +84,7 @@ func TestNekoServerYggFrameKeys(t *testing.T) {
 	traffic := iwTraffic([]uint64{1, 300}, []uint64{2}, keyK, keyN, ^uint64(0), []byte("payload"))
 	notify := iwNotify([]uint64{5}, 7, keyN, keyK, 1700000000, []uint64{1, 2, 3}, sig)
 	broken := iwBroken(nil, ^uint64(0), keyK, keyA)
+	lookup := iwLookup(keyK, keyN, 1, 300, 2)
 	cut := func(b []byte, n int) []byte { return slices.Clone(b[:len(b)-n]) }
 	plus := func(b []byte, more ...byte) []byte { return append(slices.Clone(b), more...) }
 	// The end of a path as two bytes, which binary.Uvarint takes as 0.
@@ -109,7 +117,12 @@ func TestNekoServerYggFrameKeys(t *testing.T) {
 		{"pathBroken, a port over 64 bits", overflow, true, false, [32]byte{}, [32]byte{}},
 		{"keepalive", []byte{1}, false, true, [32]byte{}, [32]byte{}},
 		{"dummy", []byte{0}, false, true, [32]byte{}, [32]byte{}},
-		{"lookup, whatever is in it", []byte{6, 0xff}, false, true, [32]byte{}, [32]byte{}},
+		{"pathLookup", lookup, true, true, keyK, keyN},
+		{"pathLookup, no path", iwLookup(keyA, keyK), true, true, keyA, keyK},
+		{"pathLookup, a byte more", plus(lookup, 0), true, false, [32]byte{}, [32]byte{}},
+		{"pathLookup, path without its end", cut(lookup, 1), true, false, [32]byte{}, [32]byte{}},
+		{"pathLookup, a key short", iwLookup(keyA, keyK)[:64], true, false, [32]byte{}, [32]byte{}},
+		{"sigReq, whatever is in it", []byte{2, 0xff}, false, true, [32]byte{}, [32]byte{}},
 		{"a type ironwood does not know", []byte{10, 1, 2}, false, true, [32]byte{}, [32]byte{}},
 		{"empty", nil, false, false, [32]byte{}, [32]byte{}},
 	} {
@@ -160,6 +173,20 @@ func TestNekoServerYggRule(t *testing.T) {
 		{"pathBroken of K's traffic to N, back to K", false, down, yggPathBroken, keyK, keyN, true},
 		{"pathBroken of N's traffic to K", false, down, yggPathBroken, keyN, keyK, false},
 		{"pathBroken of K's traffic to another", false, down, yggPathBroken, keyK, keyA, false},
+		// A lookup: from the client, its source K; to the client, the node's
+		// own, for K (its key, or one from its address, iw:
+		// pathfinder.go:62-64).
+		{"pathLookup K for N", false, up, yggPathLookup, keyK, keyN, true},
+		{"pathLookup K for another", false, up, yggPathLookup, keyK, keyA, true},
+		{"pathLookup forging N", false, up, yggPathLookup, keyN, keyK, false},
+		{"pathLookup forging another", false, up, yggPathLookup, keyA, keyN, false},
+		{"pathLookup N for K", false, down, yggPathLookup, keyN, keyK, true},
+		{"pathLookup N for K's address", false, down, yggPathLookup, keyN, [32]byte(address.AddrForKey(keyK[:]).GetKey()), true},
+		{"pathLookup N for K's subnet", false, down, yggPathLookup, keyN, [32]byte(address.SubnetForKey(keyK[:]).GetKey()), true},
+		{"pathLookup N for another", false, down, yggPathLookup, keyN, keyA, false},
+		{"pathLookup N for another's address", false, down, yggPathLookup, keyN, [32]byte(address.AddrForKey(keyA[:]).GetKey()), false},
+		{"pathLookup another for K", false, down, yggPathLookup, keyA, keyK, false},
+		{"pathLookup another for N", false, down, yggPathLookup, keyA, keyN, false},
 		// With groups: K and G in one, A in another, N in none.
 		{"group: traffic K to G", true, up, yggTraffic, keyK, keyG, true},
 		{"group: traffic G to N, through K", true, up, yggTraffic, keyG, keyN, true},
@@ -170,6 +197,12 @@ func TestNekoServerYggRule(t *testing.T) {
 		{"group: traffic A to K", true, down, yggTraffic, keyA, keyK, false},
 		{"group: pathBroken of K's traffic to G, back to K", true, down, yggPathBroken, keyK, keyG, true},
 		{"group: pathBroken of K's traffic to A", true, down, yggPathBroken, keyK, keyA, false},
+		{"group: pathLookup G for N, through K", true, up, yggPathLookup, keyG, keyN, true},
+		{"group: pathLookup A for N, through K", true, up, yggPathLookup, keyA, keyN, false},
+		{"group: pathLookup G for K", true, down, yggPathLookup, keyG, keyK, true},
+		{"group: pathLookup N for G, through K", true, down, yggPathLookup, keyN, keyG, true},
+		{"group: pathLookup G for A, through K", true, down, yggPathLookup, keyG, keyA, false},
+		{"group: pathLookup A for K", true, down, yggPathLookup, keyA, keyK, false},
 	} {
 		r := yggRule{node: keyN, key: keyK, group: noGroup}
 		if c.groups {
@@ -246,7 +279,9 @@ func TestNekoServerYggLinkFilter(t *testing.T) {
 		// A length not in the fewest bytes: ironwood takes it, and it
 		// passes as it came.
 		{append([]byte{0x81, 0x80, 0x00}, 1), true},
-		{iwFrame([]byte{6, 1, 2, 3}), true}, // a lookup: not read
+		{iwFrame(iwLookup(keyK, keyN, 1, 2)), true},
+		{iwFrame(iwLookup(keyN, keyA)), false}, // forged
+		{iwFrame([]byte{2, 1, 2, 3}), true},    // sigReq: not read
 	}
 	var stream, want []byte
 	drops := 0
@@ -278,9 +313,12 @@ func TestNekoServerYggLinkFilter(t *testing.T) {
 	down := slices.Concat(meta,
 		iwFrame(iwTraffic(nil, nil, keyN, keyK, 1, []byte("to K"))),
 		iwFrame(iwTraffic(nil, nil, keyN, keyA, 1, []byte("through K"))),
+		iwFrame(iwLookup(keyN, keyK, 3)),
+		iwFrame(iwLookup(keyN, keyA, 3)),
+		iwFrame(iwLookup(keyA, keyN, 4)),
 		iwFrame(iwBroken(nil, 1, keyK, keyN)))
 	wantDown := slices.Concat(meta, iwFrame(iwTraffic(nil, nil, keyN, keyK, 1, []byte("to K"))),
-		iwFrame(iwBroken(nil, 1, keyK, keyN)))
+		iwFrame(iwLookup(keyN, keyK, 3)), iwFrame(iwBroken(nil, 1, keyK, keyN)))
 	for _, n := range []int{1, 4, 7, len(down)} {
 		var dropped atomic.Uint64
 		f := &yggLinkFilter{rule: yggRule{node: keyN, key: keyK, group: noGroup}, dropped: &dropped}
@@ -288,7 +326,7 @@ func TestNekoServerYggLinkFilter(t *testing.T) {
 		if err := f.down(out, &chunks{b: down, n: n}); err != io.EOF {
 			t.Fatalf("down, reads of %d: %v", n, err)
 		}
-		if !bytes.Equal(out.Bytes(), wantDown) || dropped.Load() != 1 {
+		if !bytes.Equal(out.Bytes(), wantDown) || dropped.Load() != 3 {
 			t.Fatalf("down, reads of %d: %x, %d dropped", n, out.Bytes(), dropped.Load())
 		}
 	}
@@ -334,11 +372,13 @@ func TestNekoServerYggLinkFilter(t *testing.T) {
 }
 
 // iwNet is ironwood on its own, as the core runs it: routers joined by
-// pipes, each frame between them seen on the way.
+// pipes, each frame between them seen on the way, and what each router
+// gets from whom.
 type iwNet struct {
 	t      *testing.T
 	mu     sync.Mutex
 	frames []iwSeen
+	got    map[[2][32]byte]bool // receiver, sender
 }
 
 // iwSeen is a frame on a link, as the filter reads it.
@@ -350,17 +390,27 @@ type iwSeen struct {
 }
 
 func (n *iwNet) node(key ed25519.PrivateKey) *iwn.PacketConn {
-	pc, err := iwn.NewPacketConn(key, iwn.WithPeerMaxMessageSize(yggFrameMax))
+	// The bloom transform the core sets (ygg: src/core/core.go:96-102).
+	xform := func(k ed25519.PublicKey) ed25519.PublicKey { return address.SubnetForKey(k).GetKey() }
+	pc, err := iwn.NewPacketConn(key, iwn.WithPeerMaxMessageSize(yggFrameMax), iwn.WithBloomTransform(xform))
 	if err != nil {
 		n.t.Fatal(err)
 	}
 	n.t.Cleanup(func() { pc.Close() })
-	go func() { // whatever comes, read and forgotten
+	self := [32]byte(iwKey(pc))
+	go func() { // whatever comes, noted by sender and forgotten
 		b := make([]byte, 65535)
 		for {
-			if _, _, err := pc.ReadFrom(b); err != nil {
+			_, from, err := pc.ReadFrom(b)
+			if err != nil {
 				return
 			}
+			n.mu.Lock()
+			if n.got == nil {
+				n.got = map[[2][32]byte]bool{}
+			}
+			n.got[[2][32]byte{self, [32]byte(from.(iwt.Addr))}] = true
+			n.mu.Unlock()
 		}
 	}()
 	return pc
@@ -368,24 +418,48 @@ func (n *iwNet) node(key ed25519.PrivateKey) *iwn.PacketConn {
 
 func iwKey(pc *iwn.PacketConn) ed25519.PublicKey { return ed25519.PublicKey(pc.LocalAddr().(iwt.Addr)) }
 
-// link joins a and b; cut ends the link.
-func (n *iwNet) link(a, b *iwn.PacketConn) (cut func()) {
+// iwClient makes a link a client's link to the node: through the filter,
+// and with lie (when set) rewriting the client's frames before anyone
+// sees them.
+type iwClient struct {
+	filter *yggLinkFilter
+	lie    func([]byte) []byte
+}
+
+// link joins a and b, a a client of b when c is given; cut ends the link.
+// The frames are seen on a's side of the filter: a's as a sends them, b's
+// as the filter lets them through.
+func (n *iwNet) link(a, b *iwn.PacketConn, c ...iwClient) (cut func()) {
 	a1, a2 := net.Pipe()
 	b1, b2 := net.Pipe()
+	conns := []net.Conn{a1, a2, b1, b2}
 	go func() { _ = a.HandleConn(iwKey(b), a1, 0) }()
 	go func() { _ = b.HandleConn(iwKey(a), b1, 0) }()
-	go n.relay(a2, b2, iwKey(a), iwKey(b))
-	go n.relay(b2, a2, iwKey(b), iwKey(a))
+	var opt iwClient
+	if len(c) > 0 {
+		opt = c[0]
+	}
+	if opt.filter == nil {
+		go n.relay(a2, b2, iwKey(a), iwKey(b), opt.lie)
+		go n.relay(b2, a2, iwKey(b), iwKey(a), nil)
+	} else {
+		f1, f2 := net.Pipe()
+		conns = append(conns, f1, f2)
+		go n.relay(a2, f1, iwKey(a), iwKey(b), opt.lie)
+		go n.relay(f1, a2, iwKey(b), iwKey(a), nil)
+		go func() { _ = opt.filter.up(b2, f2) }()
+		go func() { _ = opt.filter.copy(f2, b2, false) }()
+	}
 	return func() {
-		for _, c := range []net.Conn{a1, a2, b1, b2} {
+		for _, c := range conns {
 			c.Close()
 		}
 	}
 }
 
-// relay splits the frames as ironwood reads them (peers.go:247-266), on
+// relay splits the frames as ironwood reads them (peers.go:247-269), on
 // its own, and has the filter's parser read each.
-func (n *iwNet) relay(src, dst net.Conn, from, to ed25519.PublicKey) {
+func (n *iwNet) relay(src, dst net.Conn, from, to ed25519.PublicKey, lie func([]byte) []byte) {
 	r := bufio.NewReader(src)
 	for {
 		size, err := binary.ReadUvarint(r)
@@ -395,6 +469,9 @@ func (n *iwNet) relay(src, dst net.Conn, from, to ed25519.PublicKey) {
 		frame := make([]byte, size)
 		if _, err := io.ReadFull(r, frame); err != nil || size == 0 {
 			return
+		}
+		if lie != nil {
+			frame = lie(frame)
 		}
 		seen := iwSeen{from: from, to: to, typ: frame[0]}
 		source, dest, keyed, ok := yggFrameKeys(frame)
@@ -409,6 +486,12 @@ func (n *iwNet) relay(src, dst net.Conn, from, to ed25519.PublicKey) {
 			return
 		}
 	}
+}
+
+func (n *iwNet) received(to, from *iwn.PacketConn) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.got[[2][32]byte{[32]byte(iwKey(to)), [32]byte(iwKey(from))}]
 }
 
 func (n *iwNet) find(ok func(iwSeen) bool) bool {
@@ -447,6 +530,8 @@ func TestNekoServerYggFrameIronwood(t *testing.T) {
 		t.Fatal("A's traffic never reached C")
 	}
 	for name, ok := range map[string]func(iwSeen) bool{
+		"lookup A for C, on A-B":    is(yggPathLookup, ka, kb, ka, kc),
+		"lookup A for C, on B-C":    is(yggPathLookup, kb, kc, ka, kc),
 		"traffic A to C, on A-B":    is(yggTraffic, ka, kb, ka, kc),
 		"pathNotify C to A, on C-B": is(yggPathNotify, kc, kb, kc, ka),
 		"pathNotify C to A, on B-A": is(yggPathNotify, kb, ka, kc, ka),
@@ -469,7 +554,7 @@ func TestNekoServerYggFrameIronwood(t *testing.T) {
 	n.mu.Lock()
 	for _, s := range n.frames {
 		types[s.typ] = true
-		if s.keyed != (s.typ >= yggPathNotify && s.typ <= yggTraffic) || !s.ok {
+		if s.keyed != (s.typ >= yggPathLookup && s.typ <= yggTraffic) || !s.ok {
 			t.Errorf("type %d: keyed %v ok %v", s.typ, s.keyed, s.ok)
 		}
 	}
@@ -511,5 +596,113 @@ func BenchmarkYggLinkFilter(b *testing.B) {
 				}
 			})
 		}
+	}
+}
+
+// yggAllOnes is a bloom filter frame with every bit set (iw:
+// bloomfilter.go:53-81): a client that sends it gets every lookup the node
+// passes on (bloomfilter.go:301-329).
+func yggAllOnes(frame []byte) []byte {
+	if frame[0] != 5 {
+		return frame
+	}
+	return slices.Concat([]byte{5}, make([]byte, 16), bytes.Repeat([]byte{0xff}, 16))
+}
+
+// The filter between ironwood routers: a node N and its clients A and B,
+// B lying in its bloom filter to get every lookup N passes on. A and N
+// reach each other (each one's lookup passes, the other's pathNotify
+// comes back); B learns nothing of A from lookups, nor reaches A, unless
+// A and B are in one group. Without the filter B gets A's lookups: the leak
+// the lookup rule closes.
+func TestNekoServerYggFrameIronwoodFilter(t *testing.T) {
+	for _, c := range []struct {
+		name                     string
+		filter, groups, nodeRoot bool
+	}{
+		{"no filter", false, false, true},
+		{"filter", true, false, true},
+		{"filter, A the tree's root", true, false, false},
+		{"filter, A and B in a group", true, true, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var keys []ed25519.PrivateKey
+			for range 3 {
+				_, k, _ := ed25519.GenerateKey(rand.Reader)
+				keys = append(keys, k)
+			}
+			slices.SortFunc(keys, func(x, y ed25519.PrivateKey) int { return bytes.Compare(x[32:], y[32:]) })
+			if !c.nodeRoot {
+				keys[0], keys[1] = keys[1], keys[0]
+			}
+			n := &iwNet{t: t}
+			N, A, B := n.node(keys[0]), n.node(keys[1]), n.node(keys[2])
+			kn, ka, kb := [32]byte(iwKey(N)), [32]byte(iwKey(A)), [32]byte(iwKey(B))
+			group := func(k *[32]byte) yggGroup {
+				if c.groups && (*k == ka || *k == kb) {
+					return 1
+				}
+				return 0
+			}
+			var droppedA, droppedB atomic.Uint64
+			ca, cb := iwClient{}, iwClient{lie: yggAllOnes}
+			if c.filter {
+				ca.filter = &yggLinkFilter{rule: yggRule{node: kn, key: ka, group: group}, dropped: &droppedA}
+				cb.filter = &yggLinkFilter{rule: yggRule{node: kn, key: kb, group: group}, dropped: &droppedB}
+			}
+			n.link(A, N, ca)
+			n.link(B, N, cb)
+
+			send := func(from, to *iwn.PacketConn, d time.Duration) bool {
+				return waitFor(d, func() bool {
+					_, _ = from.WriteTo([]byte("hello"), iwt.Addr(iwKey(to)))
+					return n.received(to, from)
+				})
+			}
+			for _, p := range []struct {
+				name     string
+				from, to *iwn.PacketConn
+			}{{"A to N", A, N}, {"N to A", N, A}, {"B to N", B, N}} {
+				if !send(p.from, p.to, 15*time.Second) {
+					t.Fatalf("%s: nothing arrived", p.name)
+				}
+			}
+			// What made it: A's lookup for N, N's pathNotify to A; N's lookup
+			// for A, A's pathNotify to N.
+			for name, want := range map[string]iwSeen{
+				"A's lookup for N":    {from: ed25519.PublicKey(ka[:]), typ: yggPathLookup, source: ka, dest: kn},
+				"N's pathNotify to A": {from: ed25519.PublicKey(kn[:]), typ: yggPathNotify, source: kn, dest: ka},
+				"N's lookup for A":    {from: ed25519.PublicKey(kn[:]), typ: yggPathLookup, source: kn, dest: ka},
+				"A's pathNotify to N": {from: ed25519.PublicKey(ka[:]), typ: yggPathNotify, source: ka, dest: kn},
+			} {
+				if !n.find(func(s iwSeen) bool {
+					return bytes.Equal(s.from, want.from) && s.typ == want.typ && s.source == want.source && s.dest == want.dest
+				}) {
+					t.Errorf("no %s", name)
+				}
+			}
+			reached := send(A, B, 5*time.Second)
+			// What came to B about A: a lookup with A's key in it.
+			aToB := n.find(func(s iwSeen) bool {
+				return bytes.Equal(s.to, iwKey(B)) && s.typ == yggPathLookup && (s.source == ka || s.dest == ka)
+			})
+			switch {
+			case !c.filter:
+				if !aToB || !reached {
+					t.Errorf("without the filter: B got A's lookup %v, A reached B %v; want both", aToB, reached)
+				}
+			case c.groups:
+				if !reached {
+					t.Error("A and B in a group, yet A did not reach B")
+				}
+			default:
+				if aToB || reached {
+					t.Errorf("B got a lookup with A's key %v, A reached B %v", aToB, reached)
+				}
+				if droppedB.Load() == 0 {
+					t.Error("nothing dropped on B's link")
+				}
+			}
+		})
 	}
 }
