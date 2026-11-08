@@ -25,7 +25,10 @@ func FuzzYggFrames(f *testing.F) {
 		iwNotify(nil, 1, keyK, keyA, 1, nil, sig),
 		iwBroken(nil, ^uint64(0), keyK, keyN),
 		iwBroken([]uint64{9}, 1, keyN, keyK),
-		{1}, {6, 1, 2}, {5},
+		iwLookup(keyK, keyN, 1, 2),
+		iwLookup(keyN, keyK),
+		iwLookup(keyA, keyK, 3),
+		{1}, {2, 1, 2}, {5},
 	}
 	for _, fr := range frames {
 		f.Add(fr, uint16(7), true)
@@ -67,8 +70,8 @@ func FuzzYggFrames(f *testing.F) {
 
 // The reference: ironwood 0712ecc's own decoding, ported as it is,
 // allocations and all (network/wire.go:20-46, 88-113; traffic.go:51-69;
-// pathfinder.go:407-421, 465-481, 527-543), and its framing (peers.go:
-// 247-266, 275).
+// pathfinder.go:322-336, 407-421, 465-481, 527-543), and its framing
+// (peers.go:247-269, 275).
 
 func iwChopSlice(out []byte, data *[]byte) bool {
 	if len(*data) < len(out) {
@@ -116,7 +119,8 @@ func iwChopPath(out *[]uint64, data *[]byte) bool {
 }
 
 // iwRefKeys decodes a frame as ironwood's _handlePacket would: keyed for
-// traffic, pathNotify and pathBroken, ok when the decoder takes it.
+// pathLookup, traffic, pathNotify and pathBroken, ok when the decoder
+// takes it.
 func iwRefKeys(frame []byte) (source, dest [32]byte, keyed, ok bool) {
 	if len(frame) == 0 {
 		return source, dest, false, false // ErrEmptyMessage
@@ -137,6 +141,8 @@ func iwRefKeys(frame []byte) (source, dest [32]byte, keyed, ok bool) {
 			var sig [64]byte
 			ok = iwChopUint(&seq, &data) && iwChopPath(&coords, &data) && iwChopSlice(sig[:], &data) && len(data) == 0
 		}
+	case 6: // pathLookup.decode
+		ok = iwChopSlice(source[:], &data) && iwChopSlice(dest[:], &data) && iwChopPath(&from, &data) && len(data) == 0
 	case 8: // pathBroken.decode
 		ok = iwChopPath(&path, &data) && iwChopUint(&watermark, &data) &&
 			iwChopSlice(source[:], &data) && iwChopSlice(dest[:], &data) && len(data) == 0

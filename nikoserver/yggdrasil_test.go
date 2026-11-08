@@ -20,6 +20,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -345,8 +346,9 @@ func TestNekoServerYggdrasilIsolation(t *testing.T) {
 	defer cancel()
 	n := startYggNode(t, ctx)
 
-	// A device that writes its own frames: one to the node passes, one with
-	// the node's key as its source is dropped.
+	// A device that writes its own frames: its traffic and lookup for the
+	// node pass, a traffic and a lookup with the node's key as their source
+	// are dropped.
 	xPublic, x, _ := ed25519.GenerateKey(rand.Reader)
 	n.setUsers(t, xPublic)
 	tc, err := tls.Dial("tcp", n.front, &tls.Config{ServerName: "y.example.com", InsecureSkipVerify: true,
@@ -372,11 +374,12 @@ func TestNekoServerYggdrasilIsolation(t *testing.T) {
 	rand.Read(other[:])
 	toNode := iwFrame(iwTraffic(nil, nil, xk, nk, ^uint64(0), []byte("to the node")))
 	forged := iwFrame(iwTraffic(nil, nil, nk, other, ^uint64(0), []byte("from the node, says x")))
-	if _, err := tc.Write(append(toNode, forged...)); err != nil {
+	lookup, forgedLookup := iwFrame(iwLookup(xk, nk)), iwFrame(iwLookup(nk, other))
+	if _, err := tc.Write(slices.Concat(toNode, forged, lookup, forgedLookup)); err != nil {
 		t.Fatal(err)
 	}
-	if !waitFor(5*time.Second, func() bool { return n.snapshot(t).DroppedFrames == 1 }) {
-		t.Fatalf("dropped %d frames, want the forged one", n.snapshot(t).DroppedFrames)
+	if !waitFor(5*time.Second, func() bool { return n.snapshot(t).DroppedFrames == 2 }) {
+		t.Fatalf("dropped %d frames, want the two forged", n.snapshot(t).DroppedFrames)
 	}
 	tc.Close()
 

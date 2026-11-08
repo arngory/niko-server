@@ -334,7 +334,7 @@ type yggLinks struct {
 // (v0.15.0). Totals only: nothing of whose frames (raycontrol lan-v1 §4.3).
 type YggdrasilSnapshot struct {
 	Started       int64  `json:"started"`        // the backend's start, Unix seconds
-	DroppedFrames uint64 `json:"dropped_frames"` // traffic, pathNotify and pathBroken on a client's link between it and another than the node: dropped
+	DroppedFrames uint64 `json:"dropped_frames"` // traffic, pathNotify, pathBroken and pathLookup on a client's link between it and another than the node: dropped
 }
 
 // serve takes one stream from tcpmux: TLS, then a Yggdrasil link of a

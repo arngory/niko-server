@@ -193,8 +193,8 @@ JSON Schema появится в `arngory/sing-box`, `cmd/niko-server/schema/` в
   если клиент задал темп, темп Brutal и доля подтверждённых. Так клиент видит свою сессию, не видя чужих.
 
   У `yggdrasil` — как у dnstt, одна строка JSON (`YggdrasilSnapshot`): `started` — время старта бэкенда,
-  `dropped_frames` — кадры traffic, pathNotify и pathBroken на линке клиента между ним и не узлом, отброшенные
-  фильтром (raycontrol `lan-v1` §2.2). Только сумма: чьи кадры, не видно нигде, в журнале тоже.
+  `dropped_frames` — кадры traffic, pathNotify, pathBroken и pathLookup на линке клиента между ним и не узлом,
+  отброшенные фильтром (raycontrol `lan-v1` §2.2, `docs/SPEC.md` §3.4). Только сумма: чьи кадры, не видно нигде, в журнале тоже.
 
 `options` по видам:
 
