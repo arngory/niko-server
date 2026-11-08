@@ -210,6 +210,9 @@ sing-quic. Бэкенды `hy2-masq` и `hy2-obfs` — niko-server на sing-qui
     - получателю, если он ждёт ответа (долг мог погасить отброшенный кадр), — keepalive.
     - Один ответ на кадр и только на этом линке; запись — целыми кадрами под одним замком на сторону; ожидающие
       кадры — не больше 16 КиБ на сторону, пишет их своя горутина, отбрасывающий не ждёт.
+  - **Packet Too Big — только своему.** ipv6rwc ядра отвечал на пакет больше MTU сообщением ICMPv6 Packet Too Big
+    с 512 байтами пакета на адрес источника, ещё не сверив его с ключом отправителя: клиент, подставивший адрес
+    другого, слал ему свои байты через узел. В форке (`5afe92f`) адрес сверяется раньше.
   - Кадр, который ядро не приняло бы (длина больше 131070 байт, пустой, разбор не сходится), закрывает линк.
   - Остальные типы (keepalive, дерево, bloom) проходят как есть.
   - Ядро не отвечает на удалённые getSelf, getPeers, getTree (`DebugPrivacy` форка): иначе getPeers отдавал бы ключи
@@ -315,7 +318,7 @@ systemd credentials (TPM при наличии), systemd-resolved stub выкл�
 | `arngory/dnstt` | серверная библиотека (§3.3) | есть: зеркало апстрима, работа от `master` (v1.20260501.0) |
 | `arngory/MasterDnsVPN` | сервер с внешним PacketConn | есть, `main` (сервер в `cmd/server`, `internal/`) |
 | sing-quic | сервер Hysteria2 | вендорен в `third_party/sing-quic` (`replace` в `go.mod`, с версии v0.6.0). Правки помечены `neko`: хук соединений с пользователем, статистикой QUIC и Brutal и (v0.15.0) способом закрыть соединение, атомарная доля подтверждённых у Brutal, атомарная замена таблицы пользователей (раньше запись без блокировки гонялась с чтением), salamander без побайтового цикла и без обрезки полного пакета до 1444 байт (v0.7.1) |
-| `arngory/yggdrasil-go` | патч `LinkDialer` (исходящие линки через дозвонщик встраивающей программы); `DebugPrivacy` (без ответов на удалённые getSelf, getPeers, getTree) | есть: 0.5.15 с патчем в `develop` ([#1](https://github.com/arngory/yggdrasil-go/pull/1)); `DebugPrivacy` — `9ba3c0a` в `claude/clever-feynman-w0e2v1`. niko-server берёт ядро отсюда (`replace` в `go.mod`, `9ba3c0a` с v0.15.0); клиенту — перейти с `sing-box/third_party/yggdrasil-go` на этот форк |
+| `arngory/yggdrasil-go` | патч `LinkDialer` (исходящие линки через дозвонщик встраивающей программы); `DebugPrivacy` (без ответов на удалённые getSelf, getPeers, getTree); ipv6rwc: Packet Too Big только на адрес, сверенный с ключом отправителя | есть: 0.5.15 с патчем в `develop` ([#1](https://github.com/arngory/yggdrasil-go/pull/1)); `DebugPrivacy` — `9ba3c0a`, Packet Too Big только своему (ipv6rwc) — `5afe92f`, оба в `claude/clever-feynman-w0e2v1`. niko-server берёт ядро отсюда (`replace` в `go.mod`, `5afe92f` с v0.15.0); клиенту — перейти с `sing-box/third_party/yggdrasil-go` на этот форк |
 | `arngory/naiveproxy` | клиент naive для тестов и плагин Android | есть, Chromium 154.0.8037.49; в `apk/` — сборка плагина (свой ключ подписи) |
 | `arngory/olcrtc`, `arngory/OpenFlux` | белые списки (§3.10) | по raycontrol |
 | apernet/hysteria | официальный клиент для тестов | форк не нужен, тег собирается в CI |

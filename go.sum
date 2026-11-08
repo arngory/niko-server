@@ -16,8 +16,8 @@ github.com/arngory/sing-box v1.14.5-0.20261102040805-34eaa8c9c5a9 h1:jx7VbuAu1ib
 github.com/arngory/sing-box v1.14.5-0.20261102040805-34eaa8c9c5a9/go.mod h1:PtwjfzE+TEhHf0J+6rYE9Y5l7T5/Yc00+F2t9jaFaNM=
 github.com/arngory/sing-box/third_party/masterdnsvpn v0.0.0-20261106212949-f0eadfa3e71c h1:mnh81fyVpy5MILlM8tEpiC9Gdcpv68ZGsF09/HJHozo=
 github.com/arngory/sing-box/third_party/masterdnsvpn v0.0.0-20261106212949-f0eadfa3e71c/go.mod h1:QakxWXe6vEM0QJf2+LK5JnqtGXHQYx8EtP66P5dGty0=
-github.com/arngory/yggdrasil-go v0.5.16-0.20261108184618-9ba3c0a13a0b h1:y2zO1LEUC1w3suA/4HWVCy70kAb07u1MpUGOw8GrQ8E=
-github.com/arngory/yggdrasil-go v0.5.16-0.20261108184618-9ba3c0a13a0b/go.mod h1:T51l2nwbGYRBt+pTEjjpEBXmSKSDdumiFHnEGVllw5s=
+github.com/arngory/yggdrasil-go v0.5.16-0.20261108201637-5afe92f15200 h1:btAh+Dnn7+TXPXAN6uAQu1M1xEfPVWzgDS4fOIf93Es=
+github.com/arngory/yggdrasil-go v0.5.16-0.20261108201637-5afe92f15200/go.mod h1:T51l2nwbGYRBt+pTEjjpEBXmSKSDdumiFHnEGVllw5s=
 github.com/bits-and-blooms/bitset v1.24.2/go.mod h1:7hO7Gc7Pp1vODcmWvKMRA9BNmbv6a/7QIWpPxHddWR8=
 github.com/bits-and-blooms/bitset v1.26.0 h1:WPvcPZbP1yuKofmjs2SYIFO1EjzIGhCP9ducElLsh5Q=
 github.com/bits-and-blooms/bitset v1.26.0/go.mod h1:7hO7Gc7Pp1vODcmWvKMRA9BNmbv6a/7QIWpPxHddWR8=
