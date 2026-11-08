@@ -14,6 +14,7 @@ Data plane ноды под управлением [raycontrol](https://github.co
 | Фронт TCP 443 (tcpmux): маршрут по SNI и ALPN, `proxy-v2` (Xray REALITY), `fd` (передача сокета) | готово (v0.2) |
 | Фронт UDP 443 (udpmux): QUIC Initial (v1, v2) → SNI, salamander, потоки с забыванием по бездействию | готово (v0.3) |
 | Бэкенды `hy2-masq`, `hy2-obfs` (sing-quic): пароли из `users_file`, перечитываются без разрыва, выход только на публичные адреса | готово (v0.3) |
+| Hysteria2: байты по пользователю (строка `traffic` в `stats_socket`), соединения снятых закрываются при перечитывании `users_file` (raycontrol `docs/spec/traffic-limit-v1.md`) | готово (v0.15) |
 | naive-quic, DoH3 | в `rayd` raycontrol за udpmux (HTTP/3) |
 | Бэкенд `site` | не нужен: сайт-приманку держит `rayd site` raycontrol (решения R2-12, R4-8) |
 | Бэкенд `yggdrasil`: tls-линк за tcpmux (TLS 1.3 с `X25519MLKEM768`), ключи пользователей из `users_file` без перезапуска, выход с портов выхода в `inner` | готово (v0.4) |

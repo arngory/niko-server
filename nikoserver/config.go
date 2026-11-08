@@ -206,7 +206,8 @@ type BackendConfig struct {
 	Inner     string         `json:"inner,omitempty"`
 	// StatsSocket (hy2-*): where the backend answers for the sessions of a
 	// client address (raycontrol's channel probes). dnstt: where it gives
-	// its counters (dnsttserver.StatsSnapshot, JSON) to whoever connects.
+	// its counters (dnsttserver.StatsSnapshot, JSON) to whoever connects;
+	// yggdrasil (v0.15.0) the same with YggdrasilSnapshot.
 	StatsSocket string `json:"stats_socket,omitempty"`
 }
 
@@ -645,8 +646,8 @@ func (c *BackendConfig) validate() []ConfigError {
 		e.add("kind", "kind %q is not served by this niko-server release (dnstt, masterdns, hy2-masq, hy2-obfs, yggdrasil)", c.Kind)
 	}
 	if c.StatsSocket != "" {
-		if c.Kind != "hy2-masq" && c.Kind != "hy2-obfs" && c.Kind != "dnstt" {
-			e.add("stats_socket", "only the Hysteria2 and dnstt backends have stats")
+		if c.Kind != "hy2-masq" && c.Kind != "hy2-obfs" && c.Kind != "dnstt" && c.Kind != "yggdrasil" {
+			e.add("stats_socket", "only the Hysteria2, dnstt and Yggdrasil backends have stats")
 		} else {
 			checkSocket(&e, "stats_socket", c.StatsSocket)
 		}
