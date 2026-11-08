@@ -112,6 +112,9 @@ func runYggdrasil(ctx context.Context, c *BackendConfig, log *Logger) error {
 	setup := []core.SetupOption{
 		core.ListenAddress((&url.URL{Scheme: "unix", Path: filepath.Join(dir, "link")}).String()),
 		core.NodeInfoPrivacy(true),
+		// getPeers would list every connected device's key to anyone with
+		// a session to the node (raycontrol lan-v1 §2.1).
+		core.DebugPrivacy(true),
 	}
 	for _, peer := range c.Options.Peers {
 		setup = append(setup, core.Peer{URI: peer})

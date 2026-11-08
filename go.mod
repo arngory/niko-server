@@ -92,7 +92,7 @@ replace github.com/sagernet/sing-box => github.com/arngory/sing-box v1.14.5-0.20
 
 replace masterdnsvpn-go => github.com/arngory/sing-box/third_party/masterdnsvpn v0.0.0-20261106212949-f0eadfa3e71c
 
-replace github.com/yggdrasil-network/yggdrasil-go => github.com/arngory/yggdrasil-go v0.5.16-0.20261103204312-0db15d43777a
+replace github.com/yggdrasil-network/yggdrasil-go => github.com/arngory/yggdrasil-go v0.5.16-0.20261108184618-9ba3c0a13a0b
 
 replace github.com/sagernet/sing-quic => ./third_party/sing-quic
 
