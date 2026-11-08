@@ -394,14 +394,15 @@ func (l *yggLinks) serve(ctx context.Context, raw net.Conn) {
 	}
 	// Frame by frame, through the filter; nothing of it in the log. A link
 	// has no half-close: when either side ends, both do.
-	f := &yggLinkFilter{rule: yggRule{node: l.node, key: key, group: l.users.group}, dropped: &l.dropped}
+	f := newYggLinkFilter(yggRule{node: l.node, key: key, group: l.users.group}, &l.dropped, link, conn)
+	defer f.close()
 	done := make(chan struct{}, 2)
 	go func() {
-		_ = f.up(link, conn)
+		_ = f.up(conn)
 		done <- struct{}{}
 	}()
 	go func() {
-		_ = f.down(conn, link)
+		_ = f.down(link)
 		done <- struct{}{}
 	}()
 	select {

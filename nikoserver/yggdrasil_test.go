@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	iwt "github.com/Arceliar/ironwood/types"
 	"github.com/sagernet/gvisor/pkg/tcpip"
 	"github.com/sagernet/gvisor/pkg/tcpip/adapters/gonet"
 	"github.com/sagernet/gvisor/pkg/tcpip/network/ipv6"
@@ -470,10 +471,33 @@ func TestNekoServerYggdrasilIsolation(t *testing.T) {
 			errs[i] = c.try()
 		}()
 	}
-	wg.Wait()
+	// Meanwhile both links stay up: the filter answers for what it drops,
+	// and ironwood ends a link whose frame gets no answer in 3 s.
+	tried := make(chan struct{})
+	go func() { wg.Wait(); close(tried) }()
+	for down := false; !down; {
+		select {
+		case <-tried:
+			down = true
+		case <-time.After(20 * time.Millisecond):
+			if !peerUp(alice) || !peerUp(bob) {
+				t.Errorf("a link went down while they tried: alice %v, bob %v", peerUp(alice), peerUp(bob))
+				down = true
+			}
+		}
+	}
+	<-tried
 	for i, c := range checks {
 		if (errs[i] == nil) != c.answer {
 			t.Errorf("%s: %v, want an answer %v", c.name, errs[i], c.answer)
+		}
+	}
+	// Alice goes on looking bob up, bob idle: his link stays (review of
+	// v0.15.0: the lookups the filter dropped ended it in 3 s).
+	for end := time.Now().Add(6 * time.Second); time.Now().Before(end); time.Sleep(100 * time.Millisecond) {
+		_, _ = alice.WriteTo([]byte{0}, iwt.Addr(bobKey))
+		if !peerUp(alice) || !peerUp(bob) {
+			t.Fatalf("a link went down: alice %v, bob %v", peerUp(alice), peerUp(bob))
 		}
 	}
 	// What was dropped: bob's and alice's answers to each other's lookups.

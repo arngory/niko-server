@@ -253,6 +253,33 @@ func (s *sink) Write(p []byte) (int, error) {
 	return s.Buffer.Write(p)
 }
 
+// testFilter is a filter on K's link that writes to sinks; what it injects
+// waits until flushed.
+func testFilter(group func(*[32]byte) yggGroup) (f *yggLinkFilter, core, client *sink, dropped *atomic.Uint64) {
+	dropped = new(atomic.Uint64)
+	core, client = &sink{}, &sink{}
+	f = newYggLinkFilter(yggRule{node: keyN, key: keyK, group: group}, dropped, core, client)
+	return f, core, client, dropped
+}
+
+// up and down are the two copies with the injected frames flushed after.
+func (f *yggLinkFilter) testUp(src io.Reader) error {
+	err := f.copy(&f.core, src, true)
+	_ = f.core.flush()
+	_ = f.client.flush()
+	return err
+}
+
+func (f *yggLinkFilter) testDown(src io.Reader) error {
+	err := f.handshake(src)
+	if err == nil {
+		err = f.copy(&f.client, src, false)
+	}
+	_ = f.core.flush()
+	_ = f.client.flush()
+	return err
+}
+
 func TestNekoServerYggLinkFilter(t *testing.T) {
 	var sig [64]byte
 	big := make([]byte, 100<<10)
@@ -294,10 +321,8 @@ func TestNekoServerYggLinkFilter(t *testing.T) {
 		}
 	}
 	for _, n := range []int{1, 3, 1000, 16 << 10, 64 << 10, len(stream)} {
-		var dropped atomic.Uint64
-		f := &yggLinkFilter{rule: yggRule{node: keyN, key: keyK, group: noGroup}, dropped: &dropped}
-		out := &sink{}
-		if err := f.up(out, &chunks{b: stream, n: n}); err != io.EOF {
+		f, out, client, dropped := testFilter(noGroup)
+		if err := f.testUp(&chunks{b: stream, n: n}); err != io.EOF {
 			t.Fatalf("reads of %d: %v", n, err)
 		}
 		if !bytes.Equal(out.Bytes(), want) || dropped.Load() != uint64(drops) {
@@ -305,6 +330,11 @@ func TestNekoServerYggLinkFilter(t *testing.T) {
 		}
 		if n == len(stream) && out.writes > 2*drops+2 {
 			t.Errorf("one read: %d writes", out.writes)
+		}
+		// The client's answers to its dropped frames: keepalives, one while
+		// none is written yet.
+		if !bytes.Equal(client.Bytes(), yggKeepAliveFrame) {
+			t.Errorf("reads of %d: the client got %x", n, client.Bytes())
 		}
 	}
 
@@ -319,15 +349,19 @@ func TestNekoServerYggLinkFilter(t *testing.T) {
 		iwFrame(iwBroken(nil, 1, keyK, keyN)))
 	wantDown := slices.Concat(meta, iwFrame(iwTraffic(nil, nil, keyN, keyK, 1, []byte("to K"))),
 		iwFrame(iwLookup(keyN, keyK, 3)), iwFrame(iwBroken(nil, 1, keyK, keyN)))
+	// The core's answers: the pathBroken the client would send for the
+	// node's traffic it cannot pass on, a keepalive for the rest.
+	wantCore := slices.Concat(iwFrame(iwBroken(nil, ^uint64(0), keyN, keyA)), yggKeepAliveFrame)
 	for _, n := range []int{1, 4, 7, len(down)} {
-		var dropped atomic.Uint64
-		f := &yggLinkFilter{rule: yggRule{node: keyN, key: keyK, group: noGroup}, dropped: &dropped}
-		out := &sink{}
-		if err := f.down(out, &chunks{b: down, n: n}); err != io.EOF {
+		f, core, out, dropped := testFilter(noGroup)
+		if err := f.testDown(&chunks{b: down, n: n}); err != io.EOF {
 			t.Fatalf("down, reads of %d: %v", n, err)
 		}
 		if !bytes.Equal(out.Bytes(), wantDown) || dropped.Load() != 3 {
 			t.Fatalf("down, reads of %d: %x, %d dropped", n, out.Bytes(), dropped.Load())
+		}
+		if !bytes.Equal(core.Bytes(), wantCore) {
+			t.Fatalf("down, reads of %d: the core got %x", n, core.Bytes())
 		}
 	}
 
@@ -350,24 +384,105 @@ func TestNekoServerYggLinkFilter(t *testing.T) {
 		{"the core says no meta", slices.Concat([]byte("mota\x00\x00"), good), true, nil, errYggFrame},
 		{"the core's meta too long", slices.Concat([]byte("meta\x04\x01"), make([]byte, 1025)), true, nil, errYggFrame},
 	} {
-		var dropped atomic.Uint64
-		f := &yggLinkFilter{rule: yggRule{node: keyN, key: keyK, group: noGroup}, dropped: &dropped}
-		out := &sink{}
+		f, core, client, _ := testFilter(noGroup)
 		var err error
+		out := core
 		if c.down {
-			err = f.down(out, &chunks{b: c.stream, n: 5})
+			err, out = f.testDown(&chunks{b: c.stream, n: 5}), client
 		} else {
-			err = f.up(out, &chunks{b: c.stream, n: 5})
+			err = f.testUp(&chunks{b: c.stream, n: 5})
 		}
 		if err != c.err || !bytes.Equal(out.Bytes(), c.want) {
 			t.Errorf("%s: %v, %d bytes written", c.name, err, out.Len())
 		}
 	}
 	// A failed write ends the copy.
-	var dropped atomic.Uint64
-	f := &yggLinkFilter{rule: yggRule{node: keyN, key: keyK, group: noGroup}, dropped: &dropped}
-	if err := f.up(&sink{fail: true}, &chunks{b: good, n: 100}); err == nil || err == io.EOF {
+	f, core, _, _ := testFilter(noGroup)
+	core.fail = true
+	if err := f.testUp(&chunks{b: good, n: 100}); err == nil || err == io.EOF {
 		t.Errorf("a failed write: %v", err)
+	}
+}
+
+// What the filter injects for a frame it drops (yggLinkFilter.answer), byte
+// for byte.
+func TestNekoServerYggLinkFilterAnswers(t *testing.T) {
+	ka := yggKeepAliveFrame
+	var sig [64]byte
+	// From the client: a keepalive back to it; the core gets one only while
+	// it waits for the client (a frame of the core's passed, and nothing
+	// went to it since).
+	f, core, client, _ := testFilter(noGroup)
+	forged := iwFrame(iwTraffic(nil, nil, keyN, keyA, 1, []byte("x")))
+	if f.testUp(&chunks{b: forged, n: 100}); core.Len() != 0 || !bytes.Equal(client.Bytes(), ka) {
+		t.Fatalf("a dropped frame of the client's: core %x, client %x", core.Bytes(), client.Bytes())
+	}
+	core.Reset()
+	client.Reset()
+	f.testDown(&chunks{b: slices.Concat([]byte("meta\x00\x00"), iwFrame([]byte{5, 1, 2}), iwFrame(ka[1:])), n: 100})
+	if !f.core.waits.Load() {
+		t.Fatal("the core's bloom filter passed, yet the core does not wait")
+	}
+	client.Reset()
+	if f.testUp(&chunks{b: slices.Concat(forged, forged), n: 100}); !bytes.Equal(core.Bytes(), ka) || !bytes.Equal(client.Bytes(), ka) {
+		t.Fatalf("dropped while the core waits: core %x, client %x", core.Bytes(), client.Bytes())
+	}
+	if f.core.waits.Load() {
+		t.Fatal("the core got a keepalive, yet waits")
+	}
+
+	// To the client: for the node's traffic, from it or to it, the
+	// pathBroken the client would send: the from path as it came, the
+	// watermark ^uint64(0), the traffic's source and dest.
+	nonMinimal := []byte{0x81, 0x00, 0x80, 0x00} // the port 1, the end: in more bytes than needed
+	traffic := slices.Concat([]byte{yggTraffic}, iwPath(nil, 9), nonMinimal, keyA[:], keyN[:], []byte{1}, []byte("p"))
+	for _, c := range []struct {
+		name  string
+		frame []byte
+		core  []byte
+	}{
+		{"the node's traffic to another", iwFrame(iwTraffic([]uint64{3}, []uint64{1, 2}, keyN, keyA, 7, []byte("p"))),
+			iwFrame(iwBroken([]uint64{1, 2}, ^uint64(0), keyN, keyA))},
+		{"another's traffic to the node, its from path in long uvarints", iwFrame(traffic),
+			iwFrame(slices.Concat([]byte{yggPathBroken}, nonMinimal, binary.AppendUvarint(nil, ^uint64(0)), keyA[:], keyN[:]))},
+		{"another's traffic to K", iwFrame(iwTraffic(nil, []uint64{4}, keyA, keyK, 1, nil)), ka},
+		{"traffic between two others", iwFrame(iwTraffic(nil, []uint64{4}, keyA, keyG, 1, nil)), ka},
+		{"the node's traffic with a from path past what may wait", iwFrame(iwTraffic(nil, slices.Repeat([]uint64{1}, yggInjectMax), keyN, keyA, 1, nil)), ka},
+		{"another's lookup", iwFrame(iwLookup(keyA, keyK)), ka},
+		{"another's pathNotify", iwFrame(iwNotify(nil, 1, keyA, keyK, 1, nil, sig)), ka},
+	} {
+		f, core, client, dropped := testFilter(noGroup)
+		f.testDown(&chunks{b: slices.Concat([]byte("meta\x00\x00"), c.frame), n: 1000})
+		if dropped.Load() != 1 || !bytes.Equal(core.Bytes(), c.core) || client.String() != "meta\x00\x00" {
+			t.Errorf("%s: dropped %d, core %x, client %x", c.name, dropped.Load(), core.Bytes(), client.Bytes())
+		}
+		if c.core[1] == yggPathBroken {
+			b := c.core[len(binary.AppendUvarint(nil, uint64(len(c.core)))):]
+			if _, _, keyed, ok := yggFrameKeys(b); !keyed || !ok {
+				t.Errorf("%s: the pathBroken does not read", c.name)
+			}
+			if _, _, _, ok := iwRefKeys(b); !ok {
+				t.Errorf("%s: ironwood would not take the pathBroken", c.name)
+			}
+		}
+	}
+	// While the client waits for the core, a dropped frame on its way to it
+	// may be what paid the core's debt: the client gets a keepalive too.
+	f, core, client, _ = testFilter(noGroup)
+	if err := f.handshake(bytes.NewReader([]byte("meta\x00\x00"))); err != nil {
+		t.Fatal(err)
+	}
+	f.testUp(&chunks{b: iwFrame(iwTraffic(nil, nil, keyK, keyN, 1, []byte("hi"))), n: 100})
+	if !f.client.waits.Load() {
+		t.Fatal("the client's traffic passed, yet the client does not wait")
+	}
+	core.Reset()
+	client.Reset()
+	f.copy(&f.client, &chunks{b: iwFrame(iwLookup(keyA, keyK)), n: 100}, false)
+	f.core.flush()
+	f.client.flush()
+	if !bytes.Equal(core.Bytes(), ka) || !bytes.Equal(client.Bytes(), ka) {
+		t.Fatalf("dropped while the client waits: core %x, client %x", core.Bytes(), client.Bytes())
 	}
 }
 
@@ -379,6 +494,7 @@ type iwNet struct {
 	mu     sync.Mutex
 	frames []iwSeen
 	got    map[[2][32]byte]bool // receiver, sender
+	ended  map[[32]byte]bool    // the links that ended, by their first end's key
 }
 
 // iwSeen is a frame on a link, as the filter reads it.
@@ -426,35 +542,62 @@ type iwClient struct {
 	lie    func([]byte) []byte
 }
 
+// closer is a func as an io.Closer.
+type closer func()
+
+func (c closer) Close() error { c(); return nil }
+
 // link joins a and b, a a client of b when c is given; cut ends the link.
 // The frames are seen on a's side of the filter: a's as a sends them, b's
 // as the filter lets them through.
 func (n *iwNet) link(a, b *iwn.PacketConn, c ...iwClient) (cut func()) {
 	a1, a2 := net.Pipe()
 	b1, b2 := net.Pipe()
-	conns := []net.Conn{a1, a2, b1, b2}
-	go func() { _ = a.HandleConn(iwKey(b), a1, 0) }()
-	go func() { _ = b.HandleConn(iwKey(a), b1, 0) }()
+	conns := []io.Closer{a1, a2, b1, b2}
+	var once sync.Once
+	cut = func() { // as a link ends: whichever side goes, all of it
+		once.Do(func() {
+			for _, c := range conns {
+				c.Close()
+			}
+			n.mu.Lock()
+			if n.ended == nil {
+				n.ended = map[[32]byte]bool{}
+			}
+			n.ended[[32]byte(iwKey(a))] = true
+			n.mu.Unlock()
+		})
+	}
 	var opt iwClient
 	if len(c) > 0 {
 		opt = c[0]
 	}
+	var f1, f2 net.Conn
+	if opt.filter != nil {
+		f1, f2 = net.Pipe()
+		conns = append(conns, f1, f2, closer(opt.filter.close))
+	}
+	run := func(f func()) {
+		go func() {
+			f()
+			cut()
+		}()
+	}
+	run(func() { _ = a.HandleConn(iwKey(b), a1, 0) })
+	run(func() { _ = b.HandleConn(iwKey(a), b1, 0) })
 	if opt.filter == nil {
-		go n.relay(a2, b2, iwKey(a), iwKey(b), opt.lie)
-		go n.relay(b2, a2, iwKey(b), iwKey(a), nil)
+		run(func() { n.relay(a2, b2, iwKey(a), iwKey(b), opt.lie) })
+		run(func() { n.relay(b2, a2, iwKey(b), iwKey(a), nil) })
 	} else {
-		f1, f2 := net.Pipe()
-		conns = append(conns, f1, f2)
-		go n.relay(a2, f1, iwKey(a), iwKey(b), opt.lie)
-		go n.relay(f1, a2, iwKey(b), iwKey(a), nil)
-		go func() { _ = opt.filter.up(b2, f2) }()
-		go func() { _ = opt.filter.copy(f2, b2, false) }()
+		run(func() { n.relay(a2, f1, iwKey(a), iwKey(b), opt.lie) })
+		run(func() { n.relay(f1, a2, iwKey(b), iwKey(a), nil) })
+		f := opt.filter
+		f.attach(b2, f2)
+		go f.client.run(f.done) // no handshake here
+		run(func() { _ = f.up(f2) })
+		run(func() { _ = f.copy(&f.client, b2, false) })
 	}
-	return func() {
-		for _, c := range conns {
-			c.Close()
-		}
-	}
+	return cut
 }
 
 // relay splits the frames as ironwood reads them (peers.go:247-269), on
@@ -486,6 +629,14 @@ func (n *iwNet) relay(src, dst net.Conn, from, to ed25519.PublicKey, lie func([]
 			return
 		}
 	}
+}
+
+// up: the link that a (its first end) is on has not ended, at either end.
+// (ironwood's Debug.GetPeers races with its peers' actors.)
+func (n *iwNet) up(a *iwn.PacketConn) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return !n.ended[[32]byte(iwKey(a))]
 }
 
 func (n *iwNet) received(to, from *iwn.PacketConn) bool {
@@ -588,11 +739,11 @@ func BenchmarkYggLinkFilter(b *testing.B) {
 			})
 			b.Run(name+"/filter", func(b *testing.B) {
 				var dropped atomic.Uint64
-				f := &yggLinkFilter{rule: yggRule{node: keyN, key: keyK, group: noGroup}, dropped: &dropped}
+				f := newYggLinkFilter(yggRule{node: keyN, key: keyK, group: noGroup}, &dropped, discard{}, discard{})
 				b.SetBytes(int64(len(stream)))
 				b.ReportAllocs()
 				for b.Loop() {
-					_ = f.up(discard{}, &chunks{b: stream, n: read})
+					_ = f.copy(&f.core, &chunks{b: stream, n: read}, true)
 				}
 			})
 		}
@@ -626,6 +777,7 @@ func TestNekoServerYggFrameIronwoodFilter(t *testing.T) {
 		{"filter, A and B in a group", true, true, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
 			var keys []ed25519.PrivateKey
 			for range 3 {
 				_, k, _ := ed25519.GenerateKey(rand.Reader)
@@ -704,5 +856,74 @@ func TestNekoServerYggFrameIronwoodFilter(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// overlapping is a writer that notes two Writes at once, and keeps what is
+// written.
+type overlapping struct {
+	in, hit atomic.Int32
+	mu      sync.Mutex
+	b       []byte
+}
+
+func (o *overlapping) Write(p []byte) (int, error) {
+	if o.in.Add(1) > 1 {
+		o.hit.Add(1)
+	}
+	o.mu.Lock()
+	o.b = append(o.b, p...)
+	o.mu.Unlock()
+	time.Sleep(20 * time.Microsecond)
+	o.in.Add(-1)
+	return len(p), nil
+}
+
+// The copy toward the client and the keepalives injected for the client's
+// dropped frames go to the same conn: never two Writes at once, and the
+// stream is whole frames.
+func TestNekoServerYggLinkFilterWritesWhole(t *testing.T) {
+	client := &overlapping{}
+	var dropped atomic.Uint64
+	f := newYggLinkFilter(yggRule{node: keyN, key: keyK, group: noGroup}, &dropped, discard{}, client)
+	defer f.close()
+	go f.client.run(f.done)
+	toK := iwFrame(iwTraffic(nil, nil, keyN, keyK, 1, make([]byte, 100)))
+	forged := iwFrame(iwTraffic(nil, nil, keyN, keyA, 1, nil))
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_ = f.copy(&f.client, &chunks{b: bytes.Repeat(toK, 2000), n: 300}, false)
+	}()
+	go func() {
+		defer wg.Done()
+		for range 2000 {
+			_ = f.copy(&f.core, &chunks{b: forged, n: 100}, true)
+		}
+	}()
+	wg.Wait()
+	_ = f.client.flush()
+	if client.hit.Load() != 0 {
+		t.Fatalf("%d Writes at once", client.hit.Load())
+	}
+	passed, keepalives := 0, 0
+	for b := client.b; len(b) > 0; {
+		size, n := binary.Uvarint(b)
+		if n <= 0 || len(b) < n+int(size) {
+			t.Fatalf("the stream breaks at %d bytes from its end", len(b))
+		}
+		switch frame := b[:n+int(size)]; {
+		case bytes.Equal(frame, toK):
+			passed++
+		case bytes.Equal(frame, yggKeepAliveFrame):
+			keepalives++
+		default:
+			t.Fatalf("a frame neither passed nor injected: %x", frame)
+		}
+		b = b[n+int(size):]
+	}
+	if passed != 2000 || keepalives == 0 {
+		t.Fatalf("%d frames passed, %d keepalives", passed, keepalives)
 	}
 }
