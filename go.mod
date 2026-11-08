@@ -3,6 +3,7 @@ module github.com/arngory/niko-server
 go 1.26.0
 
 require (
+	github.com/Arceliar/ironwood v0.0.0-20261023231900-0712eccbb962
 	github.com/quic-go/quic-go v0.64.1
 	github.com/sagernet/gvisor v0.0.0-20260727.0-sing-box-mod.1
 	github.com/sagernet/sing v0.9.7-0.20261023115459-5dc452e537bf
@@ -19,7 +20,6 @@ require (
 )
 
 require (
-	github.com/Arceliar/ironwood v0.0.0-20261023231900-0712eccbb962 // indirect
 	github.com/Arceliar/phony v0.0.0-20220903101357-530938a4b13d // indirect
 	github.com/bits-and-blooms/bitset v1.26.0 // indirect
 	github.com/bits-and-blooms/bloom/v3 v3.7.1 // indirect
@@ -92,7 +92,7 @@ replace github.com/sagernet/sing-box => github.com/arngory/sing-box v1.14.5-0.20
 
 replace masterdnsvpn-go => github.com/arngory/sing-box/third_party/masterdnsvpn v0.0.0-20261106212949-f0eadfa3e71c
 
-replace github.com/yggdrasil-network/yggdrasil-go => github.com/arngory/yggdrasil-go v0.5.16-0.20261103204312-0db15d43777a
+replace github.com/yggdrasil-network/yggdrasil-go => github.com/arngory/yggdrasil-go v0.5.16-0.20261108184618-9ba3c0a13a0b
 
 replace github.com/sagernet/sing-quic => ./third_party/sing-quic
 
