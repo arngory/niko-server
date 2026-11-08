@@ -214,7 +214,17 @@ func (o *outbound) NewConnectionEx(ctx context.Context, conn net.Conn, _ M.Socks
 	}
 	cancel()
 	if err != nil {
-		o.log.Debugf("destination: %v", err)
+		// The client hears why (Hysteria2's TCP response), not a bare EOF;
+		// the log hears neither where nor why: no destination in it.
+		o.log.Debugf("destination unreachable")
+		_ = N.CloseOnHandshakeFailure(conn, onClose, errors.New(dialReason(err)))
+		return
+	}
+	// The answer goes now, not with the destination's first bytes: a
+	// client may wait for it before it sends (an honest connect), and with
+	// a destination that speaks second both would wait for ever.
+	if err := N.ReportConnHandshakeSuccess(conn, out); err != nil {
+		out.Close()
 		conn.Close()
 		if onClose != nil {
 			onClose(err)
@@ -224,6 +234,28 @@ func (o *outbound) NewConnectionEx(ctx context.Context, conn net.Conn, _ M.Socks
 	err = bufio.CopyConn(ctx, conn, out)
 	if onClose != nil {
 		onClose(err)
+	}
+}
+
+// dialReason is what a client is told of a failed dial: the kind of
+// failure, not the node's own details (its resolver, its addresses).
+func dialReason(err error) string {
+	var dns *net.DNSError
+	switch {
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "connection refused"
+	case errors.Is(err, syscall.EHOSTUNREACH), errors.Is(err, syscall.ENETUNREACH):
+		return "no route to host"
+	case errors.As(err, &dns) && dns.IsNotFound:
+		return "no such host"
+	case errors.As(err, &dns):
+		return "lookup failed"
+	case errors.Is(err, errNotPublic):
+		return "destination not allowed"
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, os.ErrDeadlineExceeded):
+		return "timeout"
+	default:
+		return "unreachable"
 	}
 }
 
@@ -307,6 +339,8 @@ func relayUDP(ctx context.Context, conn N.PacketConn, o *outbound) error {
 	}
 }
 
+var errNotPublic = errors.New("destination not public")
+
 // PublicDialer reaches public unicast addresses only: not the node, not
 // loopback, private, link-local, CGNAT or multicast ranges.
 func PublicDialer() *net.Dialer {
@@ -316,7 +350,7 @@ func PublicDialer() *net.Dialer {
 			return err
 		}
 		if !Public(ap.Addr()) {
-			return errors.New("destination not public")
+			return errNotPublic
 		}
 		return nil
 	}}
