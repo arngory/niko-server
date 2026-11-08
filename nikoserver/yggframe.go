@@ -39,7 +39,9 @@ import (
 //     the largest frame, 131080 bytes, each way.
 //
 // A frame dropped is answered (yggLinkFilter.answer): ironwood ends a link
-// whose frame gets nothing back in 3 s.
+// whose frame gets nothing back in 3 s. A frame of the client's to the node
+// gets the watermark 0 (yggZeroWatermark): the node takes it itself, and no
+// client steers anything with its paths.
 //
 // The wire, as ironwood 0712ecc reads it (iw: its network package):
 //   - a frame is a uvarint length, then that many bytes: a type and its
@@ -85,63 +87,72 @@ var errYggFrame = errors.New("not an ironwood frame")
 // ironwood decodes it, in place. keyed is false for any other type, ok
 // false for a frame of those four that ironwood would refuse.
 func yggFrameKeys(frame []byte) (source, dest *[yggKeySize]byte, keyed, ok bool) {
+	source, dest, _, keyed, ok = yggFrameRead(frame)
+	return source, dest, keyed, ok
+}
+
+// yggFrameRead is yggFrameKeys, and where the watermark starts (traffic,
+// pathNotify, pathBroken; else 0).
+func yggFrameRead(frame []byte) (source, dest *[yggKeySize]byte, wm int, keyed, ok bool) {
 	if len(frame) == 0 {
-		return nil, nil, false, false
+		return nil, nil, 0, false, false
 	}
 	b := frame[1:]
 	switch frame[0] {
 	case yggTraffic:
 		if b, ok = yggSkipPath(b); !ok { // path
-			return nil, nil, true, false
+			return nil, nil, 0, true, false
 		}
 		if b, ok = yggSkipPath(b); !ok { // from
-			return nil, nil, true, false
+			return nil, nil, 0, true, false
 		}
 		if len(b) < 2*yggKeySize {
-			return nil, nil, true, false
+			return nil, nil, 0, true, false
 		}
 		source, dest = (*[yggKeySize]byte)(b), (*[yggKeySize]byte)(b[yggKeySize:])
+		wm = len(frame) - len(b) + 2*yggKeySize
 		if _, ok = yggSkipUint(b[2*yggKeySize:]); !ok { // watermark; the payload is the rest
-			return nil, nil, true, false
+			return nil, nil, 0, true, false
 		}
-		return source, dest, true, true
+		return source, dest, wm, true, true
 	case yggPathLookup:
 		if len(b) < 2*yggKeySize {
-			return nil, nil, true, false
+			return nil, nil, 0, true, false
 		}
 		source, dest = (*[yggKeySize]byte)(b), (*[yggKeySize]byte)(b[yggKeySize:])
 		if b, ok = yggSkipPath(b[2*yggKeySize:]); !ok || len(b) != 0 { // from, nothing after
-			return nil, nil, true, false
+			return nil, nil, 0, true, false
 		}
-		return source, dest, true, true
+		return source, dest, 0, true, true
 	case yggPathNotify, yggPathBroken:
 		if b, ok = yggSkipPath(b); !ok { // path
-			return nil, nil, true, false
+			return nil, nil, 0, true, false
 		}
+		wm = len(frame) - len(b)
 		if b, ok = yggSkipUint(b); !ok { // watermark
-			return nil, nil, true, false
+			return nil, nil, 0, true, false
 		}
 		if len(b) < 2*yggKeySize {
-			return nil, nil, true, false
+			return nil, nil, 0, true, false
 		}
 		source, dest = (*[yggKeySize]byte)(b), (*[yggKeySize]byte)(b[yggKeySize:])
 		b = b[2*yggKeySize:]
 		if frame[0] == yggPathNotify {
 			if b, ok = yggSkipUint(b); !ok { // info: seq
-				return nil, nil, true, false
+				return nil, nil, 0, true, false
 			}
 			if b, ok = yggSkipPath(b); !ok { // info: path
-				return nil, nil, true, false
+				return nil, nil, 0, true, false
 			}
 			if len(b) != 64 { // info: signature
-				return nil, nil, true, false
+				return nil, nil, 0, true, false
 			}
 		} else if len(b) != 0 {
-			return nil, nil, true, false
+			return nil, nil, 0, true, false
 		}
-		return source, dest, true, true
+		return source, dest, wm, true, true
 	}
-	return nil, nil, false, true
+	return nil, nil, 0, false, true
 }
 
 // yggSkipUint is ironwood's wireChopUint without the value.
@@ -340,7 +351,7 @@ func (f *yggLinkFilter) copy(dst *yggOut, src io.Reader, fromClient bool) error 
 				break
 			}
 			frame := buf[r+sn : end]
-			source, dest, keyed, ok := yggFrameKeys(frame)
+			source, dest, wm, keyed, ok := yggFrameRead(frame)
 			if !ok {
 				bad = true
 				break
@@ -352,8 +363,13 @@ func (f *yggLinkFilter) copy(dst *yggOut, src io.Reader, fromClient bool) error 
 				start, asks = end, false
 				f.dropped.Add(1)
 				f.answer(fromClient, frame, source, dest)
-			} else if frame[0] > yggKeepAlive {
-				asks = true
+			} else {
+				if keyed && fromClient {
+					yggZeroWatermark(frame, wm, &f.rule.node, source, dest)
+				}
+				if frame[0] > yggKeepAlive {
+					asks = true
+				}
 			}
 			r = end
 		}
@@ -387,34 +403,60 @@ func (f *yggLinkFilter) copy(dst *yggOut, src io.Reader, fromClient bool) error 
 }
 
 // yggSend writes a run of frames on: if one of them asks for an answer, its
-// sender now waits for one.
+// sender now waits for one. Marked before the write, so that an answer
+// that overtakes it can only clear it (a keepalive too many at worst).
 func yggSend(dst, sender *yggOut, b []byte, asks bool) error {
-	if err := dst.write(b); err != nil {
-		return err
-	}
 	if asks && !sender.waits.Load() {
 		sender.waits.Store(true)
 	}
-	return nil
+	return dst.write(b)
+}
+
+// yggZeroWatermark: a frame of the client's on its way to the node itself
+// (traffic or pathNotify to N, pathBroken back to N) gets the watermark 0
+// (at wm, from yggFrameRead), in place, in as many bytes as it came in (n-1 bytes 0x80, then 0x00:
+// binary.Uvarint reads 0). The node's _lookup then finds no next hop, as
+// the watermark is never above a distance (iw: router.go:701-711), and the
+// node takes the frame itself (router.go:603-616, pathfinder.go:95-103,
+// 238-247), as one with a true path: the watermark is not signed and not
+// read again. A client so steers nothing with its paths: neither traffic
+// to another client's port (and a drop, an answer, a port's occupancy
+// told) nor the answer along a from of its choosing.
+func yggZeroWatermark(frame []byte, wm int, node, source, dest *[yggKeySize]byte) {
+	switch {
+	case frame[0] == yggTraffic && *dest == *node:
+	case frame[0] == yggPathNotify && *dest == *node:
+	case frame[0] == yggPathBroken && *source == *node: // back to its source
+	default:
+		return
+	}
+	_, n := binary.Uvarint(frame[wm:])
+	for i := wm; i < wm+n-1; i++ {
+		frame[i] = 0x80
+	}
+	frame[wm+n-1] = 0
 }
 
 // answer stands in for a frame the filter dropped, as far as ironwood's
 // peers keep each other alive (iw: peers.go:127-181). A peer that sends any
 // frame but a keepalive (or a dummy) ends the link unless some frame comes
 // back within peerTimeout, 3 s; a peer that gets one owes a keepalive within
-// a second, and any frame it sends pays that debt. So:
-//   - the dropped frame's sender gets the answer its receiver would have
-//     given, on this link: to the client, a keepalive; to the core, for
-//     traffic from or to the node, the pathBroken the client's ironwood
-//     sends for traffic it cannot pass on (iw: pathfinder.go:228-236), which
-//     also puts right the stale path that brought it; for anything else a
-//     keepalive, which tells whoever sent it nothing about this link;
-//   - the dropped frame's receiver, if it waits for an answer (the debt the
-//     dropped frame paid), gets a keepalive.
+// a second, and any frame it sends pays that debt. So, on this link only:
+//   - a frame of the client's: the client gets a keepalive, the answer the
+//     core would have given; the core, if it waits for an answer (the debt
+//     the dropped frame paid), a keepalive;
+//   - traffic from or to the node, to the client: the core gets the
+//     pathBroken the client's ironwood sends for traffic it cannot pass on
+//     (iw: pathfinder.go:228-236), which also puts right the node's stale
+//     path that brought it (clients steer none, yggZeroWatermark); the
+//     client, if it waits, a keepalive;
+//   - anything else to the client: the client gets a ping (yggPing), which
+//     its own ironwood answers with a keepalive to the core. Nothing is
+//     said to the core for the client: a link whose client is gone without
+//     a word (TCP dead, no reset) gets no answer, and the core ends it in
+//     3 s, whoever looks the client up meanwhile.
 //
-// So one answer per dropped frame, to its sender, never elsewhere than this
-// link; and a keepalive owed only while the other end waits, once for each
-// of its frames that passed.
+// One answer per dropped frame, pings and keepalives waiting once.
 func (f *yggLinkFilter) answer(fromClient bool, frame []byte, source, dest *[yggKeySize]byte) {
 	if fromClient {
 		f.client.injectKeepalive()
@@ -423,14 +465,14 @@ func (f *yggLinkFilter) answer(fromClient bool, frame []byte, source, dest *[ygg
 		}
 		return
 	}
-	if frame[0] == yggTraffic && (*source == f.rule.node || *dest == f.rule.node) {
-		f.core.injectBroken(yggTrafficFrom(frame), source, dest)
-	} else {
-		f.core.injectKeepalive()
+	if frame[0] == yggTraffic && (*source == f.rule.node || *dest == f.rule.node) &&
+		f.core.injectBroken(yggTrafficFrom(frame), source, dest) {
+		if f.client.waits.Load() {
+			f.client.injectKeepalive()
+		}
+		return
 	}
-	if f.client.waits.Load() {
-		f.client.injectKeepalive()
-	}
+	f.client.injectPing(&f.rule.node, &f.rule.key)
 }
 
 // yggTrafficFrom is the from path of a traffic frame the parser took, as
@@ -469,6 +511,7 @@ type yggOut struct {
 	pending   []byte     // injected frames, not yet written
 	spare     []byte
 	keepalive bool // pending holds a keepalive
+	ping      bool // pending holds a ping
 	wake      chan struct{}
 }
 
@@ -504,16 +547,16 @@ func (o *yggOut) injectKeepalive() {
 // injectBroken injects pathBroken as ironwood's _doBroken makes it for
 // traffic (iw: pathfinder.go:228-236): the path the traffic's from, the
 // watermark ^uint64(0), the traffic's source and dest; encoded as
-// pathfinder.go:514-525 does, the from path as it came.
-func (o *yggOut) injectBroken(from []byte, source, dest *[yggKeySize]byte) {
+// pathfinder.go:514-525 does, the from path as it came. False: it does not
+// fit with what waits.
+func (o *yggOut) injectBroken(from []byte, source, dest *[yggKeySize]byte) bool {
 	size := 1 + len(from) + binary.MaxVarintLen64 + 2*yggKeySize // ^uint64(0) takes 10 bytes
 	var head [binary.MaxVarintLen64]byte
 	hn := binary.PutUvarint(head[:], uint64(size))
 	o.pmu.Lock()
 	if len(o.pending)+hn+size > yggInjectMax {
 		o.pmu.Unlock()
-		o.injectKeepalive()
-		return
+		return false
 	}
 	o.pending = append(o.pending, head[:hn]...)
 	o.pending = append(o.pending, yggPathBroken)
@@ -521,6 +564,28 @@ func (o *yggOut) injectBroken(from []byte, source, dest *[yggKeySize]byte) {
 	o.pending = binary.AppendUvarint(o.pending, ^uint64(0))
 	o.pending = append(o.pending, source[:]...)
 	o.pending = append(o.pending, dest[:]...)
+	o.pmu.Unlock()
+	o.signal()
+	return true
+}
+
+// yggPingSize is a ping's frame: the length, then pathBroken with an empty
+// path, the watermark 0, the source N and the dest K.
+const yggPingSize = 1 + 1 + 1 + 1 + 2*yggKeySize
+
+// injectPing injects, to the client, a pathBroken from the node to it with
+// an empty path and the watermark 0: its ironwood passes it nowhere (no
+// distance is under 0) and drops it (the source is not its own key, iw:
+// pathfinder.go:238-247), but owes the core a keepalive for it, in a
+// second. 68 bytes; one waits at a time.
+func (o *yggOut) injectPing(node, key *[yggKeySize]byte) {
+	o.pmu.Lock()
+	if !o.ping && len(o.pending)+yggPingSize <= yggInjectMax {
+		o.pending = append(o.pending, yggPingSize-1, yggPathBroken, 0, 0)
+		o.pending = append(o.pending, node[:]...)
+		o.pending = append(o.pending, key[:]...)
+		o.ping = true
+	}
 	o.pmu.Unlock()
 	o.signal()
 }
@@ -552,7 +617,7 @@ func (o *yggOut) flush() error {
 	o.pmu.Lock()
 	b := o.pending
 	o.pending, o.spare = o.spare[:0], b
-	o.keepalive = false
+	o.keepalive, o.ping = false, false
 	o.pmu.Unlock()
 	return o.write(b)
 }
