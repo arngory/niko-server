@@ -134,12 +134,37 @@ func TestNekoServerYggFrameKeys(t *testing.T) {
 		if keyed && ok && (*source != c.source || *dest != c.dest) {
 			t.Errorf("%s: source %x dest %x", c.name, source[:1], dest[:1])
 		}
+		// Where the watermark is: ironwood's decoder reads the same value
+		// there.
+		if _, _, wm, _, ok := yggFrameRead(c.frame); ok && keyed && c.frame[0] != yggPathLookup {
+			w, n := binary.Uvarint(c.frame[wm:])
+			if n <= 0 || !yggWatermarkIs(c.frame, w) {
+				t.Errorf("%s: the watermark at %d reads %d", c.name, wm, w)
+			}
+		}
 		// The reference decoder agrees on every case.
 		rs, rd, rkeyed, rok := iwRefKeys(c.frame)
 		if rkeyed != keyed || rok != ok || ok && keyed && (rs != *source || rd != *dest) {
 			t.Errorf("%s: the reference says keyed %v ok %v", c.name, rkeyed, rok)
 		}
 	}
+}
+
+// yggWatermarkIs: ironwood's decoder reads the watermark w in the frame.
+func yggWatermarkIs(frame []byte, w uint64) bool {
+	data := frame[1:]
+	var path, from []uint64
+	var watermark uint64
+	if !iwChopPath(&path, &data) {
+		return false
+	}
+	if frame[0] == yggTraffic && !iwChopPath(&from, &data) {
+		return false
+	}
+	if frame[0] == yggTraffic {
+		data = data[64:]
+	}
+	return iwChopUint(&watermark, &data) && watermark == w
 }
 
 func TestNekoServerYggRule(t *testing.T) {
@@ -285,39 +310,46 @@ func TestNekoServerYggLinkFilter(t *testing.T) {
 	big := make([]byte, 100<<10)
 	rand.Read(big)
 	// The largest frame: the type and body yggFrameMax bytes.
-	largest := iwTraffic(nil, nil, keyK, keyN, 1, nil)
+	largest := iwTraffic(nil, nil, keyK, keyN, 0, nil)
 	largest = append(largest, make([]byte, yggFrameMax-len(largest))...)
+	// Frames to the node reach it with the watermark 0 (yggZeroWatermark):
+	// each one's watermark here takes one byte, its zero too.
 	type frame struct {
 		b    []byte
 		pass bool
+		out  []byte // what the core gets of it, if not b
 	}
 	up := []frame{
-		{iwFrame([]byte{1}), true}, // keepalive
-		{iwFrame(iwTraffic([]uint64{1}, nil, keyK, keyN, 3, []byte("to the node"))), true},
-		{iwFrame(iwTraffic(nil, nil, keyN, keyA, 3, []byte("forged"))), false},
-		{iwFrame(iwNotify(nil, 1, keyK, keyN, 9, []uint64{1}, sig)), true},
-		{iwFrame(iwNotify(nil, 1, keyK, keyA, 9, []uint64{1}, sig)), false},
-		{iwFrame(append([]byte{5}, make([]byte, 32)...)), true}, // a bloom filter: not read
-		{iwFrame(iwTraffic(nil, nil, keyK, keyN, 1, big)), true},
-		{iwFrame(iwTraffic(nil, nil, keyK, keyA, 1, big)), false},
-		{iwFrame(largest), true},
-		{iwFrame(iwBroken([]uint64{4}, 2, keyN, keyK)), true},
-		{iwFrame(iwBroken([]uint64{4}, 2, keyK, keyN)), false},
+		{iwFrame([]byte{1}), true, nil}, // keepalive
+		{iwFrame(iwTraffic([]uint64{1}, nil, keyK, keyN, 3, []byte("to the node"))), true,
+			iwFrame(iwTraffic([]uint64{1}, nil, keyK, keyN, 0, []byte("to the node")))},
+		{iwFrame(iwTraffic(nil, nil, keyN, keyA, 3, []byte("forged"))), false, nil},
+		{iwFrame(iwNotify(nil, 1, keyK, keyN, 9, []uint64{1}, sig)), true, iwFrame(iwNotify(nil, 0, keyK, keyN, 9, []uint64{1}, sig))},
+		{iwFrame(iwNotify(nil, 1, keyK, keyA, 9, []uint64{1}, sig)), false, nil},
+		{iwFrame(append([]byte{5}, make([]byte, 32)...)), true, nil}, // a bloom filter: not read
+		{iwFrame(iwTraffic(nil, nil, keyK, keyN, 1, big)), true, iwFrame(iwTraffic(nil, nil, keyK, keyN, 0, big))},
+		{iwFrame(iwTraffic(nil, nil, keyK, keyA, 1, big)), false, nil},
+		{iwFrame(largest), true, nil},
+		{iwFrame(iwBroken([]uint64{4}, 2, keyN, keyK)), true, iwFrame(iwBroken([]uint64{4}, 0, keyN, keyK))},
+		{iwFrame(iwBroken([]uint64{4}, 2, keyK, keyN)), false, nil},
 		// A length not in the fewest bytes: ironwood takes it, and it
 		// passes as it came.
-		{append([]byte{0x81, 0x80, 0x00}, 1), true},
-		{iwFrame(iwLookup(keyK, keyN, 1, 2)), true},
-		{iwFrame(iwLookup(keyN, keyA)), false}, // forged
-		{iwFrame([]byte{2, 1, 2, 3}), true},    // sigReq: not read
+		{append([]byte{0x81, 0x80, 0x00}, 1), true, nil},
+		{iwFrame(iwLookup(keyK, keyN, 1, 2)), true, nil},
+		{iwFrame(iwLookup(keyN, keyA)), false, nil}, // forged
+		{iwFrame([]byte{2, 1, 2, 3}), true, nil},    // sigReq: not read
 	}
 	var stream, want []byte
 	drops := 0
 	for _, f := range up {
 		stream = append(stream, f.b...)
-		if f.pass {
-			want = append(want, f.b...)
-		} else {
+		switch {
+		case !f.pass:
 			drops++
+		case f.out != nil:
+			want = append(want, f.out...)
+		default:
+			want = append(want, f.b...)
 		}
 	}
 	for _, n := range []int{1, 3, 1000, 16 << 10, 64 << 10, len(stream)} {
@@ -347,11 +379,12 @@ func TestNekoServerYggLinkFilter(t *testing.T) {
 		iwFrame(iwLookup(keyN, keyA, 3)),
 		iwFrame(iwLookup(keyA, keyN, 4)),
 		iwFrame(iwBroken(nil, 1, keyK, keyN)))
+	// The answers: to the core, the pathBroken the client would send for
+	// the node's traffic it cannot pass on; to the client, for the rest, one
+	// ping (after the frames: it waits for the flush here).
 	wantDown := slices.Concat(meta, iwFrame(iwTraffic(nil, nil, keyN, keyK, 1, []byte("to K"))),
-		iwFrame(iwLookup(keyN, keyK, 3)), iwFrame(iwBroken(nil, 1, keyK, keyN)))
-	// The core's answers: the pathBroken the client would send for the
-	// node's traffic it cannot pass on, a keepalive for the rest.
-	wantCore := slices.Concat(iwFrame(iwBroken(nil, ^uint64(0), keyN, keyA)), yggKeepAliveFrame)
+		iwFrame(iwLookup(keyN, keyK, 3)), iwFrame(iwBroken(nil, 1, keyK, keyN)), iwFrame(iwBroken(nil, 0, keyN, keyK)))
+	wantCore := iwFrame(iwBroken(nil, ^uint64(0), keyN, keyA))
 	for _, n := range []int{1, 4, 7, len(down)} {
 		f, core, out, dropped := testFilter(noGroup)
 		if err := f.testDown(&chunks{b: down, n: n}); err != io.EOF {
@@ -366,7 +399,7 @@ func TestNekoServerYggLinkFilter(t *testing.T) {
 	}
 
 	// What ends the link; what passed before is written.
-	good := iwFrame(iwTraffic(nil, nil, keyK, keyN, 1, []byte("ok")))
+	good := iwFrame(iwTraffic(nil, nil, keyK, keyN, 0, []byte("ok")))
 	for _, c := range []struct {
 		name   string
 		stream []byte
@@ -431,33 +464,43 @@ func TestNekoServerYggLinkFilterAnswers(t *testing.T) {
 		t.Fatal("the core got a keepalive, yet waits")
 	}
 
-	// To the client: for the node's traffic, from it or to it, the
-	// pathBroken the client would send: the from path as it came, the
-	// watermark ^uint64(0), the traffic's source and dest.
+	// To the client: for the node's traffic, from it or to it, the core gets
+	// the pathBroken the client would send: the from path as it came, the
+	// watermark ^uint64(0), the traffic's source and dest. For anything
+	// else, the client gets the ping: pathBroken, an empty path, the
+	// watermark 0, from N to K, 68 bytes.
+	ping := slices.Concat([]byte{67, yggPathBroken, 0, 0}, keyN[:], keyK[:])
+	if !bytes.Equal(ping, iwFrame(iwBroken(nil, 0, keyN, keyK))) {
+		t.Fatalf("the ping %x is not ironwood's pathBroken", ping)
+	}
 	nonMinimal := []byte{0x81, 0x00, 0x80, 0x00} // the port 1, the end: in more bytes than needed
 	traffic := slices.Concat([]byte{yggTraffic}, iwPath(nil, 9), nonMinimal, keyA[:], keyN[:], []byte{1}, []byte("p"))
 	for _, c := range []struct {
-		name  string
-		frame []byte
-		core  []byte
+		name         string
+		frame        []byte
+		core, client []byte
 	}{
 		{"the node's traffic to another", iwFrame(iwTraffic([]uint64{3}, []uint64{1, 2}, keyN, keyA, 7, []byte("p"))),
-			iwFrame(iwBroken([]uint64{1, 2}, ^uint64(0), keyN, keyA))},
+			iwFrame(iwBroken([]uint64{1, 2}, ^uint64(0), keyN, keyA)), nil},
 		{"another's traffic to the node, its from path in long uvarints", iwFrame(traffic),
-			iwFrame(slices.Concat([]byte{yggPathBroken}, nonMinimal, binary.AppendUvarint(nil, ^uint64(0)), keyA[:], keyN[:]))},
-		{"another's traffic to K", iwFrame(iwTraffic(nil, []uint64{4}, keyA, keyK, 1, nil)), ka},
-		{"traffic between two others", iwFrame(iwTraffic(nil, []uint64{4}, keyA, keyG, 1, nil)), ka},
-		{"the node's traffic with a from path past what may wait", iwFrame(iwTraffic(nil, slices.Repeat([]uint64{1}, yggInjectMax), keyN, keyA, 1, nil)), ka},
-		{"another's lookup", iwFrame(iwLookup(keyA, keyK)), ka},
-		{"another's pathNotify", iwFrame(iwNotify(nil, 1, keyA, keyK, 1, nil, sig)), ka},
+			iwFrame(slices.Concat([]byte{yggPathBroken}, nonMinimal, binary.AppendUvarint(nil, ^uint64(0)), keyA[:], keyN[:])), nil},
+		{"another's traffic to K", iwFrame(iwTraffic(nil, []uint64{4}, keyA, keyK, 1, nil)), nil, ping},
+		{"traffic between two others", iwFrame(iwTraffic(nil, []uint64{4}, keyA, keyG, 1, nil)), nil, ping},
+		{"the node's traffic with a from path past what may wait", iwFrame(iwTraffic(nil, slices.Repeat([]uint64{1}, yggInjectMax), keyN, keyA, 1, nil)), nil, ping},
+		{"another's lookup", iwFrame(iwLookup(keyA, keyK)), nil, ping},
+		{"another's pathNotify", iwFrame(iwNotify(nil, 1, keyA, keyK, 1, nil, sig)), nil, ping},
+		{"two lookups: one ping waits", slices.Concat(iwFrame(iwLookup(keyA, keyK)), iwFrame(iwLookup(keyG, keyK))), nil, ping},
 	} {
 		f, core, client, dropped := testFilter(noGroup)
 		f.testDown(&chunks{b: slices.Concat([]byte("meta\x00\x00"), c.frame), n: 1000})
-		if dropped.Load() != 1 || !bytes.Equal(core.Bytes(), c.core) || client.String() != "meta\x00\x00" {
+		if dropped.Load() == 0 || !bytes.Equal(core.Bytes(), c.core) || client.String() != "meta\x00\x00"+string(c.client) {
 			t.Errorf("%s: dropped %d, core %x, client %x", c.name, dropped.Load(), core.Bytes(), client.Bytes())
 		}
-		if c.core[1] == yggPathBroken {
-			b := c.core[len(binary.AppendUvarint(nil, uint64(len(c.core)))):]
+		for _, b := range [][]byte{c.core, c.client} {
+			if len(b) == 0 {
+				continue
+			}
+			b = b[len(binary.AppendUvarint(nil, uint64(len(b)))):]
 			if _, _, keyed, ok := yggFrameKeys(b); !keyed || !ok {
 				t.Errorf("%s: the pathBroken does not read", c.name)
 			}
@@ -466,8 +509,9 @@ func TestNekoServerYggLinkFilterAnswers(t *testing.T) {
 			}
 		}
 	}
-	// While the client waits for the core, a dropped frame on its way to it
-	// may be what paid the core's debt: the client gets a keepalive too.
+	// While the client waits for the core, the node's traffic dropped on
+	// its way to it may be what paid the core's debt: the client gets a
+	// keepalive too.
 	f, core, client, _ = testFilter(noGroup)
 	if err := f.handshake(bytes.NewReader([]byte("meta\x00\x00"))); err != nil {
 		t.Fatal(err)
@@ -478,11 +522,58 @@ func TestNekoServerYggLinkFilterAnswers(t *testing.T) {
 	}
 	core.Reset()
 	client.Reset()
-	f.copy(&f.client, &chunks{b: iwFrame(iwLookup(keyA, keyK)), n: 100}, false)
+	f.copy(&f.client, &chunks{b: iwFrame(iwTraffic(nil, nil, keyN, keyA, 1, nil)), n: 100}, false)
 	f.core.flush()
 	f.client.flush()
-	if !bytes.Equal(core.Bytes(), ka) || !bytes.Equal(client.Bytes(), ka) {
+	if !bytes.Equal(core.Bytes(), iwFrame(iwBroken(nil, ^uint64(0), keyN, keyA))) || !bytes.Equal(client.Bytes(), ka) {
 		t.Fatalf("dropped while the client waits: core %x, client %x", core.Bytes(), client.Bytes())
+	}
+
+	// An answer that comes while the frame that asks for it is still being
+	// written: the client is not left waiting (the mark comes first).
+	var answered *yggLinkFilter
+	hook := hookWriter(func() { _ = answered.client.write(ka) })
+	answered = newYggLinkFilter(yggRule{node: keyN, key: keyK, group: noGroup}, new(atomic.Uint64), hook, &sink{})
+	_ = answered.copy(&answered.core, &chunks{b: iwFrame(iwTraffic(nil, nil, keyK, keyN, 0, nil)), n: 100}, true)
+	if answered.client.waits.Load() {
+		t.Fatal("answered during the write, yet the client waits")
+	}
+
+	// From the client to the node: the watermark 0, in its own bytes.
+	zero := func(n int) []byte { return append(bytes.Repeat([]byte{0x80}, n-1), 0) }
+	for _, c := range []struct {
+		name     string
+		in, want []byte
+	}{
+		{"traffic to N", iwTraffic([]uint64{2}, nil, keyK, keyN, ^uint64(0), []byte("p")),
+			slices.Concat([]byte{yggTraffic}, iwPath(nil, 2), iwPath(nil), keyK[:], keyN[:], zero(10), []byte("p"))},
+		{"traffic to N, a short watermark", iwTraffic(nil, nil, keyK, keyN, 5, nil), iwTraffic(nil, nil, keyK, keyN, 0, nil)},
+		{"pathNotify to N", iwNotify([]uint64{1}, 300, keyK, keyN, 1, []uint64{4}, sig),
+			slices.Concat([]byte{yggPathNotify}, iwPath(nil, 1), zero(2), keyK[:], keyN[:], []byte{1}, iwPath(nil, 4), sig[:])},
+		{"pathBroken back to N", iwBroken([]uint64{1}, 7, keyN, keyK), iwBroken([]uint64{1}, 0, keyN, keyK)},
+		{"a lookup: no watermark", iwLookup(keyK, keyN, 1), iwLookup(keyK, keyN, 1)},
+	} {
+		f, core, _, _ := testFilter(noGroup)
+		if f.testUp(&chunks{b: iwFrame(c.in), n: 7}); !bytes.Equal(core.Bytes(), iwFrame(c.want)) {
+			t.Errorf("%s: the core got %x", c.name, core.Bytes())
+		}
+		if c.in[0] == yggTraffic {
+			if _, _, _, ok := iwRefKeys(c.want); !ok {
+				t.Errorf("%s: ironwood would not take it", c.name)
+			}
+		}
+	}
+	// To a group's key (G with K), the watermark stays.
+	groups := func(k *[32]byte) yggGroup {
+		if *k == keyK || *k == keyG {
+			return 1
+		}
+		return 0
+	}
+	f, core, _, _ = testFilter(groups)
+	toG := iwFrame(iwTraffic(nil, nil, keyK, keyG, 9, nil))
+	if f.testUp(&chunks{b: toG, n: 100}); !bytes.Equal(core.Bytes(), toG) {
+		t.Errorf("traffic to G: the core got %x", core.Bytes())
 	}
 }
 
@@ -857,6 +948,14 @@ func TestNekoServerYggFrameIronwoodFilter(t *testing.T) {
 			}
 		})
 	}
+}
+
+// hookWriter calls itself in each Write, as an answer that arrives then.
+type hookWriter func()
+
+func (h hookWriter) Write(p []byte) (int, error) {
+	h()
+	return len(p), nil
 }
 
 // overlapping is a writer that notes two Writes at once, and keeps what is

@@ -57,7 +57,7 @@ func FuzzYggFrames(f *testing.F) {
 		}
 
 		rule := yggRule{node: keyN, key: keyK, group: groups}
-		want, wantAnswers, wantDropped, wantBad := iwRefFilter(data, &rule, fromClient)
+		want, wantPings, wantAnswers, wantDropped, wantBad := iwRefFilter(data, &rule, fromClient)
 		var dropped atomic.Uint64
 		out, other := &sink{}, &sink{} // where the copy writes; the other end, which gets the answers
 		var lf *yggLinkFilter
@@ -76,8 +76,8 @@ func FuzzYggFrames(f *testing.F) {
 		}
 		_ = lf.core.flush()
 		_ = lf.client.flush()
-		if !bytes.Equal(out.Bytes(), want) || !bytes.Equal(other.Bytes(), wantAnswers) {
-			t.Fatalf("stream %x: answers %x, want %x", data, other.Bytes(), wantAnswers)
+		if !bytes.Equal(out.Bytes(), slices.Concat(want, wantPings)) || !bytes.Equal(other.Bytes(), wantAnswers) {
+			t.Fatalf("stream %x: answers %x and %x, want %x and %x", data, out.Bytes()[len(want):], other.Bytes(), wantPings, wantAnswers)
 		}
 	})
 }
@@ -170,15 +170,24 @@ func iwRefKeys(frame []byte) (source, dest [32]byte, keyed, ok bool) {
 }
 
 // iwRefFilter is the filter as ironwood frames a stream: what it would
-// send on, how many it would drop, and whether the core would end the link;
-// and the answers to the dropped frames the other end would get before a
-// flush (yggLinkFilter.answer): the client a keepalive, the core the
-// client's pathBroken for the node's traffic and a keepalive for the rest,
-// a keepalive waiting once, all within yggInjectMax.
-func iwRefFilter(stream []byte, rule *yggRule, fromClient bool) (out, answers []byte, dropped uint64, bad bool) {
+// send on (a frame of the client's to the node with its watermark 0, in as
+// many bytes), how many it would drop, and whether the core would end the
+// link; and, before a flush, the answers to the dropped frames
+// (yggLinkFilter.answer): pings, to the copy's own end (the client), and
+// the answers to the other end, the client's keepalive or the core's
+// pathBrokens for the node's traffic. A keepalive and a ping wait once,
+// all within yggInjectMax.
+func iwRefFilter(stream []byte, rule *yggRule, fromClient bool) (out, pings, answers []byte, dropped uint64, bad bool) {
 	keepalive := false
+	ping := iwFrame(iwBroken(nil, 0, rule.node, rule.key))
 	answer := func(frame []byte, source, dest [32]byte) {
-		if !fromClient && frame[0] == yggTraffic && (source == rule.node || dest == rule.node) {
+		if fromClient {
+			if !keepalive && len(answers)+2 <= yggInjectMax {
+				answers, keepalive = append(answers, 1, 1), true
+			}
+			return
+		}
+		if frame[0] == yggTraffic && (source == rule.node || dest == rule.node) {
 			data := frame[1:]
 			var path []uint64
 			iwChopPath(&path, &data)
@@ -191,9 +200,29 @@ func iwRefFilter(stream []byte, rule *yggRule, fromClient bool) (out, answers []
 				return
 			}
 		}
-		if !keepalive && len(answers)+2 <= yggInjectMax {
-			answers, keepalive = append(answers, 1, 1), true
+		if len(pings) == 0 {
+			pings = ping
 		}
+	}
+	// zero sets the watermark of a frame of the client's to the node to 0.
+	zero := func(frame []byte, source, dest [32]byte) {
+		data := frame[1:]
+		var path []uint64
+		switch {
+		case frame[0] == yggTraffic && dest == rule.node:
+			iwChopPath(&path, &data)
+			iwChopPath(&path, &data)
+			data = data[64:]
+		case frame[0] == yggPathNotify && dest == rule.node, frame[0] == yggPathBroken && source == rule.node:
+			iwChopPath(&path, &data)
+		default:
+			return
+		}
+		var w uint64
+		rest := data
+		iwChopUint(&w, &rest)
+		n := len(data) - len(rest)
+		copy(data, append(bytes.Repeat([]byte{0x80}, n-1), 0))
 	}
 	br := bytes.NewReader(stream)
 	for {
@@ -201,26 +230,30 @@ func iwRefFilter(stream []byte, rule *yggRule, fromClient bool) (out, answers []
 		size, err := binary.ReadUvarint(br)
 		if err != nil {
 			// The end between frames or within a length; else an overflow.
-			return out, answers, dropped, err != io.EOF && err != io.ErrUnexpectedEOF
+			return out, pings, answers, dropped, err != io.EOF && err != io.ErrUnexpectedEOF
 		}
 		if size == 0 || size > yggFrameMax {
-			return out, answers, dropped, true
+			return out, pings, answers, dropped, true
 		}
 		if uint64(br.Len()) < size {
-			return out, answers, dropped, false // the end within a frame
+			return out, pings, answers, dropped, false // the end within a frame
 		}
 		body := len(stream) - br.Len()
 		frame := stream[body : body+int(size)]
 		_, _ = br.Seek(int64(size), io.SeekCurrent)
 		source, dest, keyed, ok := iwRefKeys(frame)
 		if !ok {
-			return out, answers, dropped, true
+			return out, pings, answers, dropped, true
 		}
 		if keyed && !rule.passes(fromClient, frame[0], &source, &dest) {
 			dropped++
 			answer(frame, source, dest)
 			continue
 		}
+		start := len(out)
 		out = append(out, stream[at:body+int(size)]...)
+		if keyed && fromClient {
+			zero(out[start+body-at:], source, dest)
+		}
 	}
 }
