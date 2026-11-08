@@ -53,6 +53,9 @@ import (
 // unix socket in a private directory. The node's mesh address takes TCP on
 // the exit ports and carries it to inner: what users send through the mesh
 // is VLESS with ML-KEM-768 there, as the mesh's own encryption is classical.
+// Clients reach the node and no one else: on each link a filter drops the
+// frames between the client and another than the node (yggframe.go), and
+// the core answers no one's getSelf, getPeers or getTree (DebugPrivacy).
 
 // yggMetaMax bounds the link handshake (yggdrasil-go's is 6+80 bytes).
 const yggMetaMax = 1024
@@ -112,6 +115,9 @@ func runYggdrasil(ctx context.Context, c *BackendConfig, log *Logger) error {
 	setup := []core.SetupOption{
 		core.ListenAddress((&url.URL{Scheme: "unix", Path: filepath.Join(dir, "link")}).String()),
 		core.NodeInfoPrivacy(true),
+		// getPeers would list every connected device's key to anyone with
+		// a session to the node (raycontrol lan-v1 §2.1).
+		core.DebugPrivacy(true),
 	}
 	for _, peer := range c.Options.Peers {
 		setup = append(setup, core.Peer{URI: peer})
@@ -149,7 +155,11 @@ func runYggdrasil(ctx context.Context, c *BackendConfig, log *Logger) error {
 	}()
 	log.Infof("yggdrasil backend on %s: address %s, public key %s, exit ports %v",
 		c.Socket, address, hex.EncodeToString(node.PublicKey()), c.Options.ExitPorts)
-	l := &yggLinks{tls: tlsConfig, users: users, dir: dir, log: log}
+	l := &yggLinks{tls: tlsConfig, users: users, node: [32]byte(node.PublicKey()), dir: dir, log: log}
+	started := time.Now()
+	defer startStats(c.StatsSocket, func() any {
+		return YggdrasilSnapshot{Started: started.Unix(), DroppedFrames: l.dropped.Load()}
+	}, log)()
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -274,6 +284,11 @@ func (u *yggUsers) leave(key [32]byte, conn net.Conn) {
 	}
 }
 
+// group is G(key) of the link filter (raycontrol lan-v1 §2.2): the key's
+// LAN group. The users file has none yet (yggdrasil.lan comes with LAN):
+// no key is in one, and a client reaches only the node.
+func (u *yggUsers) group(*[32]byte) yggGroup { return 0 }
+
 // yggMetaKey reads the key of a link handshake (yggdrasil-go's version
 // metadata without a password: TLVs, then an ed25519 signature over the
 // BLAKE2b-512 of the key) and checks the signature, as the core does.
@@ -306,11 +321,20 @@ func yggMetaKey(body []byte) ([32]byte, bool) {
 }
 
 type yggLinks struct {
-	tls   sbtls.ServerConfig
-	users *yggUsers
-	dir   string
-	log   *Logger
-	seq   atomic.Uint64
+	tls     sbtls.ServerConfig
+	users   *yggUsers
+	node    [32]byte // the node's key
+	dir     string
+	log     *Logger
+	seq     atomic.Uint64
+	dropped atomic.Uint64 // frames the link filter dropped
+}
+
+// YggdrasilSnapshot is what the Yggdrasil backend gives on stats_socket
+// (v0.15.0). Totals only: nothing of whose frames (raycontrol lan-v1 §4.3).
+type YggdrasilSnapshot struct {
+	Started       int64  `json:"started"`        // the backend's start, Unix seconds
+	DroppedFrames uint64 `json:"dropped_frames"` // traffic, pathNotify, pathBroken and pathLookup on a client's link between it and another than the node: dropped
 }
 
 // serve takes one stream from tcpmux: TLS, then a Yggdrasil link of a
@@ -368,14 +392,16 @@ func (l *yggLinks) serve(ctx context.Context, raw net.Conn) {
 	if _, err := link.Write(meta); err != nil {
 		return
 	}
-	// A link has no half-close: when either side ends, both do.
+	// Frame by frame, through the filter; nothing of it in the log. A link
+	// has no half-close: when either side ends, both do.
+	f := &yggLinkFilter{rule: yggRule{node: l.node, key: key, group: l.users.group}, dropped: &l.dropped}
 	done := make(chan struct{}, 2)
 	go func() {
-		_, _ = io.Copy(link, conn)
+		_ = f.up(link, conn)
 		done <- struct{}{}
 	}()
 	go func() {
-		_, _ = io.Copy(conn, link)
+		_ = f.down(conn, link)
 		done <- struct{}{}
 	}()
 	select {
