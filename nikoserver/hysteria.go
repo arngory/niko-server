@@ -101,7 +101,7 @@ func runHysteria(ctx context.Context, c *BackendConfig, conn *packetConn, log *L
 	var live sessions
 	users := newHy2Users()
 	if c.StatsSocket != "" {
-		stop, err := live.serveStats(c.StatsSocket, log)
+		stop, err := live.serveStats(c.StatsSocket, users, log)
 		if err != nil {
 			return envError("stats socket: %v", err)
 		}
@@ -236,6 +236,11 @@ func (o *outbound) NewConnectionEx(ctx context.Context, conn net.Conn, _ M.Socks
 		}
 		return
 	}
+	// The user's bytes at the destination's side: read from it down,
+	// written to it up. The copy unwraps the counters (the half-close and
+	// the copy's fast paths stay) and adds each buffer once it is through.
+	t := trafficFrom(ctx)
+	out = bufio.NewInt64CounterConn(out, []*atomic.Int64{&t.down}, []*atomic.Int64{&t.up})
 	err = bufio.CopyConn(ctx, conn, out)
 	if onClose != nil {
 		onClose(err)
@@ -271,8 +276,11 @@ func (o *outbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn,
 	}
 }
 
-// relayUDP carries a user's datagrams to and from public addresses.
+// relayUDP carries a user's datagrams to and from public addresses and
+// counts their payloads for the user: sent to a destination up, received
+// from one and passed on down.
 func relayUDP(ctx context.Context, conn N.PacketConn, o *outbound) error {
+	t := trafficFrom(ctx)
 	var probeAddr netip.AddrPort
 	var probeFrom atomic.Pointer[M.Socksaddr] // what the client sent to: replies come from it
 	if o != nil && o.probe != nil {
@@ -312,6 +320,7 @@ func relayUDP(ctx context.Context, conn N.PacketConn, o *outbound) error {
 			if err := conn.WritePacket(buffer, source); err != nil {
 				return
 			}
+			t.down.Add(int64(n))
 		}
 	}()
 	for {
@@ -324,7 +333,9 @@ func relayUDP(ctx context.Context, conn N.PacketConn, o *outbound) error {
 		if probeAddr.IsValid() && o.isProbe(destination) {
 			d := destination
 			probeFrom.Store(&d)
-			_, _ = udp.WriteToUDPAddrPort(buffer.Bytes(), probeAddr)
+			if n, err := udp.WriteToUDPAddrPort(buffer.Bytes(), probeAddr); err == nil {
+				t.up.Add(int64(n))
+			}
 			buffer.Release()
 			continue
 		}
@@ -338,7 +349,9 @@ func relayUDP(ctx context.Context, conn N.PacketConn, o *outbound) error {
 			}
 		}
 		if addr.IsValid() && (Public(addr) || anyDestination()) {
-			_, _ = udp.WriteToUDPAddrPort(buffer.Bytes(), netip.AddrPortFrom(addr.Unmap(), destination.Port))
+			if n, err := udp.WriteToUDPAddrPort(buffer.Bytes(), netip.AddrPortFrom(addr.Unmap(), destination.Port)); err == nil {
+				t.up.Add(int64(n))
+			}
 		}
 		buffer.Release()
 	}

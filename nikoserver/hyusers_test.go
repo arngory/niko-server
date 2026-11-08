@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -26,6 +27,7 @@ import (
 	sbtls "github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-quic/hysteria2"
+	"github.com/sagernet/sing/common/auth"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )
@@ -151,6 +153,92 @@ func (n *hy2Node) ask(t *testing.T, line string) []byte {
 	return b
 }
 
+func (n *hy2Node) traffic(t *testing.T) HysteriaTraffic {
+	t.Helper()
+	b := n.ask(t, "traffic\n")
+	var tr HysteriaTraffic
+	if err := json.Unmarshal(b, &tr); err != nil {
+		t.Fatalf("traffic %q: %v", b, err)
+	}
+	return tr
+}
+
+// tripleTargets are a TCP and a UDP destination on loopback that answer
+// three bytes for each byte: TCP once the client has half-closed, UDP a
+// datagram for a datagram. Up and down then differ, and a swap shows.
+func tripleTargets(t *testing.T) (tcpAddr, udpAddr string) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close(); pc.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				c.SetDeadline(time.Now().Add(10 * time.Second))
+				got, _ := io.ReadAll(c)
+				c.Write(bytes.Repeat(got, 3))
+			}()
+		}
+	}()
+	go func() {
+		b := make([]byte, 2048)
+		for {
+			n, from, err := pc.ReadFrom(b)
+			if err != nil {
+				return
+			}
+			pc.WriteTo(bytes.Repeat(b[:n], 3), from)
+		}
+	}()
+	return ln.Addr().String(), pc.LocalAddr().String()
+}
+
+// tcpTriple writes up bytes on a stream, half-closes and reads the answer.
+func tcpTriple(t *testing.T, ctx context.Context, client *hysteria2.Client, to string, up int) {
+	t.Helper()
+	conn, err := client.DialConn(ctx, M.ParseSocksaddr(to))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := conn.Write(bytes.Repeat([]byte{'u'}, up)); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.(interface{ CloseWrite() error }).CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(conn)
+	if (err != nil && !isEOF(err)) || len(got) != 3*up {
+		t.Fatalf("TCP: %d bytes back, want %d (%v)", len(got), 3*up, err)
+	}
+}
+
+// udpTriple sends a datagram and waits for its answer.
+func udpTriple(t *testing.T, pc net.PacketConn, to string, size int) {
+	t.Helper()
+	if _, err := pc.WriteTo(bytes.Repeat([]byte{'d'}, size), M.ParseSocksaddr(to)); err != nil {
+		t.Fatal(err)
+	}
+	pc.SetReadDeadline(time.Now().Add(5 * time.Second))
+	b := make([]byte, 4096)
+	n, _, err := pc.ReadFrom(b)
+	if err != nil || n != 3*size {
+		t.Fatalf("UDP: %d bytes back, want %d (%v)", n, 3*size, err)
+	}
+}
+
 func echoOnce(t *testing.T, s net.Conn, msg string) {
 	t.Helper()
 	s.SetDeadline(time.Now().Add(5 * time.Second))
@@ -175,9 +263,105 @@ func echoDatagram(t *testing.T, pc net.PacketConn, to, msg string) {
 	}
 }
 
+// Each user's bytes at the destinations' side, streams and datagrams, on
+// the stats socket's traffic line; the address queries as before.
+func TestHysteriaTraffic(t *testing.T) {
+	t.Setenv(unsafeAnyDestination, "1") // datagrams to the loopback target
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	logs := &lockedLog{}
+	node := startHy2Masq(t, ctx, NewLogger("debug", logs), "u5", "pw-5", "u6", "pw-6", "u7", "pw-7")
+	tcpTarget, udpTarget := tripleTargets(t)
+
+	before := node.traffic(t)
+	if before.V != 1 || len(before.Boot) != 16 {
+		t.Fatalf("traffic %+v", before)
+	}
+	if _, err := hex.DecodeString(before.Boot); err != nil {
+		t.Fatalf("boot %q: %v", before.Boot, err)
+	}
+	if len(before.Users) != 3 || before.Users["u5"] != (UserTraffic{}) {
+		t.Fatalf("before any traffic: %+v", before.Users)
+	}
+
+	c5, c6 := node.client(t, ctx, "pw-5"), node.client(t, ctx, "pw-6")
+	tcpTriple(t, ctx, c5, tcpTarget, 100_000) // several buffers each way
+	tcpTriple(t, ctx, c5, tcpTarget, 1_000)
+	tcpTriple(t, ctx, c6, tcpTarget, 5_000)
+	pc, err := c5.ListenPacket(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	udpTriple(t, pc, udpTarget, 100)
+	udpTriple(t, pc, udpTarget, 200)
+	// A stream whose dial fails carries nothing: u7 stays at nought.
+	closed, _ := net.Listen("tcp", "127.0.0.1:0")
+	refused := closed.Addr().String()
+	closed.Close()
+	r, err := node.client(t, ctx, "pw-7").DialConn(ctx, M.ParseSocksaddr(refused))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.SetDeadline(time.Now().Add(5 * time.Second))
+	r.Write([]byte("lost"))
+	if _, err := r.Read(make([]byte, 1)); err == nil || !strings.Contains(err.Error(), "connection refused") {
+		t.Fatalf("a refused dial: %v", err)
+	}
+	r.Close()
+
+	want := map[string]UserTraffic{
+		"u5": {Up: 100_000 + 1_000 + 100 + 200, Down: 3 * (100_000 + 1_000 + 100 + 200)},
+		"u6": {Up: 5_000, Down: 15_000},
+		"u7": {},
+	}
+	// The relay adds a buffer once it is through, a moment after the client
+	// or the target has it.
+	var got HysteriaTraffic
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		got = node.traffic(t)
+		if fmt.Sprint(got.Users) == fmt.Sprint(want) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("users %+v, want %+v", got.Users, want)
+		}
+	}
+	// Reading resets nothing; the boot stays.
+	if again := node.traffic(t); fmt.Sprint(again) != fmt.Sprint(got) || again.Boot != before.Boot {
+		t.Fatalf("a second read %+v, the first %+v", again, got)
+	}
+	// The JSON as raycontrol reads it, then the socket closes.
+	raw := node.ask(t, "traffic\n")
+	if !bytes.HasPrefix(raw, []byte(`{"v":1,"boot":"`+got.Boot+`","users":{`)) || !bytes.Contains(raw, []byte(`"u6":{"up":5000,"down":15000}`)) {
+		t.Fatalf("raw %s", raw)
+	}
+	// The address queries are as before.
+	var st HysteriaStats
+	if err := json.Unmarshal(node.ask(t, "127.0.0.1 u5\n"), &st); err != nil || st.Connections != 3 || len(st.Own) != 1 {
+		t.Fatalf("stats %+v (%v)", st, err)
+	}
+	// Anything else gets nothing, as before: a longer line, another word.
+	for _, line := range []string{"traffic please\n", "TRAFFIC\n", strings.Repeat("t", 200) + "\n"} {
+		if b := node.ask(t, line); len(b) != 0 {
+			t.Fatalf("%q answered %q", line, b)
+		}
+	}
+	// Neither destinations nor counters in the log, at debug.
+	_, tcpPort, _ := net.SplitHostPort(tcpTarget)
+	_, udpPort, _ := net.SplitHostPort(udpTarget)
+	_, refusedPort, _ := net.SplitHostPort(refused)
+	for _, secret := range []string{":" + tcpPort, ":" + udpPort, ":" + refusedPort, "101300", "303900"} {
+		if strings.Contains(logs.String(), secret) {
+			t.Fatalf("the log has %q:\n%s", secret, logs)
+		}
+	}
+}
+
 // A name gone from the users file or disabled there (expired, over its
 // limit), or given another password, loses its connections at the reload,
-// streams and datagram sessions; the others stay.
+// streams and datagram sessions; the others stay. Its counters stay until
+// the process ends.
 func TestHysteriaRevoke(t *testing.T) {
 	t.Setenv(unsafeAnyDestination, "1")
 	ctx, cancel := context.WithCancel(context.Background())
@@ -247,6 +431,11 @@ func TestHysteriaRevoke(t *testing.T) {
 		if _, err := c.DialConn(ctx, M.ParseSocksaddr(echoTCP.Addr().String())); err == nil {
 			t.Fatalf("%s still gets in", password)
 		}
+	}
+	// A removed name's counters stay: raycontrol counts by name.
+	tr := node.traffic(t)
+	if u5, u8 := tr.Users["u5"], tr.Users["u8"]; u5 != (UserTraffic{Up: 5 + 4, Down: 5 + 4}) || u8 != u5 {
+		t.Fatalf("u5 and u8 after their removal: %+v", tr.Users)
 	}
 }
 
@@ -340,10 +529,13 @@ func hy2Table(table *atomic.Pointer[map[string]*hy2User]) func([]*hy2User, []str
 }
 
 // A reload keeps a user whose name and password stay, revokes the others,
-// closes their connections and only theirs.
+// closes their connections and only theirs; a name keeps its counters.
 func TestHy2UsersSet(t *testing.T) {
 	var table atomic.Pointer[map[string]*hy2User]
 	u := newHy2Users()
+	if other := newHy2Users(); other.boot == u.boot || len(u.boot) != 16 {
+		t.Fatalf("boot %q, another %q", u.boot, other.boot)
+	}
 	u.set([]string{"u5", "u6", "u7"}, []string{"a", "b", "c"}, hy2Table(&table))
 	old := *table.Load()
 	closed := map[string]bool{}
@@ -352,6 +544,7 @@ func TestHy2UsersSet(t *testing.T) {
 			t.Fatalf("%s not admitted", p)
 		}
 	}
+	old["b"].traffic.up.Add(7)
 	// u5 gone, u6 with a new password, u7 as it was.
 	if n := u.set([]string{"u6", "u7"}, []string{"b2", "c"}, hy2Table(&table)); n != 2 {
 		t.Fatalf("%d closed, want 2", n)
@@ -363,11 +556,15 @@ func TestHy2UsersSet(t *testing.T) {
 	if !old["a"].revoked || !old["b"].revoked || old["c"].revoked {
 		t.Fatal("revoked")
 	}
-	if now["b2"].name != "u6" {
-		t.Fatal("u6 with its new password")
+	if now["b2"].traffic != old["b"].traffic || now["b2"].name != "u6" {
+		t.Fatal("u6's counters with its new password")
 	}
 	if u.admit(old["b"], &hy2Conn{close: func() {}}) {
 		t.Fatal("a revoked user admitted")
+	}
+	tr := u.trafficSnapshot()
+	if len(tr.Users) != 3 || tr.Users["u6"].Up != 7 || tr.Boot != u.boot || tr.V != 1 {
+		t.Fatalf("traffic %+v", tr)
 	}
 	// The same password under another name is another user.
 	u.set([]string{"u8"}, []string{"c"}, hy2Table(&table))
@@ -444,4 +641,16 @@ func TestHy2UsersReloadRace(t *testing.T) {
 		close(done)
 	}
 	t.Logf("refused at the check, closed when the hook returned, closed later by the reload: %v", counts)
+}
+
+// A stream or a datagram session finds its user's counters in its context
+// (sing-quic puts the user there); without a user they count for nobody.
+func TestHy2TrafficFrom(t *testing.T) {
+	user := &hy2User{name: "u5", traffic: new(hy2Traffic)}
+	if trafficFrom(auth.ContextWithUser(context.Background(), user)) != user.traffic {
+		t.Fatal("the user's counters")
+	}
+	if trafficFrom(context.Background()) == nil || trafficFrom(auth.ContextWithUser(context.Background(), "u5")) == nil {
+		t.Fatal("no user")
+	}
 }
