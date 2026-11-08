@@ -74,6 +74,10 @@ func TestNekoServerConfigCheck(t *testing.T) {
 	if errs := checkConfig(t, ygg); len(errs) > 0 {
 		t.Fatal(errs)
 	}
+	// Yggdrasil has its counters on a stats socket (v0.15.0).
+	if errs := checkConfig(t, strings.Replace(ygg, `"inner":`, `"stats_socket":"/run/niko/ygg/stats.sock","inner":`, 1)); len(errs) > 0 {
+		t.Fatalf("yggdrasil with a stats socket: %v", errs)
+	}
 
 	hy2 := `{"schema":1,"role":"backend","kind":"hy2-masq","socket":"/run/niko/h/packet.sock","front_uid":9100,
 		"users_file":"/r/h/users.json","tls":{"certificate_file":"/r/h/chain.pem","key_file":"/run/niko/h/key.pem"},

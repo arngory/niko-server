@@ -9,15 +9,19 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -86,9 +90,20 @@ func writeYggUsers(t *testing.T, path string, keys ...ed25519.PublicKey) {
 	}
 }
 
-func TestNekoServerYggdrasil(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+// yggNode is a Yggdrasil backend behind tcpmux, as on a node, with no
+// users yet; it stops with ctx.
+type yggNode struct {
+	key       ed25519.PublicKey // the node's
+	front     string            // tcpmux's address
+	peer      string            // the node as a client's peer
+	usersFile string
+	stats     string // the backend's stats socket
+	dir       string
+	stopped   chan error
+}
+
+func startYggNode(t *testing.T, ctx context.Context) *yggNode {
+	t.Helper()
 	dir := t.TempDir()
 	uid := os.Getuid()
 	log := NewLogger("warn", io.Discard)
@@ -101,20 +116,20 @@ func TestNekoServerYggdrasil(t *testing.T) {
 	seed := make([]byte, ed25519.SeedSize)
 	rand.Read(seed)
 	nodeKey := ed25519.NewKeyFromSeed(seed)
-	nodePublic := nodeKey.Public().(ed25519.PublicKey)
+	n := &yggNode{key: nodeKey.Public().(ed25519.PublicKey), usersFile: filepath.Join(dir, "users.json"),
+		stats: filepath.Join(dir, "stats.sock"), dir: dir, stopped: make(chan error, 1)}
 	keyPath := filepath.Join(dir, "node.key")
 	os.WriteFile(keyPath, []byte(hex.EncodeToString(seed)+"\n"), 0o600)
-	usersFile := filepath.Join(dir, "users.json")
-	writeYggUsers(t, usersFile)
+	writeYggUsers(t, n.usersFile)
 
 	c := &BackendConfig{Schema: 1, Role: "backend", Kind: "yggdrasil", Socket: filepath.Join(dir, "ygg.sock"),
-		FrontUID: uid, UsersFile: usersFile, TLS: &BackendTLS{CertificateFile: certFile, KeyFile: keyFile},
-		Options: BackendOptions{PrivateKeyFile: keyPath, ExitPorts: []int{4433}}, Inner: echoInner(t, dir)}
+		FrontUID: uid, UsersFile: n.usersFile, TLS: &BackendTLS{CertificateFile: certFile, KeyFile: keyFile},
+		Options: BackendOptions{PrivateKeyFile: keyPath, ExitPorts: []int{4433}}, Inner: echoInner(t, dir),
+		StatsSocket: n.stats}
 	if errs := c.validate(); len(errs) > 0 {
 		t.Fatal(errs)
 	}
-	stopped := make(chan error, 1)
-	go func() { stopped <- RunBackend(ctx, c, log) }()
+	go func() { n.stopped <- RunBackend(ctx, c, log) }()
 	if !waitFor(5*time.Second, func() bool { _, err := os.Stat(c.Socket); return err == nil }) {
 		t.Fatal("the backend did not listen")
 	}
@@ -125,8 +140,39 @@ func TestNekoServerYggdrasil(t *testing.T) {
 		t.Fatal(err)
 	}
 	go front.run(ctx)
-	frontAddr := front.listeners[0].Addr().String()
-	peer := fmt.Sprintf("tls://%s?sni=y.example.com&key=%s", frontAddr, hex.EncodeToString(nodePublic))
+	n.front = front.listeners[0].Addr().String()
+	n.peer = fmt.Sprintf("tls://%s?sni=y.example.com&key=%s", n.front, hex.EncodeToString(n.key))
+	return n
+}
+
+// snapshot is what the backend's stats socket says.
+func (n *yggNode) snapshot(t *testing.T) YggdrasilSnapshot {
+	t.Helper()
+	c, err := net.Dial("unix", n.stats)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	var s YggdrasilSnapshot
+	if err := json.NewDecoder(c).Decode(&s); err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// setUsers writes the users file and has the backend read it.
+func (n *yggNode) setUsers(t *testing.T, keys ...ed25519.PublicKey) {
+	t.Helper()
+	writeYggUsers(t, n.usersFile, keys...)
+	syscall.Kill(os.Getpid(), syscall.SIGHUP)
+	time.Sleep(200 * time.Millisecond)
+}
+
+func TestNekoServerYggdrasil(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	n := startYggNode(t, ctx)
+	peer, frontAddr, nodePublic, usersFile, dir, stopped := n.peer, n.front, n.key, n.usersFile, n.dir, n.stopped
 
 	alice, aliceNet, aliceKey := yggClient(t, ctx, peer)
 	bob, _, bobKey := yggClient(t, ctx, peer)
@@ -256,4 +302,179 @@ func TestNekoServerYggdrasilMeta(t *testing.T) {
 func blake2bSum(b []byte) []byte {
 	h := blake2b.Sum512(b)
 	return h[:]
+}
+
+// yggHandshake is yggdrasil-go 0.5's link handshake for key, as a client
+// sends it: "meta", the length, TLVs, the signature.
+func yggHandshake(key ed25519.PrivateKey) []byte {
+	public := key.Public().(ed25519.PublicKey)
+	b := []byte{0, 0, 0, 2, 0, 0, 0, 1, 0, 2, 0, 5, 0, 2, 0, 32}
+	b = append(b, public...)
+	b = append(b, 0, 3, 0, 1, 0)
+	b = append(b, ed25519.Sign(key, blake2bSum(public))...)
+	return append(binary.BigEndian.AppendUint16([]byte("meta"), uint16(len(b))), b...)
+}
+
+// yggDial is TCP from a client's netstack to a key's address.
+func yggDial(ctx context.Context, s *stack.Stack, key ed25519.PublicKey, port uint16, d time.Duration) (*gonet.TCPConn, error) {
+	dctx, cancel := context.WithTimeout(ctx, d)
+	defer cancel()
+	addr := tcpip.AddrFrom16Slice(address.AddrForKey(key)[:])
+	return gonet.DialContextTCP(dctx, s, tcpip.FullAddress{NIC: 1, Addr: addr, Port: port}, ipv6.ProtocolNumber)
+}
+
+// yggAdmin takes the core's admin handlers, for its remote requests.
+type yggAdmin map[string]core.AddHandlerFunc
+
+func (a yggAdmin) AddHandler(name, _ string, _ []string, f core.AddHandlerFunc) error {
+	a[name] = f
+	return nil
+}
+
+func (a yggAdmin) ask(name string, key ed25519.PublicKey) error {
+	_, err := a[name](json.RawMessage(`{"key":"` + hex.EncodeToString(key) + `"}`))
+	return err
+}
+
+// Clients reach the node and nobody else (raycontrol lan-v1 §2): two
+// devices of the node, each with a link up, and no session between them;
+// no answer from the node about its peers; a frame that forges the node's
+// key goes no further than the client's link.
+func TestNekoServerYggdrasilIsolation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	n := startYggNode(t, ctx)
+
+	// A device that writes its own frames: one to the node passes, one with
+	// the node's key as its source is dropped.
+	xPublic, x, _ := ed25519.GenerateKey(rand.Reader)
+	n.setUsers(t, xPublic)
+	tc, err := tls.Dial("tcp", n.front, &tls.Config{ServerName: "y.example.com", InsecureSkipVerify: true,
+		CurvePreferences: []tls.CurveID{tls.X25519MLKEM768}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tc.Close()
+	tc.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := tc.Write(yggHandshake(x)); err != nil {
+		t.Fatal(err)
+	}
+	head := make([]byte, 6)
+	if _, err := io.ReadFull(tc, head); err != nil || string(head[:4]) != "meta" {
+		t.Fatalf("the core's handshake: %q %v", head, err)
+	}
+	if _, err := io.ReadFull(tc, make([]byte, binary.BigEndian.Uint16(head[4:]))); err != nil {
+		t.Fatal(err)
+	}
+	var nk, xk, other [32]byte
+	copy(nk[:], n.key)
+	copy(xk[:], xPublic)
+	rand.Read(other[:])
+	toNode := iwFrame(iwTraffic(nil, nil, xk, nk, ^uint64(0), []byte("to the node")))
+	forged := iwFrame(iwTraffic(nil, nil, nk, other, ^uint64(0), []byte("from the node, says x")))
+	if _, err := tc.Write(append(toNode, forged...)); err != nil {
+		t.Fatal(err)
+	}
+	if !waitFor(5*time.Second, func() bool { return n.snapshot(t).DroppedFrames == 1 }) {
+		t.Fatalf("dropped %d frames, want the forged one", n.snapshot(t).DroppedFrames)
+	}
+	tc.Close()
+
+	alice, aliceNet, aliceKey := yggClient(t, ctx, n.peer)
+	bob, bobNet, bobKey := yggClient(t, ctx, n.peer)
+	n.setUsers(t, aliceKey, bobKey)
+	for _, c := range []*core.Core{alice, bob} {
+		c.RetryPeersNow()
+		if !waitFor(10*time.Second, func() bool { return peerUp(c) }) {
+			t.Fatalf("a link is not up: %+v", c.GetPeers())
+		}
+	}
+	// Both reach the node's exit port.
+	for name, s := range map[string]*stack.Stack{"alice": aliceNet, "bob": bobNet} {
+		conn, err := yggDial(ctx, s, n.key, 4433, 10*time.Second)
+		if err != nil {
+			t.Fatalf("%s to the exit port: %v", name, err)
+		}
+		conn.SetDeadline(time.Now().Add(10 * time.Second))
+		got := make([]byte, 5)
+		if _, err := conn.Write([]byte("hello")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.ReadFull(conn, got); err != nil || string(got) != "hello" {
+			t.Fatalf("%s: the echo: %q %v", name, got, err)
+		}
+		conn.Close()
+	}
+	dropped := n.snapshot(t).DroppedFrames
+
+	// Each listens; neither gets through to the other, by address or by
+	// key. The node answers its node info (a session to it works), but not
+	// getSelf, getPeers or getTree.
+	admins := map[string]yggAdmin{"alice": {}, "bob": {}}
+	alice.SetAdmin(admins["alice"])
+	bob.SetAdmin(admins["bob"])
+	for _, s := range []*stack.Stack{aliceNet, bobNet} {
+		ln, err := gonet.ListenTCP(s, tcpip.FullAddress{NIC: 1, Port: 7}, ipv6.ProtocolNumber)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+		go func() {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				c.Write([]byte("reached"))
+				c.Close()
+			}
+		}()
+	}
+	type check struct {
+		name   string
+		answer bool // whether it should get through
+		try    func() error
+	}
+	checks := []check{
+		{"alice: the node's node info", true, func() error { return admins["alice"].ask("getNodeInfo", n.key) }},
+		{"alice: the node's getSelf", false, func() error { return admins["alice"].ask("debug_remoteGetSelf", n.key) }},
+		{"alice: the node's getPeers", false, func() error { return admins["alice"].ask("debug_remoteGetPeers", n.key) }},
+		{"alice: the node's getTree", false, func() error { return admins["alice"].ask("debug_remoteGetTree", n.key) }},
+		{"bob: the node's getPeers", false, func() error { return admins["bob"].ask("debug_remoteGetPeers", n.key) }},
+		{"alice: bob's node info", false, func() error { return admins["alice"].ask("getNodeInfo", bobKey) }},
+		{"bob: alice's node info", false, func() error { return admins["bob"].ask("getNodeInfo", aliceKey) }},
+		{"alice: TCP to bob", false, func() error {
+			c, err := yggDial(ctx, aliceNet, bobKey, 7, 6*time.Second)
+			if err == nil {
+				c.Close()
+			}
+			return err
+		}},
+		{"bob: TCP to alice", false, func() error {
+			c, err := yggDial(ctx, bobNet, aliceKey, 7, 6*time.Second)
+			if err == nil {
+				c.Close()
+			}
+			return err
+		}},
+	}
+	errs := make([]error, len(checks))
+	var wg sync.WaitGroup
+	for i, c := range checks {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = c.try()
+		}()
+	}
+	wg.Wait()
+	for i, c := range checks {
+		if (errs[i] == nil) != c.answer {
+			t.Errorf("%s: %v, want an answer %v", c.name, errs[i], c.answer)
+		}
+	}
+	// What was dropped: bob's and alice's answers to each other's lookups.
+	if s := n.snapshot(t); s.DroppedFrames <= dropped {
+		t.Errorf("dropped %d frames, as many as before the tries", s.DroppedFrames)
+	}
 }
