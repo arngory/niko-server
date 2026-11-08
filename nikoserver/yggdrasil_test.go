@@ -505,3 +505,78 @@ func TestNekoServerYggdrasilIsolation(t *testing.T) {
 		t.Errorf("dropped %d frames, as many as before the tries", s.DroppedFrames)
 	}
 }
+
+// A packet over the node's MTU gets an ICMPv6 Packet Too Big, sent to its
+// source address with the packet's first bytes; the core checks that source
+// against the sender's key first (the fork's ipv6rwc, 5afe92f). Before, a
+// device that put another's address as the source had the node send that
+// device its bytes, past the filter (the node's traffic passes).
+func TestNekoServerYggdrasilPacketTooBig(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	n := startYggNode(t, ctx)
+	// Devices without a netstack: what the node sends them, read here.
+	device := func() (*core.Core, ed25519.PublicKey, chan []byte) {
+		public, private, _ := ed25519.GenerateKey(rand.Reader)
+		cert, _ := yggCertificate(private)
+		c, err := core.New(cert, yggLog{NewLogger("error", io.Discard)}, core.Peer{URI: n.peer})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(c.Stop)
+		got := make(chan []byte, 64)
+		go func() {
+			b := make([]byte, 65535)
+			for {
+				k, from, err := c.ReadFrom(b)
+				if err != nil {
+					return
+				}
+				if bytes.Equal(from.(iwt.Addr), n.key) {
+					got <- append([]byte(nil), b[:k]...)
+				}
+			}
+		}()
+		return c, public, got
+	}
+	alice, aliceKey, toAlice := device()
+	bob, bobKey, toBob := device()
+	n.setUsers(t, aliceKey, bobKey)
+	for _, c := range []*core.Core{alice, bob} {
+		c.RetryPeersNow()
+		if !waitFor(10*time.Second, func() bool { return peerUp(c) }) {
+			t.Fatal("a link is not up")
+		}
+	}
+	marker := []byte("ALICE-TO-BOB-THROUGH-THE-NODE")
+	packet := func(source ed25519.PublicKey) []byte {
+		p := make([]byte, 1400)
+		p[0] = 0x60
+		binary.BigEndian.PutUint16(p[4:], uint16(len(p)-40))
+		p[6], p[7] = 59, 64 // no next header
+		copy(p[8:24], address.AddrForKey(source)[:])
+		copy(p[24:40], address.AddrForKey(n.key)[:])
+		copy(p[40:], marker)
+		return p
+	}
+	// A Packet Too Big with the marker in it, to who sends, within d.
+	ptb := func(from *core.Core, source ed25519.PublicKey, to chan []byte, d time.Duration) bool {
+		for end := time.Now().Add(d); time.Now().Before(end); {
+			_, _ = from.WriteTo(packet(source), iwt.Addr(n.key))
+			select {
+			case p := <-to:
+				if len(p) > 40 && p[6] == 58 && p[40] == 2 && bytes.Contains(p, marker) {
+					return true
+				}
+			case <-time.After(300 * time.Millisecond):
+			}
+		}
+		return false
+	}
+	if !ptb(alice, aliceKey, toAlice, 15*time.Second) || !ptb(bob, bobKey, toBob, 15*time.Second) {
+		t.Fatal("an oversize packet of a device's own got no Packet Too Big")
+	}
+	if ptb(alice, bobKey, toBob, 5*time.Second) {
+		t.Fatal("bob got alice's bytes from the node")
+	}
+}
