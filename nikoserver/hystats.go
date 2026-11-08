@@ -97,15 +97,15 @@ type session struct {
 	stats func() hysteria2.ConnectionStats
 }
 
-// hook is the service's ConnectionHook.
-func (t *sessions) hook(remote net.Addr, user any, stats func() hysteria2.ConnectionStats, done <-chan struct{}) {
+// add counts a connection of user in its client address's stats until
+// forget (connectionHook calls it when the connection ends).
+func (t *sessions) add(remote net.Addr, user string, stats func() hysteria2.ConnectionStats) (forget func()) {
 	ap, err := netip.ParseAddrPort(remote.String())
 	if err != nil {
-		return
+		return func() {}
 	}
 	ip := ap.Addr().Unmap()
-	name, _ := user.(string)
-	s := &session{user: name, stats: stats}
+	s := &session{user: user, stats: stats}
 	t.mu.Lock()
 	if t.byIP == nil {
 		t.byIP = map[netip.Addr]map[*session]bool{}
@@ -115,15 +115,14 @@ func (t *sessions) hook(remote net.Addr, user any, stats func() hysteria2.Connec
 	}
 	t.byIP[ip][s] = true
 	t.mu.Unlock()
-	go func() {
-		<-done
+	return func() {
 		t.mu.Lock()
 		delete(t.byIP[ip], s)
 		if len(t.byIP[ip]) == 0 {
 			delete(t.byIP, ip)
 		}
 		t.mu.Unlock()
-	}()
+	}
 }
 
 // owns reports whether a session's user is name or one of its variants

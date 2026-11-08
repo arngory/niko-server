@@ -51,9 +51,19 @@ type ServiceOptions struct {
 	RealmOptions          *realm.Options
 	// ConnectionHook, if set, learns of each authenticated connection: the
 	// client's address, the user it authenticated as, its stats while it
-	// lives, and when it ends (neko).
-	ConnectionHook func(remote net.Addr, user any, stats func() ConnectionStats, done <-chan struct{})
+	// lives, a way to close it, and when it ends (neko). The password is
+	// checked once per connection, so UpdateUsers alone leaves a removed
+	// user's connections open; closeConnection ends one with all its streams
+	// and datagrams, at once or later, as often as wanted. The hook runs in
+	// the auth request's handler after the password check, which may have
+	// read the table UpdateUsers has just replaced: a caller closing the
+	// connections of users it took out must refuse those here as well.
+	ConnectionHook func(remote net.Addr, user any, stats func() ConnectionStats, closeConnection func(), done <-chan struct{})
 }
+
+// errClosedByHook is how a connection ends when its ConnectionHook closes it
+// (neko): a closed error, so that it is logged at debug level.
+var errClosedByHook = E.Cause(net.ErrClosed, "closed by the server")
 
 // ConnectionStats is what the server knows of a client connection (neko):
 // QUIC's own numbers and, when the client gave its rate, the server's
@@ -84,7 +94,7 @@ type Service[U comparable] struct {
 	tlsConfig             aTLS.ServerConfig
 	quicConfig            *quic.Config
 	users                 atomic.Pointer[map[string]U] // swapped whole by UpdateUsers (neko: was a racy map write)
-	connectionHook        func(remote net.Addr, user any, stats func() ConnectionStats, done <-chan struct{})
+	connectionHook        func(remote net.Addr, user any, stats func() ConnectionStats, closeConnection func(), done <-chan struct{})
 	udpDisabled           bool
 	udpTimeout            time.Duration
 	handler               ServerHandler
@@ -339,7 +349,7 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					st.Brutal, st.RateBPS, st.AckRate = true, brutal.BPS(), brutal.AckRate()
 				}
 				return st
-			}, conn.Context().Done())
+			}, func() { s.closeWithError(errClosedByHook) }, conn.Context().Done())
 		}
 		if s.ctx.Done() != nil {
 			go func() {
