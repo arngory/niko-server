@@ -99,6 +99,7 @@ func runHysteria(ctx context.Context, c *BackendConfig, conn *packetConn, log *L
 		salamander = strings.TrimRight(string(b), "\r\n")
 	}
 	var live sessions
+	users := newHy2Users()
 	if c.StatsSocket != "" {
 		stop, err := live.serveStats(c.StatsSocket, log)
 		if err != nil {
@@ -118,9 +119,9 @@ func runHysteria(ctx context.Context, c *BackendConfig, conn *packetConn, log *L
 	if salamander != "" {
 		quicOptions.InitialPacketSize = 1280 - 8
 	}
-	service, err := hysteria2.NewService[string](hysteria2.ServiceOptions{
+	service, err := hysteria2.NewService[*hy2User](hysteria2.ServiceOptions{
 		QUICOptions:        quicOptions,
-		ConnectionHook:     live.hook,
+		ConnectionHook:     connectionHook(users, &live),
 		Context:            ctx,
 		Logger:             nopLogger(),
 		SendBPS:            uint64(c.Options.UpMbps * hysteria.MbpsToBps),
@@ -142,9 +143,13 @@ func runHysteria(ctx context.Context, c *BackendConfig, conn *packetConn, log *L
 		if err != nil {
 			return err
 		}
-		// The vendored sing-quic swaps the table atomically.
-		service.UpdateUsers(names, passwords)
-		log.Infof("%d users", len(names))
+		// The vendored sing-quic swaps the table atomically; the connections
+		// of a name gone or of a password changed close, as Yggdrasil's.
+		if closed := users.set(names, passwords, service.UpdateUsers); closed > 0 {
+			log.Infof("%d users, %d connections of removed users closed", len(names), closed)
+		} else {
+			log.Infof("%d users", len(names))
+		}
 		return nil
 	}
 	if err := reload(); err != nil {
