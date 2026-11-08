@@ -20,7 +20,9 @@ import (
 // probes (its probe-v1, "link"): what the server knows of the connections
 // from one client address. Aggregates only, since several people may share
 // an address behind carrier-grade NAT; asked with a user's name, the
-// sessions of that user from the address one by one as well (own).
+// sessions of that user from the address one by one as well (own). The
+// same socket gives the users' bytes for raycontrol's traffic limits
+// (hyusers.go).
 
 // HysteriaStats answers a stats query.
 type HysteriaStats struct {
@@ -97,15 +99,15 @@ type session struct {
 	stats func() hysteria2.ConnectionStats
 }
 
-// hook is the service's ConnectionHook.
-func (t *sessions) hook(remote net.Addr, user any, stats func() hysteria2.ConnectionStats, done <-chan struct{}) {
+// add counts a connection of user in its client address's stats until
+// forget (connectionHook calls it when the connection ends).
+func (t *sessions) add(remote net.Addr, user string, stats func() hysteria2.ConnectionStats) (forget func()) {
 	ap, err := netip.ParseAddrPort(remote.String())
 	if err != nil {
-		return
+		return func() {}
 	}
 	ip := ap.Addr().Unmap()
-	name, _ := user.(string)
-	s := &session{user: name, stats: stats}
+	s := &session{user: user, stats: stats}
 	t.mu.Lock()
 	if t.byIP == nil {
 		t.byIP = map[netip.Addr]map[*session]bool{}
@@ -115,15 +117,14 @@ func (t *sessions) hook(remote net.Addr, user any, stats func() hysteria2.Connec
 	}
 	t.byIP[ip][s] = true
 	t.mu.Unlock()
-	go func() {
-		<-done
+	return func() {
 		t.mu.Lock()
 		delete(t.byIP[ip], s)
 		if len(t.byIP[ip]) == 0 {
 			delete(t.byIP, ip)
 		}
 		t.mu.Unlock()
-	}()
+	}
 }
 
 // owns reports whether a session's user is name or one of its variants
@@ -176,11 +177,12 @@ func (t *sessions) stats(ip netip.Addr, name string) HysteriaStats {
 	return st
 }
 
-// serveStats answers on a unix socket: a client address on one line in,
-// optionally followed by a space and a user's name, HysteriaStats as JSON
-// out. The socket's directory keeps it to the service's group (raycontrol's
-// rayd).
-func (t *sessions) serveStats(path string, log *Logger) (func(), error) {
+// serveStats answers on a unix socket, one line in and JSON out, then
+// closes: a client address, optionally followed by a space and a user's
+// name, gets HysteriaStats; the line "traffic" gets HysteriaTraffic, the
+// users' bytes. The socket's directory keeps it to the service's group
+// (raycontrol's rayd).
+func (t *sessions) serveStats(path string, users *hy2Users, log *Logger) (func(), error) {
 	_ = os.Remove(path)
 	ln, err := net.Listen("unix", path)
 	if err != nil {
@@ -205,9 +207,17 @@ func (t *sessions) serveStats(path string, log *Logger) (func(), error) {
 				defer c.Close()
 				_ = c.SetDeadline(time.Now().Add(2 * time.Second))
 				line, err := bufio.NewReader(&limitedReader{c, 192}).ReadString('\n')
-				addr, name, _ := strings.Cut(strings.TrimSpace(line), " ")
-				ip, perr := netip.ParseAddr(addr)
-				if err != nil || perr != nil {
+				if err != nil {
+					return
+				}
+				line = strings.TrimSpace(line)
+				if line == "traffic" {
+					_ = json.NewEncoder(c).Encode(users.trafficSnapshot())
+					return
+				}
+				addr, name, _ := strings.Cut(line, " ")
+				ip, err := netip.ParseAddr(addr)
+				if err != nil {
 					return
 				}
 				_ = json.NewEncoder(c).Encode(t.stats(ip, strings.TrimSpace(name)))
