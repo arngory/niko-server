@@ -690,6 +690,21 @@ func TestSendLoopMemo(t *testing.T) {
 // The keys file rewritten after LoadKeys, before the watcher's first look
 // and at the same size, is taken (review 8: the watcher compared mtime and
 // size with what it saw at its start, and a revocation was missed).
+// writeAtomic replaces a watched file as raycontrol does (a new file
+// renamed over it): os.WriteFile truncates first, and a watcher that reads
+// in between sees an empty file, which for auth keys is "every device
+// revoked" (CI flaked on it).
+func writeAtomic(t *testing.T, path string, b []byte) {
+	t.Helper()
+	tmp := path + ".new"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestAuthWatchKeysContent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "auth.keys")
 	k1 := "d1 " + strings.Repeat("11", 32) + "\n"
@@ -717,18 +732,14 @@ func TestAuthWatchKeysContent(t *testing.T) {
 		t.Fatal("the rewritten keys not taken")
 	}
 	// A file that does not parse keeps the keys in force.
-	if err := os.WriteFile(path, []byte("d1 zz\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeAtomic(t, path, []byte("d1 zz\n"))
 	time.Sleep(100 * time.Millisecond)
 	if a.Devices() != 1 || a.keys.Load().keys[0].key[0] != 0x22 {
 		t.Fatal("a bad file replaced the keys")
 	}
 	// Emptied, the last device revoked: no key (review 9: an empty file
 	// matched the nil bad one and was never taken).
-	if err := os.WriteFile(path, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeAtomic(t, path, nil)
 	for range 200 {
 		if a.Devices() == 0 {
 			break
