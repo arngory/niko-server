@@ -18,10 +18,12 @@ import (
 // user's device to another user's, or to anyone through the node. On each
 // client's link the backend reads the frames as ironwood frames them, and
 // of traffic, pathNotify, pathBroken and pathLookup it lets through only
-// those between the client and the node; in LAN (later) also those within
-// the client's group. Everything else passes as it is (keepalive, the tree,
-// the bloom filters): without them there is no route at all. The filter
-// says nothing in any log: counters only (§4.3).
+// those between the client and the node, and (LAN, v0.16.0) those within
+// the client's group; what the node relays within a group, neither end the
+// node, it charges to the group's bucket (ygglan.go). Everything else
+// passes as it is (keepalive, the tree, the bloom filters): without them
+// there is no route at all. The filter says nothing in any log: counters
+// only (§4.3).
 //
 // Left, known and accepted (docs/SPEC.md §3.4):
 //   - the node's bloom filter to a client holds every other on-tree peer's
@@ -179,61 +181,100 @@ func yggSkipPath(b []byte) ([]byte, bool) {
 	}
 }
 
-// yggGroup is a key's LAN group (lan-v1 §2.2); 0 is none (∅).
-type yggGroup uint32
+// yggGroup is a key's LAN group (lan-v1 §2.2): one per name in the users
+// file, the same for the life of the process (yggLAN, ygglan.go); nil is
+// none (∅).
+type yggGroup = *yggLAN
+
+// yggGroups is G as one reading of the users file gives it: the keys in a
+// group, each with its group. A reading is never changed: a reload makes
+// another.
+type yggGroups map[[yggKeySize]byte]yggGroup
 
 // yggRule is lan-v1 §2.2 on one client's link: N the node's key, K the
-// link's, G(x) the group of a key.
+// link's, G(x) the group of a key, as the users file has it now.
 type yggRule struct {
 	node, key [yggKeySize]byte
-	group     func(*[yggKeySize]byte) yggGroup
+	groups    func() yggGroups
+}
+
+// yggView is G for a run of frames: one reading of the users file, and K's
+// group in it. A frame is judged on one reading, so a reload between two
+// lookups of it never mixes two; a reload shows at the next read of the
+// link.
+type yggView struct {
+	groups yggGroups
+	own    yggGroup // G(K)
+}
+
+func (r *yggRule) view() yggView {
+	g := r.groups()
+	return yggView{groups: g, own: g[r.key]}
 }
 
 // passes is the rule for a frame of type pathLookup, pathNotify,
-// pathBroken or traffic with its source and dest. From the client (K to the
-// core): the source is K, the dest N. To the client (the core to K): the
-// source is N, the dest K. Either end may instead be a key of K's group,
-// when K has one. pathBroken carries the source and dest of the traffic it
-// reports on, but goes back to that source (iw: pathfinder.go:228-236): for
-// it the two trade places. A lookup goes out to whoever might answer it:
-// from the client only its source is held to the rule, K's lookups for
-// anyone pass; to the client the source is N and the dest one K would
-// answer. Else a client that claims every key in its bloom filter (iw:
+// pathBroken or traffic with its source and dest, in v. From the client (K
+// to the core): the source is K, the dest N. To the client (the core to
+// K): the source is N, the dest K. Either end may instead be a key of K's
+// group, when K has one. pathBroken carries the source and dest of the
+// traffic it reports on, but goes back to that source (iw:
+// pathfinder.go:228-236): for it the two trade places. A lookup goes out to
+// whoever might answer it, and is held to the rule by its source (lan-v1
+// §2.2): from the client K's or its group's lookups for anyone pass; to
+// the client its group's for anyone (one behind K, in K's Wi-Fi, answers
+// through K), and the node's only for what K would answer or a key of its
+// group. Else a client that claims every key in its bloom filter (iw:
 // bloomfilter.go:301-329) would get every other client's lookup for the
 // node, and the node's own for each of them, keys and all.
-func (r *yggRule) passes(fromClient bool, typ byte, source, dest *[yggKeySize]byte) bool {
+func (r *yggRule) passes(v yggView, fromClient bool, typ byte, source, dest *[yggKeySize]byte) bool {
 	switch typ {
 	case yggPathLookup:
 		if fromClient {
-			return r.is(source, &r.key)
+			return r.is(v, source, &r.key)
 		}
-		return r.is(source, &r.node) && (r.is(dest, &r.key) || r.answers(dest))
+		if *source == r.node {
+			return r.is(v, dest, &r.key) || r.answers(dest)
+		}
+		return v.in(source)
 	case yggPathBroken:
 		source, dest = dest, source
 	}
 	if fromClient {
-		return r.is(source, &r.key) && r.is(dest, &r.node)
+		return r.is(v, source, &r.key) && r.is(v, dest, &r.node)
 	}
-	return r.is(source, &r.node) && r.is(dest, &r.key)
+	return r.is(v, source, &r.node) && r.is(v, dest, &r.key)
 }
 
 // answers: K would answer a lookup for dest, as ironwood decides it
-// (iw: pathfinder.go:62-64) with the core's bloom transform (ygg:
-// src/core/core.go:96-98), dest being a whole key or one from an address.
+// (iw: pathfinder.go:62-64), dest being a whole key or one from an address.
 // Only for the node's lookups and not for K's very key: never on the way
-// of traffic. A group of LAN will want G of such a key too.
-func (r *yggRule) answers(dest *[yggKeySize]byte) bool {
-	return bytes.Equal(address.SubnetForKey(dest[:]).GetKey(), address.SubnetForKey(r.key[:]).GetKey())
+// of traffic.
+func (r *yggRule) answers(dest *[yggKeySize]byte) bool { return yggAnswers(dest, &r.key) }
+
+// yggAnswers: the owner of key answers a lookup for dest: the two are one
+// under the core's bloom transform (ygg: src/core/core.go:96-98).
+func yggAnswers(dest, key *[yggKeySize]byte) bool {
+	return bytes.Equal(address.SubnetForKey(dest[:]).GetKey(), address.SubnetForKey(key[:]).GetKey())
+}
+
+// relayed: a frame of the client's that passed the rule, K in a group, is
+// one the node relays between two keys of the group (lan-v1 §4.4): neither
+// its source nor its dest is N (each is then K or of K's group, but for a
+// lookup's dest, which may be anyone's). A lookup whose dest the node
+// itself answers, a key from its address among them, is for N. Frames to
+// or from N are the node's own and never charged.
+func (r *yggRule) relayed(typ byte, source, dest *[yggKeySize]byte) bool {
+	if *source == r.node || *dest == r.node {
+		return false
+	}
+	return typ != yggPathLookup || !yggAnswers(dest, &r.node)
 }
 
 // is: x is want, or G(x) = G(K) ≠ ∅.
-func (r *yggRule) is(x, want *[yggKeySize]byte) bool {
-	if *x == *want {
-		return true
-	}
-	g := r.group(&r.key)
-	return g != 0 && r.group(x) == g
-}
+func (r *yggRule) is(v yggView, x, want *[yggKeySize]byte) bool { return *x == *want || v.in(x) }
+
+// in: G(x) = G(K) ≠ ∅.
+func (v yggView) in(x *[yggKeySize]byte) bool { return v.own != nil && v.groups[*x] == v.own }
 
 // The buffers of the filter, from pools: each direction of a link reads
 // into one of yggReadSize, as io.Copy would; a frame larger than that is
@@ -310,7 +351,11 @@ func (f *yggLinkFilter) handshake(core io.Reader) error {
 // copy passes src's frames to dst, those the rule lets through, as they
 // came: runs of them in one write. A frame the core would refuse, or a
 // length over its largest frame, ends the copy (what passed before it is
-// written). For each frame it drops it injects the answers (answer).
+// written). For each frame it drops it injects the answers (answer). A
+// frame of the client's that the node relays within K's group (relayed)
+// is charged to the group's bucket as it goes into the core, once, and
+// dropped over the group's rate; frames to the client are charged where
+// they came in, never again.
 func (f *yggLinkFilter) copy(dst *yggOut, src io.Reader, fromClient bool) error {
 	sender := &f.core // the end whose frames these are
 	if fromClient {
@@ -329,8 +374,9 @@ func (f *yggLinkFilter) copy(dst *yggOut, src io.Reader, fromClient bool) error 
 	for {
 		n, rerr := src.Read(buf[w:])
 		w += n
-		start, need := r, 0 // buf[start:r]: frames to send; need: what the next one takes from r
-		asks := false       // a frame in buf[start:r] asks for an answer
+		view := f.rule.view() // the groups as the users file has them now
+		start, need := r, 0   // buf[start:r]: frames to send; need: what the next one takes from r
+		asks := false         // a frame in buf[start:r] asks for an answer
 		var bad bool
 		for r < w {
 			size, sn := binary.Uvarint(buf[r:w])
@@ -356,12 +402,20 @@ func (f *yggLinkFilter) copy(dst *yggOut, src io.Reader, fromClient bool) error 
 				bad = true
 				break
 			}
-			if keyed && !f.rule.passes(fromClient, frame[0], source, dest) {
+			drop := false
+			switch {
+			case !keyed:
+			case !f.rule.passes(view, fromClient, frame[0], source, dest):
+				drop = true
+				f.dropped.Add(1)
+			case fromClient && view.own != nil && f.rule.relayed(frame[0], source, dest):
+				drop = !view.own.pass(len(frame)) // the group counts it either way
+			}
+			if drop {
 				if err := yggSend(dst, sender, buf[start:r], asks); err != nil {
 					return err
 				}
 				start, asks = end, false
-				f.dropped.Add(1)
 				f.answer(fromClient, frame, source, dest)
 			} else {
 				if keyed && fromClient {
