@@ -4,6 +4,7 @@ package nikoserver
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -52,8 +54,46 @@ func TestYggRelayBucket(t *testing.T) {
 	}
 	// 0: nothing.
 	off := newYggRelay(0)
-	if off.group("u5").pass(1) || off.dropped.Load() != 1 || off.frames.Load() != 0 {
-		t.Fatal("lan_relay_mbps 0 relays")
+	if off.burst != 0 || off.group("u5").pass(1) || off.dropped.Load() != 1 || off.frames.Load() != 0 {
+		t.Fatal("lan_relay_mbps 0 relays, or its bucket holds something")
+	}
+
+	// 1 Mbit/s: a second is 125000 bytes, less than the largest frame; the
+	// bucket holds that frame all the same, and fills to it at the rate.
+	slow := newYggRelay(1)
+	slow.now = func() time.Time { return now }
+	s := slow.group("u5")
+	for i, c := range []struct {
+		after time.Duration
+		size  int
+		pass  bool
+	}{
+		{0, yggFrameMax, true},
+		{0, 1, false},
+		{time.Second, yggFrameMax, false}, // 125000
+		{50 * time.Millisecond, yggFrameMax, true},
+		{10 * time.Second, yggFrameMax + 1, false}, // never more than the frame
+		{0, yggFrameMax, true},
+	} {
+		now = now.Add(c.after)
+		if got := s.pass(c.size); got != c.pass {
+			t.Fatalf("1 Mbit/s, %d: %d bytes pass %v", i, c.size, got)
+		}
+	}
+	if slow.frames.Load() != 3 || slow.bytes.Load() != 3*yggFrameMax {
+		t.Fatalf("1 Mbit/s: %d frames, %d bytes", slow.frames.Load(), slow.bytes.Load())
+	}
+	// Through a link: K's largest frame to G goes into the core; the next,
+	// with the bucket empty, does not.
+	link := newYggRelay(1).group("u1")
+	largest := iwTraffic(nil, nil, keyK, keyG, 0, nil)
+	largest = append(largest, make([]byte, yggFrameMax-len(largest))...)
+	f, core, _, _ := testFilter(func() yggGroups { return yggGroups{keyK: link, keyG: link} })
+	if err := f.testUp(&chunks{b: slices.Concat(iwFrame(largest), iwFrame(largest)), n: 32 << 10}); err != io.EOF {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(core.Bytes(), iwFrame(largest)) || link.up.Load() != yggFrameMax || link.relay.dropped.Load() != 1 {
+		t.Fatalf("1 Mbit/s, the largest frame: the core got %d bytes, the group %d, dropped %d", core.Len(), link.up.Load(), link.relay.dropped.Load())
 	}
 }
 

@@ -175,7 +175,8 @@ type BackendOptions struct {
 	Peers     []string `json:"peers,omitempty"`
 	// LANRelayMbps (yggdrasil, v0.16.0): the ceiling of what the node relays
 	// between the keys of one LAN group, neither end the node (raycontrol
-	// lan-v1 §4.4), Mbit/s a group with a second's worth of burst; absent
+	// lan-v1 §4.4), Mbit/s a group with a second's worth of burst (the
+	// largest frame, 131070 bytes, at least); absent
 	// 20, 0 nothing relayed.
 	LANRelayMbps *int `json:"lan_relay_mbps,omitempty"`
 	// hy2-*: a name that leads to an address on the node, TCP and UDP (the
