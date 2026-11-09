@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func checkConfig(t *testing.T, content string) []ConfigError {
@@ -449,7 +451,7 @@ func TestNekoServerConfigConnLimit(t *testing.T) {
 			if err != nil || len(errs) > 0 {
 				t.Fatalf("%s %s: %v %v", kind, extra, errs, err)
 			}
-			if got := c.(*BackendConfig).Options.connLimitOn(); got != on {
+			if got, problem := c.(*BackendConfig).Options.connLimitOn(); got != on || problem != nil {
 				t.Errorf("%s %s: on %v, want %v", kind, extra, got, on)
 			}
 		}
@@ -477,13 +479,13 @@ func TestNekoServerConfigConnLimit(t *testing.T) {
 		if err := os.WriteFile(file, []byte(content), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if got := o.connLimitOn(); got != on {
-			t.Errorf("the file says %q: on %v, want %v", content, got, on)
+		if got, problem := o.connLimitOn(); got != on || problem != nil {
+			t.Errorf("the file says %q: on %v (%v), want %v", content, got, problem, on)
 		}
 	}
 	os.Remove(file)
-	if !o.connLimitOn() {
-		t.Error("no file: off")
+	if on, problem := o.connLimitOn(); !on || problem != nil {
+		t.Errorf("no file: on %v (%v)", on, problem)
 	}
 	// Only the Hysteria2 backends have the limits.
 	dnstt := `{"schema":1,"role":"backend","kind":"dnstt","socket":"/run/niko/dns/packet.sock","inner":"/run/niko/inner/vless.sock",
@@ -495,5 +497,48 @@ func TestNekoServerConfigConnLimit(t *testing.T) {
 	}
 	if errs := checkConfig(t, strings.Replace(dnstt, "EXTRA", "", 1)); len(errs) != 0 {
 		t.Errorf("dnstt: %v", errs)
+	}
+}
+
+// The switch file is read without waiting on it: a FIFO, a directory or a
+// device is no switch (on), and the read never blocks the watch that also
+// revokes users. "off" may come after some padding.
+func TestConnLimitFileKinds(t *testing.T) {
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	os.Symlink(fifo, link)
+	padded := filepath.Join(dir, "padded")
+	os.WriteFile(padded, []byte(strings.Repeat(" ", 20)+"off\n"), 0o600)
+	long := filepath.Join(dir, "long")
+	os.WriteFile(long, []byte(strings.Repeat(" ", 70)+"off"), 0o600)
+	toOff := filepath.Join(dir, "to-off")
+	os.Symlink(padded, toOff) // a link to a regular file is that file
+	for _, c := range []struct {
+		path    string
+		on      bool
+		problem bool
+	}{{fifo, true, true}, {link, true, true}, {dir, true, true}, {"/dev/null", true, true},
+		{padded, false, false}, {toOff, false, false}, {long, true, false}, {filepath.Join(dir, "none"), true, false}} {
+		type result struct {
+			on      bool
+			problem error
+		}
+		done := make(chan result, 1)
+		go func() {
+			on, problem := BackendOptions{ConnLimitFile: c.path}.connLimitOn()
+			done <- result{on, problem}
+		}()
+		select {
+		case r := <-done:
+			if r.on != c.on || (r.problem != nil) != c.problem {
+				t.Errorf("%s: on %v (%v), want %v and a problem %v", c.path, r.on, r.problem, c.on, c.problem)
+			}
+		case <-time.After(2 * time.Second):
+			t.Errorf("%s: the read blocks", c.path)
+		}
 	}
 }
