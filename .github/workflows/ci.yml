@@ -14,6 +14,22 @@ permissions:
   contents: read
 
 jobs:
+  # Known vulnerabilities reachable from our code, in the standard library
+  # (the toolchain go.mod names) and the modules: a release built on an
+  # old patch release shipped dozens (v0.16.0 on go1.26.0).
+  govulncheck:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
   integration:
     runs-on: ubuntu-latest
     permissions:
