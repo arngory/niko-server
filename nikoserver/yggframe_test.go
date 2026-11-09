@@ -772,6 +772,37 @@ func TestNekoServerYggLinkFilterAnswers(t *testing.T) {
 		t.Fatalf("dropped while the client waits: core %x, client %x", core.Bytes(), client.Bytes())
 	}
 
+	// A frame of the core's dropped, the client pinged: the core waits for
+	// the client's keepalive, which the client pays with whatever it sends
+	// first. If the filter drops that too, the core gets the keepalive (a
+	// device that left its group, its traffic to its old neighbours
+	// dropped, lost its link in 3 s).
+	f, core, client, _ = testFilter(noGroup)
+	if err := f.handshake(bytes.NewReader([]byte("meta\x00\x00"))); err != nil {
+		t.Fatal(err)
+	}
+	f.copy(&f.client, &chunks{b: iwFrame(iwLookup(keyA, keyK)), n: 100}, false)
+	f.core.flush()
+	f.client.flush()
+	if !f.core.waits.Load() || core.Len() != 0 || client.String() != "meta\x00\x00"+string(ping) {
+		t.Fatalf("a lookup of the core's dropped: the core waits %v; core %x, client %x", f.core.waits.Load(), core.Bytes(), client.Bytes())
+	}
+	core.Reset()
+	client.Reset()
+	if f.testUp(&chunks{b: slices.Concat(forged, forged), n: 100}); !bytes.Equal(core.Bytes(), ka) || !bytes.Equal(client.Bytes(), ka) {
+		t.Fatalf("the client's frames dropped while the core waits for its ping's answer: core %x, client %x", core.Bytes(), client.Bytes())
+	}
+	if f.core.waits.Load() {
+		t.Fatal("the core got a keepalive, yet waits")
+	}
+	// The client's answer, passed, ends the wait: nothing more to the core.
+	f.copy(&f.client, &chunks{b: iwFrame(iwLookup(keyA, keyK)), n: 100}, false)
+	f.testUp(&chunks{b: ka, n: 100})
+	core.Reset()
+	if f.testUp(&chunks{b: forged, n: 100}); core.Len() != 0 {
+		t.Fatalf("the core was answered, yet got %x", core.Bytes())
+	}
+
 	// An answer that comes while the frame that asks for it is still being
 	// written: the client is not left waiting (the mark comes first).
 	var answered *yggLinkFilter

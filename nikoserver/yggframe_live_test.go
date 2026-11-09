@@ -395,6 +395,57 @@ func TestNekoServerYggFilterLiveness(t *testing.T) {
 			t.Error("nothing dropped on B's link")
 		}
 	})
+
+	// A and B are in a group, and B has a path to A; B leaves it. B goes on
+	// sending A traffic along that path, every frame dropped, while A looks
+	// B up: N passes the lookups on to B's link, where the filter drops them
+	// and pings B. B's ironwood pays the ping with its next frame, dropped
+	// too, and N, which sent the lookup, would hear nothing: the filter
+	// answers N for it. A group change never cuts a link (review of v0.16.0:
+	// in CI, the link of a device out of its group went 3 s after).
+	t.Run("a client out of its group, its old neighbour's lookups dropped", func(t *testing.T) {
+		t.Parallel()
+		keys := iwKeys(3)
+		n := &iwNet{t: t}
+		N, A, B := n.node(keys[0]), n.node(keys[1]), n.node(keys[2])
+		kn, ka, kb := [32]byte(iwKey(N)), [32]byte(iwKey(A)), [32]byte(iwKey(B))
+		g := newYggRelay(1 << 30).group("u5")
+		var groups atomic.Pointer[yggGroups]
+		groups.Store(&yggGroups{ka: g, kb: g})
+		read := func() yggGroups { return *groups.Load() }
+		var dA, dB atomic.Uint64
+		n.link(A, N, iwClient{filter: &yggLinkFilter{rule: yggRule{node: kn, key: ka, groups: read}, dropped: &dA}})
+		n.link(B, N, iwClient{filter: &yggLinkFilter{rule: yggRule{node: kn, key: kb, groups: read}, dropped: &dB}})
+		if !n.reach(B, A, 15*time.Second) {
+			t.Fatal("B, in A's group, never reached A")
+		}
+		groups.Store(&yggGroups{ka: g})
+		n.mu.Lock()
+		delete(n.got, [2][32]byte{ka, kb})
+		seen := len(n.frames)
+		n.mu.Unlock()
+		n.stays(8*time.Second, func() bool {
+			_, _ = B.WriteTo([]byte("b"), iwt.Addr(ka[:]))
+			_, _ = A.WriteTo([]byte("a"), iwt.Addr(kb[:]))
+			return false
+		}, A, B)
+		// The case it is about: B sent A traffic, the filter pinged B.
+		n.mu.Lock()
+		after := slices.Clone(n.frames[seen:])
+		n.mu.Unlock()
+		var traffic, pings int
+		for _, s := range after {
+			switch {
+			case bytes.Equal(s.from, kb[:]) && s.typ == yggTraffic && s.source == kb && s.dest == ka:
+				traffic++
+			case bytes.Equal(s.to, kb[:]) && s.typ == yggPathBroken && s.size == yggPingSize-1 && s.source == kn && s.dest == kb:
+				pings++
+			}
+		}
+		if traffic == 0 || pings == 0 || n.received(A, B) {
+			t.Errorf("B sent A %d frames of traffic, got %d pings; A got B's traffic %v", traffic, pings, n.received(A, B))
+		}
+	})
 }
 
 // rootLeaves: the longest N and B do not reach each other, in rounds of

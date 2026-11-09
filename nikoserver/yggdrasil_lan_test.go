@@ -161,6 +161,26 @@ func (d *lanDevice) uptime() time.Duration {
 	return 0
 }
 
+// uptimes are the uptimes of devs' links now.
+func uptimes(devs []*lanDevice) []time.Duration {
+	up := make([]time.Duration, len(devs))
+	for i, d := range devs {
+		up[i] = d.uptime()
+	}
+	return up
+}
+
+// cut is the first of devs whose link went since their uptimes were was
+// (its uptime now no more than then, 0 if down), or -1.
+func cut(devs []*lanDevice, was []time.Duration) int {
+	for i, d := range devs {
+		if d.uptime() <= was[i] {
+			return i
+		}
+	}
+	return -1
+}
+
 // bulk has d send to e's port 9 as fast as it goes for dur: what e took
 // in, in what time.
 func (d *lanDevice) bulk(t *testing.T, ctx context.Context, e *lanDevice, dur time.Duration) (int64, time.Duration) {
@@ -188,8 +208,7 @@ func TestNekoServerYggdrasilLAN(t *testing.T) {
 	t.Cleanup(cancel) // after the parallel subtests
 
 	// The isolation first, its two nodes side by side, and only then the
-	// rates: those saturate the CPU (under -race, on 4 cores, a link of
-	// "groups" once missed ironwood's 3 s while they ran).
+	// rates, which saturate the CPU.
 	t.Run("isolation", func(t *testing.T) { lanIsolation(ctx, t) })
 	lanRates(ctx, t)
 }
@@ -197,21 +216,30 @@ func TestNekoServerYggdrasilLAN(t *testing.T) {
 func lanIsolation(ctx context.Context, t *testing.T) {
 	// Two devices of u5 reach each other through the node, both ways; a
 	// device of u6 and one in no group reach neither, nor are reached; all
-	// reach the node. What the node relayed counts for u5 on the traffic
-	// line. A device whose group changes keeps its link and reaches its new
-	// group at once; one taken out of its group keeps its link and reaches
-	// no one but the node; one taken out of the users file loses its link.
+	// reach the node, and no link goes meanwhile. What the node relayed
+	// counts for u5 on the traffic line. A device whose group changes
+	// reaches its new group at once; one taken out of its group reaches no
+	// one but the node; neither change cuts any device's link. One taken
+	// out of the users file loses its link.
 	t.Run("groups", func(t *testing.T) {
 		t.Parallel()
 		n := startYggNode(t, ctx)
 		a, b, c, d := newLANDevice(t, ctx, n), newLANDevice(t, ctx, n), newLANDevice(t, ctx, n), newLANDevice(t, ctx, n)
+		all, names := []*lanDevice{a, b, c, d}, "abcd"
+		kept := func(was []time.Duration, when string) {
+			t.Helper()
+			if i := cut(all, was); i >= 0 {
+				t.Fatalf("%s: %c's link was cut: up %v, before %v", when, names[i], all[i].uptime(), was[i])
+			}
+		}
 		n.setLAN(t, yggDevice{a.key, "u5"}, yggDevice{b.key, "u5"}, yggDevice{c.key, "u6"}, yggDevice{d.key, ""})
-		for _, x := range []*lanDevice{a, b, c, d} {
+		for _, x := range all {
 			x.up(t)
 		}
 		if !a.reaches(ctx, b, 15*time.Second) || !b.reaches(ctx, a, 15*time.Second) {
 			t.Fatal("two devices of one group do not reach each other")
 		}
+		was := uptimes(all)
 		type try struct {
 			name     string
 			from, to *lanDevice
@@ -232,9 +260,10 @@ func lanIsolation(ctx context.Context, t *testing.T) {
 				t.Errorf("%s: reached", x.name)
 			}
 		}
-		for _, x := range []*lanDevice{a, b, c, d} {
-			if !peerUp(x.core) || !x.exits(ctx, n) {
-				t.Fatal("a device's link went, or it does not reach the node")
+		kept(was, "the tries across groups")
+		for _, x := range all {
+			if !x.exits(ctx, n) {
+				t.Fatal("a device does not reach the node")
 			}
 		}
 		tr := n.traffic(t)
@@ -251,22 +280,22 @@ func lanIsolation(ctx context.Context, t *testing.T) {
 		t.Logf("u5 relayed %d bytes, u6 %d (its lookups); %+v", tr.Users["u5"].Up, tr.Users["u6"].Up, n.snapshot(t))
 
 		// c joins u5: no cut, and it reaches a.
-		was := c.uptime()
+		was = uptimes(all)
 		n.setLAN(t, yggDevice{a.key, "u5"}, yggDevice{b.key, "u5"}, yggDevice{c.key, "u5"}, yggDevice{d.key, ""})
 		if !c.reaches(ctx, a, 15*time.Second) || !a.reaches(ctx, c, 15*time.Second) {
 			t.Fatal("c, moved to u5, does not reach a")
 		}
-		if up := c.uptime(); up <= was {
-			t.Fatalf("c's link was cut: up %v, before the change %v", up, was)
-		}
-		// c leaves its group: no cut, and it reaches no one but the node.
-		was = c.uptime()
+		kept(was, "c joined u5")
+		// c leaves its group: no cut (the traffic it and a still send each
+		// other is dropped), and it reaches no one but the node.
+		was = uptimes(all)
 		n.setLAN(t, yggDevice{a.key, "u5"}, yggDevice{b.key, "u5"}, yggDevice{c.key, ""}, yggDevice{d.key, ""})
 		if c.reaches(ctx, a, 6*time.Second) || a.reaches(ctx, c, 6*time.Second) {
 			t.Error("c, out of its group, still reaches a")
 		}
-		if up := c.uptime(); up <= was || !c.exits(ctx, n) {
-			t.Fatalf("c's link was cut, or c does not reach the node: up %v, before %v", up, was)
+		kept(was, "c left u5")
+		if !c.exits(ctx, n) {
+			t.Fatal("c, out of its group, does not reach the node")
 		}
 		// b leaves the users file: its link goes, a's stays.
 		n.setLAN(t, yggDevice{a.key, "u5"}, yggDevice{c.key, ""}, yggDevice{d.key, ""})

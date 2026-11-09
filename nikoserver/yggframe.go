@@ -635,6 +635,9 @@ func (f *yggLinkFilter) copy(dst *yggOut, src io.Reader, fromClient bool) error 
 					return err
 				}
 				start, asks = end, false
+				// Dropped, the frame still asked for an answer: its sender
+				// waits as for one passed (answer).
+				sender.wait()
 				f.answer(fromClient, frame, source, dest)
 			} else {
 				if keyed && fromClient {
@@ -679,8 +682,8 @@ func (f *yggLinkFilter) copy(dst *yggOut, src io.Reader, fromClient bool) error 
 // sender now waits for one. Marked before the write, so that an answer
 // that overtakes it can only clear it (a keepalive too many at worst).
 func yggSend(dst, sender *yggOut, b []byte, asks bool) error {
-	if asks && !sender.waits.Load() {
-		sender.waits.Store(true)
+	if asks {
+		sender.wait()
 	}
 	return dst.write(b)
 }
@@ -723,11 +726,16 @@ func yggZeroWatermark(frame []byte, wm int, node, source, dest *[yggKeySize]byte
 //     (iw: pathfinder.go:228-236), which also puts right the node's stale
 //     path that brought it (clients steer none, yggZeroWatermark); the
 //     client, if it waits, a keepalive;
-//   - anything else to the client: the client gets a ping (yggPing), which
-//     its own ironwood answers with a keepalive to the core. Nothing is
-//     said to the core for the client: a link whose client is gone without
-//     a word (TCP dead, no reset) gets no answer, and the core ends it in
-//     3 s, whoever looks the client up meanwhile.
+//   - anything else to the client: the client gets a ping (injectPing),
+//     which its own ironwood answers with a keepalive to the core, or with
+//     whatever it sends first. The core waits meanwhile (copy marks the
+//     sender of every frame dropped), so if that is a frame the filter
+//     drops too, the core gets the keepalive for it (above): a client that
+//     has just left a group keeps sending its old neighbours traffic,
+//     dropped, and its link would end in 3 s. Nothing is said to the core
+//     for the client otherwise: a link whose client is gone without a word
+//     (TCP dead, no reset) gets no answer, and the core ends it in 3 s,
+//     whoever looks the client up meanwhile.
 //
 // One answer per dropped frame, pings and keepalives waiting once.
 func (f *yggLinkFilter) answer(fromClient bool, frame []byte, source, dest *[yggKeySize]byte) {
@@ -776,8 +784,9 @@ const yggInjectMax = 16 << 10
 type yggOut struct {
 	mu sync.Mutex // around every Write to w
 	w  io.Writer
-	// waits: this end sent a frame that asks for an answer, and has had
-	// nothing since.
+	// waits: this end sent a frame that asks for an answer, passed or
+	// dropped, and has had nothing since: ironwood's read deadline on its
+	// side of the link (iw: peers.go:140-160).
 	waits atomic.Bool
 
 	pmu       sync.Mutex // around pending, spare, keepalive
@@ -791,6 +800,14 @@ type yggOut struct {
 func (o *yggOut) init(w io.Writer) {
 	o.w = w
 	o.wake = make(chan struct{}, 1)
+}
+
+// wait marks that this end sent a frame that asks for an answer; anything
+// written to it clears the mark (write).
+func (o *yggOut) wait() {
+	if !o.waits.Load() {
+		o.waits.Store(true)
+	}
 }
 
 // write sends whole frames to the end.
