@@ -5,9 +5,12 @@ package nikoserver
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,6 +23,7 @@ import (
 	"github.com/sagernet/gvisor/pkg/tcpip/network/ipv6"
 	"github.com/sagernet/gvisor/pkg/tcpip/stack"
 	"github.com/yggdrasil-network/yggdrasil-go/src/core"
+	"github.com/yggdrasil-network/yggdrasil-go/src/ipv6rwc"
 )
 
 // LAN over Yggdrasil on real cores (raycontrol lan-v1): devices as Niko's,
@@ -39,6 +43,42 @@ type lanDevice struct {
 func newLANDevice(t *testing.T, ctx context.Context, n *yggNode, mtu ...uint32) *lanDevice {
 	t.Helper()
 	c, s, key := yggClientMTU(t, ctx, n.peer, append(mtu, 0)[0])
+	return serveLANDevice(t, c, s, key)
+}
+
+// newLANPublicDevice is a device on the public mesh: a core with no peer
+// of its own, listening on TCP, as a public peer a node dials does; a node
+// whose peers name it is its way in.
+func newLANPublicDevice(t *testing.T, ctx context.Context) (d *lanDevice, peer string) {
+	t.Helper()
+	public, private, _ := ed25519.GenerateKey(rand.Reader)
+	cert, err := yggCertificate(private)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := core.New(cert, yggLog{NewLogger("error", io.Discard)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(c.Stop)
+	ln, err := c.Listen(&url.URL{Scheme: "tcp", Host: "127.0.0.1:0"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rwc := ipv6rwc.NewReadWriteCloser(c)
+	t.Cleanup(func() { rwc.Close() })
+	addr, _ := netip.AddrFromSlice(c.Address())
+	s, err := yggNetstack(ctx, rwc, addr, uint32(rwc.MTU()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Close)
+	return serveLANDevice(t, c, s, public), "tcp://" + ln.Addr().String()
+}
+
+// serveLANDevice makes a device of a core and its netstack.
+func serveLANDevice(t *testing.T, c *core.Core, s *stack.Stack, key ed25519.PublicKey) *lanDevice {
+	t.Helper()
 	d := &lanDevice{core: c, net: s, key: key}
 	serve := func(port uint16, conn func(*gonet.TCPConn)) {
 		ln, err := gonet.ListenTCP(s, tcpip.FullAddress{NIC: 1, Port: port}, ipv6.ProtocolNumber)
@@ -238,6 +278,51 @@ func lanIsolation(ctx context.Context, t *testing.T) {
 		}
 	})
 
+	// A public peer (R4-18): the node dials p, a device of u5 on the public
+	// mesh, past the filter; m and o, of u5 too, are the node's clients.
+	// One sends another as fast as TCP goes at 8 Mbit/s: what the node
+	// relays is charged either way, where it goes out to m, or where it
+	// comes in from m (it leaves through the public peer, past every
+	// client); between two clients where it comes in; no more than the
+	// bucket passes. (Once, not twice, between two clients: the rule's
+	// tests, and TestYggLinksRule for the backend's wiring.)
+	t.Run("public peer", func(t *testing.T) {
+		t.Parallel()
+		p, peer := newLANPublicDevice(t, ctx)
+		mbps := 8
+		n := startYggNode(t, ctx, func(c *BackendConfig) {
+			c.Options.Peers = []string{peer}
+			c.Options.LANRelayMbps = &mbps
+		})
+		m, o := newLANDevice(t, ctx, n), newLANDevice(t, ctx, n)
+		n.setLAN(t, yggDevice{p.key, "u5"}, yggDevice{m.key, "u5"}, yggDevice{o.key, "u5"})
+		m.up(t)
+		o.up(t)
+		if !waitFor(15*time.Second, func() bool { return peerUp(p.core) }) {
+			t.Fatal("the node never dialed its public peer")
+		}
+		if !m.reaches(ctx, p, 15*time.Second) || !p.reaches(ctx, m, 15*time.Second) || !m.reaches(ctx, o, 15*time.Second) {
+			t.Fatal("m, o and p, of one group, do not reach each other")
+		}
+		for _, x := range []struct {
+			name     string
+			from, to *lanDevice
+		}{{"public to client", p, m}, {"client to public", m, p}, {"client to client", m, o}} {
+			time.Sleep(time.Second) // the bucket full again
+			before := n.traffic(t).Users["u5"].Up
+			start := time.Now()
+			got, _ := x.from.bulk(t, ctx, x.to, 3*time.Second)
+			time.Sleep(200 * time.Millisecond) // what is on its way
+			relayed := n.traffic(t).Users["u5"].Up - before
+			window := time.Since(start)
+			bound := float64(mbps)*1e6/8*(window.Seconds()+1) + 2*yggFrameMax
+			t.Logf("%s: %d bytes arrived, %d relayed, in %v", x.name, got, relayed, window.Round(time.Millisecond))
+			if got == 0 || relayed < got || float64(relayed) > bound {
+				t.Errorf("%s: %d bytes arrived, %d relayed in %v; at most %.0f", x.name, got, relayed, window, bound)
+			}
+		}
+	})
+
 	// lan_relay_mbps 0: two devices of one group do not reach each other
 	// through the node; both reach the node.
 	t.Run("relay 0", func(t *testing.T) {
@@ -328,11 +413,11 @@ func lanRates(ctx context.Context, t *testing.T) {
 				}
 				// TCP's share is logged, not held: under -race the stack
 				// itself runs at about 9 Mbit/s. Without it, 12 ms each way:
-				// at 20 Mbit/s about 87 % in every run; at 8 about 90 % in
-				// some, and in others, the slow start's overshoot of the
-				// burst lost whole windows and their retransmissions, about
-				// 20 % (a burst of 100 ms did far worse: 3-6 %); with no
-				// bound about 30 Mbit/s.
+				// at 20 Mbit/s 82-88 %, but in about one run of six, as at 8
+				// in most, the slow start's overshoot of the burst lost
+				// whole windows and their retransmissions: 15-20 % (a burst
+				// of 100 ms did far worse: 3-6 %); at 8 about 90 % in the
+				// others; with no bound 27-51 Mbit/s.
 				if c.delay > 0 || mbps > 100 {
 					return
 				}

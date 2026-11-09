@@ -15,15 +15,15 @@ import (
 // devices reach each other through the node. A key of the users file may
 // carry a group, its user's base name ("yggdrasil": {"lan": "u5"}); on a
 // client's link the filter passes the frames between two keys of one
-// group (yggRule), and charges those the node relays between them, neither
-// end the node, to the group's bucket (lan-v1 §4.4): lan_relay_mbps a
-// group, a second's worth of burst, the largest frame at least (yggBurst).
-// Over it a frame is dropped and TCP
-// inside slows down; at 0 nothing is relayed. What passed counts for
-// raycontrol's traffic limits (traffic-limit-v1 §2.2) by group, on the
-// stats socket's traffic line, as Hysteria2's names do: the relay goes
-// past inner, where Xray counts everything else. A group gone from the
-// users file is dropped once it has relayed nothing for trafficStale
+// group (yggRule), and charges what the node relays for the group to the
+// group's bucket, once, mostly where it goes out to a member
+// (yggRule.judge; lan-v1 §4.4): lan_relay_mbps a group, a second's worth
+// of burst, the largest frame at least (yggBurst). Over it a frame is
+// dropped and TCP inside slows down; at 0 nothing is relayed. What passed
+// counts for raycontrol's traffic limits (traffic-limit-v1 §2.2) by group,
+// on the stats socket's traffic line, as Hysteria2's names do: the relay
+// goes past inner, where Xray counts everything else. A group gone from
+// the users file is dropped once it has relayed nothing for trafficStale
 // (prune). Nothing of it goes to the log: no keys, no groups, no frames
 // (§4.3).
 
@@ -136,9 +136,9 @@ func (r *yggRelay) prune(now time.Time) {
 
 // traffic answers the stats socket's traffic line as Hysteria2's does:
 // each group's bytes relayed since the process started (or since it came
-// back after prune dropped it), up as they came in from its devices; down
-// is always 0 (a relayed frame counts once, where it comes in). The groups
-// of the users file are there from their first reading, 0 or not.
+// back after prune dropped it), up as charged; down is always 0 (a relayed
+// frame counts once, where it is charged). The groups of the users file
+// are there from their first reading, 0 or not.
 func (r *yggRelay) traffic() HysteriaTraffic {
 	r.mu.Lock()
 	defer r.mu.Unlock()
