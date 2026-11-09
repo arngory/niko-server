@@ -117,8 +117,17 @@ func runHysteriaWith(ctx context.Context, c *BackendConfig, conn *packetConn, lo
 	}
 	// The switch of the per-user limits (conn_limit, conn_limit_file):
 	// read now, and again at each look of the users file's watch.
+	var connLimitProblem string // the file's last problem logged: once each
 	connLimit := func() {
-		if on := c.Options.connLimitOn(); on == lim.off.Load() {
+		on, problem := c.Options.connLimitOn()
+		switch {
+		case problem == nil:
+			connLimitProblem = ""
+		case problem.Error() != connLimitProblem:
+			connLimitProblem = problem.Error()
+			log.Warnf("conn_limit_file: %v; the limits stay on", problem)
+		}
+		if on == lim.off.Load() {
 			lim.SetConnLimit(on)
 			if on {
 				log.Infof("per-user connection limits on")

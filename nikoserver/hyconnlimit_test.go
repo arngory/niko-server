@@ -1265,3 +1265,39 @@ func TestHysteriaUDPNameSpelling(t *testing.T) {
 		}
 	}
 }
+
+// A switch file that is a FIFO neither stalls the backend nor its watch:
+// the limits stay on, and the log says why once, however often it looks.
+func TestHysteriaConnLimitFileFIFO(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fifo := t.TempDir() + "/conn-limit"
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logs := &lockedLog{}
+	lim := newHyLimits()
+	lim.n.tcp = 1
+	node := startHy2MasqWith(t, ctx, NewLogger("warn", logs), lim, func(c *BackendConfig) { c.Options.ConnLimitFile = fifo }, "u5", "pw-5")
+	target, _ := holdTarget(t)
+	client := node.client(t, ctx, "pw-5")
+	if _, err := openStream(t, ctx, client, target); err != nil {
+		t.Fatalf("the backend with a FIFO for a switch: %v", err)
+	}
+	for range 3 {
+		syscall.Kill(os.Getpid(), syscall.SIGHUP)
+		time.Sleep(100 * time.Millisecond)
+	}
+	if _, err := openStream(t, ctx, client, target); !tooMany(err) {
+		t.Fatalf("the limits are not on: %v", err)
+	}
+	if n := strings.Count(logs.String(), "conn_limit_file:"); n != 1 || !strings.Contains(logs.String(), "not a regular file") {
+		t.Fatalf("the log, %d lines of the file's problem:\n%s", n, logs)
+	}
+	// The watch goes on: a user taken out of the users file is revoked.
+	writeHy2Users(t, node.users, "u6", "pw-6")
+	syscall.Kill(os.Getpid(), syscall.SIGHUP)
+	if !waitFor(5*time.Second, func() bool { _, err := openStream(t, ctx, node.client(t, ctx, "pw-6"), target); return err == nil }) {
+		t.Fatal("the users file was not read again")
+	}
+}
