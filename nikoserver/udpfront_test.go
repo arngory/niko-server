@@ -5,10 +5,12 @@ package nikoserver
 import (
 	"context"
 	"crypto/rand"
+	"fmt"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,6 +29,83 @@ func packetBackend(t *testing.T, path string) *packetConn {
 	go c.acceptLoop()
 	t.Cleanup(func() { c.Close() })
 	return c
+}
+
+// listenPacketSocket leaves the umask alone. It is the whole process's: a
+// directory another goroutine made while a socket was made under 0117 lost
+// its owner's search bit (0700 &^ 0117), so the next mkdir in it failed for
+// any user but root; and two sockets made at once, as parallel tests'
+// backends start, could each restore the other's 0117 and leave it so for
+// good (in CI, every t.TempDir after that failed). Sockets made by four
+// goroutines at once, directories made beside them: each directory keeps
+// its owner's bits (a mode check, so it holds as root too), each socket is
+// 0660, and a directory made after them keeps its owner's bits too.
+func TestNekoServerSocketUmask(t *testing.T) {
+	dir := t.TempDir()
+	ownerBits := func() error { // a directory made now
+		d, err := os.MkdirTemp(dir, "d")
+		if err != nil {
+			return err
+		}
+		defer os.Remove(d)
+		st, err := os.Stat(d)
+		if err != nil {
+			return err
+		}
+		if st.Mode().Perm()&0o700 != 0o700 {
+			return fmt.Errorf("a directory made %v", st.Mode())
+		}
+		return nil
+	}
+	stop := make(chan struct{})
+	var dirs, socks sync.WaitGroup
+	for range 4 {
+		dirs.Add(1)
+		go func() {
+			defer dirs.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if err := ownerBits(); err != nil {
+					t.Errorf("while sockets were made: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	for g := range 4 {
+		socks.Add(1)
+		go func() {
+			defer socks.Done()
+			for i := range 25 {
+				path := filepath.Join(dir, fmt.Sprintf("s%d-%d.sock", g, i%2))
+				ln, err := listenPacketSocket(path)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				st, err := os.Stat(path)
+				ln.Close()
+				switch {
+				case err != nil:
+					t.Error(err)
+					return
+				case st.Mode().Perm() != 0o660:
+					t.Errorf("a socket: %v", st.Mode())
+					return
+				}
+			}
+		}()
+	}
+	socks.Wait()
+	close(stop)
+	dirs.Wait()
+	if err := ownerBits(); err != nil {
+		t.Errorf("after the sockets: %v (the umask stayed changed)", err)
+	}
 }
 
 func TestNekoServerUDPFront(t *testing.T) {
