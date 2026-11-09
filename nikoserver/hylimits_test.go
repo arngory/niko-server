@@ -951,7 +951,28 @@ func TestHyLimitsOff(t *testing.T) {
 	} else {
 		done()
 	}
-	_ = c
+	// A session that ends while the limits are off leaves no pairs in the
+	// journal: switched on again, its user has none.
+	u6 := slotOf(t, l, "u6")
+	for i := range 3 {
+		if !l.reach(u6, destOf(100+i)) {
+			t.Fatalf("u6's pair %d refused", i)
+		}
+		u6.heard(destOf(100+i), monoAt(c.t))
+	}
+	if pairs, _ := l.pairsOf("u6"); pairs != 3 {
+		t.Fatalf("u6's pairs before: %d", pairs)
+	}
+	l.SetConnLimit(false)
+	l.udpPut(u6)
+	l.SetConnLimit(true)
+	l.mu.Lock()
+	l.sweepLocked(c.t) // ages every user: the journal is counted anew
+	u6user := l.users["u6"]
+	l.mu.Unlock()
+	if u6user != nil && (u6user.pairs != 0 || len(u6user.journal) != 0) {
+		t.Fatalf("on again after a session ended while off: %d pairs, %d in the journal", u6user.pairs, len(u6user.journal))
+	}
 }
 
 // Users apart; the names of u5's credentials share u5's limits.
