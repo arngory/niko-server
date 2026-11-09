@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func checkConfig(t *testing.T, content string) []ConfigError {
@@ -420,5 +422,123 @@ func TestNekoServerConfigLANRelay(t *testing.T) {
 		"options":{"lan_relay_mbps":20}}`
 	if errs := checkConfig(t, hy2); len(errs) != 1 || errs[0].Path != "options.lan_relay_mbps" {
 		t.Errorf("lan_relay_mbps on hy2-masq: %v", errs)
+	}
+}
+
+// conn_limit and conn_limit_file (v0.17.0): the switch of the Hysteria2
+// backends' per-user connection limits; on unless told off.
+func TestNekoServerConfigConnLimit(t *testing.T) {
+	hy2 := func(kind, extra string) string {
+		obfs := ""
+		if kind == "hy2-obfs" {
+			obfs = `"obfs_password_file":"/r/h/obfs.pass",`
+		}
+		return `{"schema":1,"role":"backend","kind":"` + kind + `","socket":"/run/niko/h/packet.sock","front_uid":9100,
+		"users_file":"/r/h/users.json","tls":{"certificate_file":"/r/h/chain.pem","key_file":"/run/niko/h/key.pem"},
+		"stats_socket":"/run/niko/h/stats.sock","options":{` + obfs + `"up_mbps":0` + extra + `}}`
+	}
+	for _, kind := range []string{"hy2-masq", "hy2-obfs"} {
+		for extra, on := range map[string]bool{
+			``:                                     true,
+			`,"conn_limit":"on"`:                   true,
+			`,"conn_limit":"off"`:                  false,
+			`,"conn_limit_file":"/nowhere/at/all"`: true, // no file: on
+			`,"conn_limit":"off","conn_limit_file":"/nowhere/at/all"`: false,
+		} {
+			path := filepath.Join(t.TempDir(), "c.json")
+			os.WriteFile(path, []byte(hy2(kind, extra)), 0o600)
+			c, errs, err := Load(path)
+			if err != nil || len(errs) > 0 {
+				t.Fatalf("%s %s: %v %v", kind, extra, errs, err)
+			}
+			if got, problem := c.(*BackendConfig).Options.connLimitOn(); got != on || problem != nil {
+				t.Errorf("%s %s: on %v, want %v", kind, extra, got, on)
+			}
+		}
+		for extra, path := range map[string]string{
+			`,"conn_limit":"maybe"`:                       "options.conn_limit",
+			`,"conn_limit":"OFF"`:                         "options.conn_limit",
+			`,"conn_limit":"1024"`:                        "options.conn_limit",
+			`,"conn_limit_file":"conn-limit"`:             "options.conn_limit_file",
+			`,"conn_limit_file":"/run/niko/h/stats.sock"`: "stats_socket", // the backend removes what is there
+			`,"conn_limit":false`:                         "",
+			`,"conn_limits":"off"`:                        "",
+			`,"conn_limit_tcp":64`:                        "", // no numbers
+		} {
+			errs := checkConfig(t, hy2(kind, extra))
+			if len(errs) != 1 || errs[0].Path != path {
+				t.Errorf("%s %s: %v, want one error at %q", kind, extra, errs, path)
+			}
+		}
+	}
+	// The file: "off" turns the limits off, anything else, or nothing, on.
+	file := filepath.Join(t.TempDir(), "conn-limit")
+	o := BackendOptions{ConnLimitFile: file}
+	for content, on := range map[string]bool{"off": false, "off\n": false, "  off \r\n": false, "on\n": true, "": true, "0": true,
+		"offline": true, "off off": true, strings.Repeat(" ", 100) + "off": true} {
+		if err := os.WriteFile(file, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if got, problem := o.connLimitOn(); got != on || problem != nil {
+			t.Errorf("the file says %q: on %v (%v), want %v", content, got, problem, on)
+		}
+	}
+	os.Remove(file)
+	if on, problem := o.connLimitOn(); !on || problem != nil {
+		t.Errorf("no file: on %v (%v)", on, problem)
+	}
+	// Only the Hysteria2 backends have the limits.
+	dnstt := `{"schema":1,"role":"backend","kind":"dnstt","socket":"/run/niko/dns/packet.sock","inner":"/run/niko/inner/vless.sock",
+		"options":{"zone":"t.example.com","private_key_file":"/r/dnstt.key"EXTRA}}`
+	for _, extra := range []string{`,"conn_limit":"off"`, `,"conn_limit":"on"`, `,"conn_limit_file":"/r/conn-limit"`} {
+		if errs := checkConfig(t, strings.Replace(dnstt, "EXTRA", extra, 1)); len(errs) != 1 || errs[0].Path != "options" {
+			t.Errorf("dnstt with %s: %v", extra, errs)
+		}
+	}
+	if errs := checkConfig(t, strings.Replace(dnstt, "EXTRA", "", 1)); len(errs) != 0 {
+		t.Errorf("dnstt: %v", errs)
+	}
+}
+
+// The switch file is read without waiting on it: a FIFO, a directory or a
+// device is no switch (on), and the read never blocks the watch that also
+// revokes users. "off" may come after some padding.
+func TestConnLimitFileKinds(t *testing.T) {
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	os.Symlink(fifo, link)
+	padded := filepath.Join(dir, "padded")
+	os.WriteFile(padded, []byte(strings.Repeat(" ", 20)+"off\n"), 0o600)
+	long := filepath.Join(dir, "long")
+	os.WriteFile(long, []byte(strings.Repeat(" ", 70)+"off"), 0o600)
+	toOff := filepath.Join(dir, "to-off")
+	os.Symlink(padded, toOff) // a link to a regular file is that file
+	for _, c := range []struct {
+		path    string
+		on      bool
+		problem bool
+	}{{fifo, true, true}, {link, true, true}, {dir, true, true}, {"/dev/null", true, true},
+		{padded, false, false}, {toOff, false, false}, {long, true, false}, {filepath.Join(dir, "none"), true, false}} {
+		type result struct {
+			on      bool
+			problem error
+		}
+		done := make(chan result, 1)
+		go func() {
+			on, problem := BackendOptions{ConnLimitFile: c.path}.connLimitOn()
+			done <- result{on, problem}
+		}()
+		select {
+		case r := <-done:
+			if r.on != c.on || (r.problem != nil) != c.problem {
+				t.Errorf("%s: on %v (%v), want %v and a problem %v", c.path, r.on, r.problem, c.on, c.problem)
+			}
+		case <-time.After(2 * time.Second):
+			t.Errorf("%s: the read blocks", c.path)
+		}
 	}
 }

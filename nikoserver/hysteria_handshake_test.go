@@ -19,7 +19,7 @@ type handshakeConn struct {
 	fail chan error
 }
 
-func (c *handshakeConn) HandshakeSuccess() error         { close(c.ok); return nil }
+func (c *handshakeConn) HandshakeSuccess() error          { close(c.ok); return nil }
 func (c *handshakeConn) HandshakeFailure(err error) error { c.fail <- err; return nil }
 
 func newHandshakeConn(t *testing.T) *handshakeConn {

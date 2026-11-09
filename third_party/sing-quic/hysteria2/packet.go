@@ -310,6 +310,13 @@ func (c *udpPacketConn) closeWithError(err error) {
 	c.cancel(err)
 }
 
+// SessionID is the session's number, as its client chose it (neko): a
+// handler that refuses a session, which the client then repeats with every
+// datagram, tells the repeats of one session by it.
+func (c *udpPacketConn) SessionID() uint32 {
+	return c.sessionID
+}
+
 func (c *udpPacketConn) LocalAddr() net.Addr {
 	return c.quicConn.LocalAddr()
 }

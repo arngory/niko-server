@@ -9,8 +9,11 @@ package nikoserver
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/arngory/niko-server/dnsttserver"
+	"io"
+	"io/fs"
 	"net/netip"
 	"net/url"
 	"os"
@@ -18,6 +21,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -183,6 +187,58 @@ type BackendOptions struct {
 	// channel probes of raycontrol, probe-v1); nothing else of the node is
 	// reachable.
 	Probe *ProbeRoute `json:"probe,omitempty"`
+	// ConnLimit (hy2-*, v0.17.0): the per-user connection limits (raycontrol
+	// docs/spec/conn-limit-v1.md §3.2, §8): "on", or absent, or "off". No
+	// numbers and nothing per user.
+	ConnLimit string `json:"conn_limit,omitempty"`
+	// ConnLimitFile (hy2-*, v0.17.0; optional): a file that says "off" to
+	// turn the limits off while the backend runs, read at the start, on
+	// SIGHUP and every 5 s, as the users file is looked at: what is open
+	// stays. Anything else in it (connLimitFileMax bytes at most), no file,
+	// or something that is no regular file, is on. With conn_limit "off"
+	// the limits are off whatever it says.
+	ConnLimitFile string `json:"conn_limit_file,omitempty"`
+}
+
+// connLimitFileMax bounds what is read of conn_limit_file: "off" with some
+// padding fits; a longer file is on.
+const connLimitFileMax = 64
+
+// connLimitOn reads the switch of the per-user connection limits: off with
+// conn_limit "off", or while conn_limit_file says "off"; on otherwise (the
+// limits are a protection: a missing or broken file must not take them
+// away). The file is opened without blocking and must be a regular file: a
+// FIFO would hold the read, and with it the users file's watch, which
+// revokes users. problem says why a file that is there was not read, for
+// the log; a missing file is none.
+func (o BackendOptions) connLimitOn() (on bool, problem error) {
+	if o.ConnLimit == "off" {
+		return false, nil
+	}
+	if o.ConnLimitFile == "" {
+		return true, nil
+	}
+	f, err := os.OpenFile(o.ConnLimitFile, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if errors.Is(err, fs.ErrNotExist) {
+		return true, nil
+	}
+	if err != nil {
+		return true, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return true, err
+	}
+	if !st.Mode().IsRegular() {
+		return true, fmt.Errorf("%s: not a regular file (%v)", o.ConnLimitFile, st.Mode().Type())
+	}
+	b := make([]byte, connLimitFileMax+1)
+	n, err := io.ReadFull(f, b)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return true, err
+	}
+	return n > connLimitFileMax || strings.TrimSpace(string(b[:n])) != "off", nil
 }
 
 // lanRelayMbps is lan_relay_mbps, its default when absent.
@@ -624,6 +680,12 @@ func (c *BackendConfig) validate() []ConfigError {
 		if c.Options.UpMbps < 0 || c.Options.DownMbps < 0 {
 			e.add("options", "up_mbps and down_mbps cannot be negative")
 		}
+		if c.Options.ConnLimit != "" && c.Options.ConnLimit != "on" && c.Options.ConnLimit != "off" {
+			e.add("options.conn_limit", "want on or off, got %q", c.Options.ConnLimit)
+		}
+		if c.Options.ConnLimitFile != "" {
+			checkSocket(&e, "options.conn_limit_file", c.Options.ConnLimitFile)
+		}
 		if pr := c.Options.Probe; pr != nil {
 			if !dnsName.MatchString(pr.Name) {
 				e.add("options.probe.name", "not a DNS name: %q", pr.Name)
@@ -676,7 +738,7 @@ func (c *BackendConfig) validate() []ConfigError {
 			{c.Socket, "the backend's socket"}, {c.Inner, "the inner stage's socket"}, {c.UsersFile, "users_file"},
 			{c.Options.PrivateKeyFile, "options.private_key_file"}, {c.Options.AuthKeysFile, "options.auth_keys_file"},
 			{c.Options.SealKeyFile, "options.seal_key_file"}, {c.Options.EncryptionKeyFile, "options.encryption_key_file"},
-			{c.Options.ObfsPasswordFile, "options.obfs_password_file"},
+			{c.Options.ObfsPasswordFile, "options.obfs_password_file"}, {c.Options.ConnLimitFile, "options.conn_limit_file"},
 		}
 		if c.TLS != nil {
 			files = append(files, struct{ path, what string }{c.TLS.CertificateFile, "tls.certificate_file"},
@@ -690,6 +752,9 @@ func (c *BackendConfig) validate() []ConfigError {
 	}
 	if c.Options.Probe != nil && c.Kind != "hy2-masq" && c.Kind != "hy2-obfs" {
 		e.add("options.probe", "only the Hysteria2 backends route a probe name")
+	}
+	if (c.Options.ConnLimit != "" || c.Options.ConnLimitFile != "") && c.Kind != "hy2-masq" && c.Kind != "hy2-obfs" {
+		e.add("options", "conn_limit and conn_limit_file are options of the Hysteria2 backends")
 	}
 	if c.Kind != "yggdrasil" && (len(c.Options.ExitPorts) > 0 || len(c.Options.Peers) > 0) {
 		e.add("options", "exit_ports and peers are Yggdrasil options")
