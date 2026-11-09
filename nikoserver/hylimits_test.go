@@ -955,7 +955,9 @@ func TestHyLimitsOff(t *testing.T) {
 
 // Users apart; the names of u5's credentials share u5's limits.
 func TestHyLimitsByBaseName(t *testing.T) {
-	for name, want := range map[string]string{"u5": "u5", "u5-n": "u5", "u5-p": "u5", "u5-3f2a9c0d1e4b5a67": "u5", "u50": "u50", "alice": "alice", "": ""} {
+	for name, want := range map[string]string{"u5": "u5", "u5-n": "u5", "u5-p": "u5", "u5-3f2a9c0d1e4b5a67": "u5", "u50": "u50", "alice": "alice",
+		// Never "": that is nobody, whom nothing limits.
+		"": "-", "-": "-", "-u5": "-u5", "--": "--"} {
 		if got := baseName(name); got != want {
 			t.Errorf("%q: base %q, want %q", name, got, want)
 		}

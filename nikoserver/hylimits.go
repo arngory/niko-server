@@ -199,9 +199,16 @@ func (l *hyLimits) limited(user string) bool { return user != "" && !l.off.Load(
 
 // baseName is whose limits a name takes: u5 for u5 and for the names of its
 // credentials (u5-<fingerprint>; u5-n and u5-p before raycontrol v0.23.0).
+// Never "", which is nobody's: a name that begins with a dash is its own
+// user, and the users without a name are one user, "-".
 func baseName(name string) string {
-	b, _, _ := strings.Cut(name, "-")
-	return b
+	if b, _, _ := strings.Cut(name, "-"); b != "" {
+		return b
+	}
+	if name == "" {
+		return "-"
+	}
+	return name
 }
 
 // userLocked is a user's state, made at first sight with full buckets.

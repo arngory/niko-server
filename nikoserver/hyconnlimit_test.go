@@ -849,6 +849,15 @@ func TestHysteriaStreamLimits(t *testing.T) {
 	if hc, _ := start("u50-aaaa"); wait(hc) != nil {
 		t.Fatal("u50 is not u5")
 	}
+	// A user without a name is limited too.
+	for range 2 {
+		if hc, _ := start(""); wait(hc) != nil {
+			t.Fatal("a user without a name: refused within the limit")
+		}
+	}
+	if hc, _ := start(""); wait(hc) == nil {
+		t.Fatal("users without a name are limited by nothing")
+	}
 	// The place comes back when the stream ends, not before.
 	lim.mu.Lock()
 	held := lim.users["u5"].tcp
