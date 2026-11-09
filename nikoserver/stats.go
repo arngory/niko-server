@@ -1,10 +1,13 @@
 package nikoserver
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"os"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -14,6 +17,42 @@ import (
 // it to the service's group (raycontrol's rayd): a dnstt backend's
 // counters (stats_socket), the DNS front's (dns.stats_socket).
 func serveStats(path string, snapshot func() any, log *Logger) (func(), error) {
+	return listenStats(path, log, func(c net.Conn) {
+		_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+		_ = json.NewEncoder(c).Encode(snapshot())
+		c.Close()
+	})
+}
+
+// statsLineWait is how long a stats socket that takes the traffic line
+// waits for a line: a reader that sends nothing gets the snapshot then.
+const statsLineWait = 500 * time.Millisecond
+
+// serveStatsTraffic is serveStats with the traffic line of raycontrol's
+// traffic-limit-v1 §2.2, as Hysteria2's socket takes it (Yggdrasil,
+// v0.16.0): the line "traffic" gets traffic(), then the close. Anything
+// else gets snapshot(), as serveStats gives it: another line, the end of
+// what the reader sends (its half-close), or nothing within
+// statsLineWait. A line is 192 bytes at most, everything within 2 s.
+func serveStatsTraffic(path string, snapshot, traffic func() any, log *Logger) (func(), error) {
+	return listenStats(path, log, func(c net.Conn) {
+		go func() {
+			defer c.Close()
+			_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+			_ = c.SetReadDeadline(time.Now().Add(statsLineWait))
+			line, _ := bufio.NewReader(io.LimitReader(c, 192)).ReadString('\n')
+			answer := snapshot
+			if strings.TrimSpace(line) == "traffic" {
+				answer = traffic
+			}
+			_ = json.NewEncoder(c).Encode(answer())
+		}()
+	})
+}
+
+// listenStats listens on a unix socket at path (whatever is there goes;
+// 0660) and gives each connection to serve, in the accept loop.
+func listenStats(path string, log *Logger, serve func(net.Conn)) (func(), error) {
 	_ = os.Remove(path)
 	ln, err := net.Listen("unix", path)
 	if err != nil {
@@ -34,9 +73,7 @@ func serveStats(path string, snapshot func() any, log *Logger) (func(), error) {
 				continue
 			}
 			backoff.ok()
-			_ = c.SetDeadline(time.Now().Add(2 * time.Second))
-			_ = json.NewEncoder(c).Encode(snapshot())
-			c.Close()
+			serve(c)
 		}
 	}()
 	log.Infof("stats on %s", path)
@@ -83,10 +120,19 @@ func (b *acceptBackoff) next() time.Duration {
 // cannot be made is said and left out: the counters are not worth the
 // service (review 12: the front's TCP and UDP 443 went down with it).
 func startStats(path string, snapshot func() any, log *Logger) func() {
+	return startStatsWith(path, log, func() (func(), error) { return serveStats(path, snapshot, log) })
+}
+
+// startStatsTraffic is startStats with the traffic line (serveStatsTraffic).
+func startStatsTraffic(path string, snapshot, traffic func() any, log *Logger) func() {
+	return startStatsWith(path, log, func() (func(), error) { return serveStatsTraffic(path, snapshot, traffic, log) })
+}
+
+func startStatsWith(path string, log *Logger, serve func() (func(), error)) func() {
 	if path == "" {
 		return func() {}
 	}
-	stop, err := serveStats(path, snapshot, log)
+	stop, err := serve()
 	if err != nil {
 		log.Warnf("stats socket %s: %v; no counters", path, err)
 		return func() {}

@@ -45,6 +45,9 @@ type UsersFile struct {
 		} `json:"hy2,omitempty"`
 		Yggdrasil *struct {
 			PublicKey string `json:"public_key"`
+			// LAN (v0.16.0): the key's group, its user's base name
+			// (raycontrol lan-v1 §2.2); absent or "" none.
+			LAN string `json:"lan,omitempty"`
 		} `json:"yggdrasil,omitempty"`
 	} `json:"users"`
 }
@@ -155,7 +158,7 @@ func runHysteria(ctx context.Context, c *BackendConfig, conn *packetConn, log *L
 	if err := reload(); err != nil {
 		return envError("users: %v", err)
 	}
-	go watchUsers(ctx, c.UsersFile, reload, log)
+	go watchUsers(ctx, c.UsersFile, reload, users.check, log)
 	if err := service.Start(conn); err != nil {
 		return err
 	}
@@ -163,8 +166,9 @@ func runHysteria(ctx context.Context, c *BackendConfig, conn *packetConn, log *L
 	return service.Close()
 }
 
-// watchUsers reloads the users file on SIGHUP and when it changes.
-func watchUsers(ctx context.Context, path string, reload func() error, log *Logger) {
+// watchUsers reloads the users file on SIGHUP and when it changes; check
+// runs at each look, every 5 s, whether it changed or not.
+func watchUsers(ctx context.Context, path string, reload func() error, check func(), log *Logger) {
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 	defer signal.Stop(hup)
@@ -180,6 +184,7 @@ func watchUsers(ctx context.Context, path string, reload func() error, log *Logg
 			return
 		case <-hup:
 		case <-tick.C:
+			check()
 			st, err := os.Stat(path)
 			if err != nil || st.ModTime().Equal(last) {
 				continue
@@ -207,6 +212,8 @@ func (o *outbound) isProbe(d M.Socksaddr) bool {
 }
 
 func (o *outbound) NewConnectionEx(ctx context.Context, conn net.Conn, _ M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+	t := trafficFrom(ctx)
+	defer t.open()()
 	dctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	var out net.Conn
 	var err error
@@ -239,7 +246,6 @@ func (o *outbound) NewConnectionEx(ctx context.Context, conn net.Conn, _ M.Socks
 	// The user's bytes at the destination's side: read from it down,
 	// written to it up. The copy unwraps the counters (the half-close and
 	// the copy's fast paths stay) and adds each buffer once it is through.
-	t := trafficFrom(ctx)
 	out = bufio.NewInt64CounterConn(out, []*atomic.Int64{&t.down}, []*atomic.Int64{&t.up})
 	err = bufio.CopyConn(ctx, conn, out)
 	if onClose != nil {
@@ -281,6 +287,7 @@ func (o *outbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn,
 // from one and passed on down.
 func relayUDP(ctx context.Context, conn N.PacketConn, o *outbound) error {
 	t := trafficFrom(ctx)
+	defer t.open()()
 	var probeAddr netip.AddrPort
 	var probeFrom atomic.Pointer[M.Socksaddr] // what the client sent to: replies come from it
 	if o != nil && o.probe != nil {

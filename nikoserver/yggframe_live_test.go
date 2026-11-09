@@ -40,7 +40,7 @@ func iwKeys(n int) []ed25519.PrivateKey {
 // filtered is a client's link to the node N through the filter.
 func filtered(n *iwn.PacketConn, client *iwn.PacketConn, dropped *atomic.Uint64, lie func([]byte) []byte) iwClient {
 	return iwClient{lie: lie, filter: &yggLinkFilter{
-		rule: yggRule{node: [32]byte(iwKey(n)), key: [32]byte(iwKey(client)), group: noGroup}, dropped: dropped}}
+		rule: yggRule{node: [32]byte(iwKey(n)), key: [32]byte(iwKey(client)), groups: noGroup}, dropped: dropped}}
 }
 
 // reach has from send to to until it arrives.
@@ -254,7 +254,7 @@ func TestNekoServerYggFilterLiveness(t *testing.T) {
 				return iwLookup(ka, kb)
 			}
 			n.link(A, N, filtered(N, A, &dA, lie))
-			kill, gone := deadLink(N, B, &yggLinkFilter{rule: yggRule{node: kn, key: kb, group: noGroup}, dropped: &dOld})
+			kill, gone := deadLink(N, B, &yggLinkFilter{rule: yggRule{node: kn, key: kb, groups: noGroup}, dropped: &dOld})
 			if !n.reach(N, B, 15*time.Second) || !n.reach(A, N, 15*time.Second) {
 				t.Fatal("no traffic")
 			}

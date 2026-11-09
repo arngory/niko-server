@@ -42,6 +42,12 @@ import (
 // and a netstack on its address.
 func yggClient(t *testing.T, ctx context.Context, peer string) (*core.Core, *stack.Stack, ed25519.PublicKey) {
 	t.Helper()
+	return yggClientMTU(t, ctx, peer, 0)
+}
+
+// yggClientMTU is yggClient with the netstack's MTU (0: the core's, 65535).
+func yggClientMTU(t *testing.T, ctx context.Context, peer string, mtu uint32) (*core.Core, *stack.Stack, ed25519.PublicKey) {
+	t.Helper()
 	public, private, _ := ed25519.GenerateKey(rand.Reader)
 	cert, err := yggCertificate(private)
 	if err != nil {
@@ -55,7 +61,10 @@ func yggClient(t *testing.T, ctx context.Context, peer string) (*core.Core, *sta
 	rwc := ipv6rwc.NewReadWriteCloser(node)
 	t.Cleanup(func() { rwc.Close() })
 	addr, _ := netip.AddrFromSlice(node.Address())
-	s, err := yggNetstack(ctx, rwc, addr, uint32(rwc.MTU()))
+	if mtu == 0 {
+		mtu = uint32(rwc.MTU())
+	}
+	s, err := yggNetstack(ctx, rwc, addr, mtu)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +113,7 @@ type yggNode struct {
 	stopped   chan error
 }
 
-func startYggNode(t *testing.T, ctx context.Context) *yggNode {
+func startYggNode(t *testing.T, ctx context.Context, opts ...func(*BackendConfig)) *yggNode {
 	t.Helper()
 	dir := t.TempDir()
 	uid := os.Getuid()
@@ -128,12 +137,20 @@ func startYggNode(t *testing.T, ctx context.Context) *yggNode {
 		FrontUID: uid, UsersFile: n.usersFile, TLS: &BackendTLS{CertificateFile: certFile, KeyFile: keyFile},
 		Options: BackendOptions{PrivateKeyFile: keyPath, ExitPorts: []int{4433}}, Inner: echoInner(t, dir),
 		StatsSocket: n.stats}
+	for _, o := range opts {
+		o(c)
+	}
 	if errs := c.validate(); len(errs) > 0 {
 		t.Fatal(errs)
 	}
 	go func() { n.stopped <- RunBackend(ctx, c, log) }()
 	if !waitFor(5*time.Second, func() bool { _, err := os.Stat(c.Socket); return err == nil }) {
-		t.Fatal("the backend did not listen")
+		select {
+		case err := <-n.stopped:
+			t.Fatalf("the backend did not listen: %v", err)
+		default:
+			t.Fatal("the backend did not listen")
+		}
 	}
 	backends := map[string]BackendRef{"ygg": {Socket: c.Socket, Mode: "fd", UID: uid}}
 	front := newTCPFront(&FrontTCP{Listen: []string{"127.0.0.1:0"}, Default: "ygg",
@@ -155,6 +172,7 @@ func (n *yggNode) snapshot(t *testing.T) YggdrasilSnapshot {
 		t.Fatal(err)
 	}
 	defer c.Close()
+	c.(*net.UnixConn).CloseWrite() // nothing to say: the snapshot at once
 	var s YggdrasilSnapshot
 	if err := json.NewDecoder(c).Decode(&s); err != nil {
 		t.Fatal(err)
@@ -168,6 +186,47 @@ func (n *yggNode) setUsers(t *testing.T, keys ...ed25519.PublicKey) {
 	writeYggUsers(t, n.usersFile, keys...)
 	syscall.Kill(os.Getpid(), syscall.SIGHUP)
 	time.Sleep(200 * time.Millisecond)
+}
+
+// yggDevice is a device's key in the users file and its LAN group ("":
+// none), as raycontrol writes them: u<id>-<device>, the group u<id>.
+type yggDevice struct {
+	key ed25519.PublicKey
+	lan string
+}
+
+// setLAN writes the users file with groups and has the backend read it.
+func (n *yggNode) setLAN(t *testing.T, devices ...yggDevice) {
+	t.Helper()
+	var users []string
+	for i, d := range devices {
+		users = append(users, fmt.Sprintf(`{"name":"u%d-%d","enabled":true,"yggdrasil":{"public_key":%q,"lan":%q}}`,
+			i, i, hex.EncodeToString(d.key), d.lan))
+	}
+	if err := os.WriteFile(n.usersFile, []byte(`{"users":[`+strings.Join(users, ",")+`]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	syscall.Kill(os.Getpid(), syscall.SIGHUP)
+	time.Sleep(200 * time.Millisecond)
+}
+
+// traffic is the backend's answer to the line traffic.
+func (n *yggNode) traffic(t *testing.T) HysteriaTraffic {
+	t.Helper()
+	c, err := net.Dial("unix", n.stats)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.WriteString(c, "traffic\n"); err != nil {
+		t.Fatal(err)
+	}
+	var tr HysteriaTraffic
+	if err := json.NewDecoder(c).Decode(&tr); err != nil {
+		t.Fatal(err)
+	}
+	return tr
 }
 
 func TestNekoServerYggdrasil(t *testing.T) {

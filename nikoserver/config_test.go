@@ -381,3 +381,44 @@ func TestNekoServerConfigTaggedZone(t *testing.T) {
 		}
 	}
 }
+
+// lan_relay_mbps (v0.16.0): a Yggdrasil option, an integer not below 0;
+// absent it is 20, 0 relays nothing.
+func TestNekoServerConfigLANRelay(t *testing.T) {
+	ygg := `{"schema":1,"role":"backend","kind":"yggdrasil","socket":"/run/niko/ygg/fd.sock","front_uid":9100,
+		"users_file":"/run/niko-rendered/ygg/users.json",
+		"tls":{"certificate_file":"/run/credentials/niko-ygg.service/chain.pem","key_file":"/run/credentials/niko-ygg.service/key.pem"},
+		"options":{"private_key_file":"/run/credentials/niko-ygg.service/node.key","exit_ports":[4433]%s},
+		"inner":"/run/niko/inner/vless.sock"}`
+	load := func(opt string) (*BackendConfig, []ConfigError) {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "c.json")
+		os.WriteFile(path, []byte(fmt.Sprintf(ygg, opt)), 0o600)
+		c, errs, err := Load(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := c.(*BackendConfig)
+		return b, errs
+	}
+	for opt, want := range map[string]int{``: 20, `,"lan_relay_mbps":0`: 0, `,"lan_relay_mbps":7`: 7, `,"lan_relay_mbps":100000`: 100000} {
+		c, errs := load(opt)
+		if len(errs) > 0 || c == nil || c.Options.lanRelayMbps() != want {
+			t.Errorf("%q: %v, want %d", opt, errs, want)
+		}
+	}
+	for _, opt := range []string{`,"lan_relay_mbps":-1`, `,"lan_relay_mbps":1.5`, `,"lan_relay_mbps":"20"`, `,"lan_relay":20`} {
+		if _, errs := load(opt); len(errs) == 0 {
+			t.Errorf("%q passed", opt)
+		}
+	}
+	if _, errs := load(`,"lan_relay_mbps":-1`); len(errs) != 1 || errs[0].Path != "options.lan_relay_mbps" {
+		t.Errorf("-1: %v", errs)
+	}
+	hy2 := `{"schema":1,"role":"backend","kind":"hy2-masq","socket":"/run/niko/h/packet.sock","front_uid":9100,
+		"users_file":"/r/h/users.json","tls":{"certificate_file":"/r/h/chain.pem","key_file":"/run/niko/h/key.pem"},
+		"options":{"lan_relay_mbps":20}}`
+	if errs := checkConfig(t, hy2); len(errs) != 1 || errs[0].Path != "options.lan_relay_mbps" {
+		t.Errorf("lan_relay_mbps on hy2-masq: %v", errs)
+	}
+}

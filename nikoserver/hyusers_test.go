@@ -654,3 +654,121 @@ func TestHy2TrafficFrom(t *testing.T) {
 		t.Fatal("no user")
 	}
 }
+
+// The counters of a name gone from the users file (raycontrol v0.23.0
+// names each credential for life, so each rotation leaves one): kept while
+// a connection, stream or datagram session of the name lives, and
+// trafficStale after the last one ends, across the watch's looks; then
+// dropped. A name in the file is never dropped; one back in it keeps its
+// counters; one dropped and back starts from 0.
+func TestHy2TrafficPruned(t *testing.T) {
+	var table atomic.Pointer[map[string]*hy2User]
+	now := time.Unix(1_800_000_000, 0)
+	u := newHy2Users()
+	u.now = func() time.Time { return now }
+	u.stale = time.Minute
+	look := func(d time.Duration) map[string]UserTraffic {
+		t.Helper()
+		now = now.Add(d)
+		u.check()
+		return u.trafficSnapshot().Users
+	}
+	has := func(got map[string]UserTraffic, names ...string) bool {
+		for _, n := range names {
+			if _, ok := got[n]; !ok {
+				return false
+			}
+		}
+		return true
+	}
+	u.set([]string{"u5-a", "u5-b", "u6", "u7", "u8"}, []string{"a", "b", "c", "d", "e"}, hy2Table(&table))
+	users := *table.Load()
+	conn := &hy2Conn{close: func() {}}
+	if !u.admit(users["a"], conn) { // u5-a: a connection
+		t.Fatal("not admitted")
+	}
+	stream := users["b"].traffic.open() // u5-b: a stream, its connection gone
+	users["a"].traffic.up.Add(5)
+	users["d"].traffic.up.Add(7)
+	users["e"].traffic.up.Add(9)
+
+	// A rotation: u5-a and u5-b leave, u7 and u8 too; u6 stays.
+	u.set([]string{"u6"}, []string{"c"}, hy2Table(&table))
+	if got := look(30 * time.Second); !has(got, "u5-a", "u5-b", "u6", "u7", "u8") {
+		t.Fatalf("within the stale time: %v", got)
+	}
+	// u8 comes back, with another password: its counters stay.
+	u.set([]string{"u6", "u8"}, []string{"c", "e2"}, hy2Table(&table))
+	if got := look(30 * time.Second); has(got, "u7") || !has(got, "u5-a", "u5-b", "u6", "u8") || got["u8"].Up != 9 {
+		t.Fatalf("a minute after u7 left, with nothing of it: %v", got)
+	}
+	// Hours with a connection and a stream alive: kept.
+	for range 10 {
+		if got := look(time.Hour); !has(got, "u5-a", "u5-b", "u6", "u8") {
+			t.Fatalf("with a session alive: %v", got)
+		}
+	}
+	// The connection ends: kept a minute from the first look after, at
+	// every look; then dropped. The stream keeps u5-b.
+	u.leave(users["a"], conn)
+	for _, d := range []time.Duration{time.Second, 20 * time.Second, 20 * time.Second, 19 * time.Second} {
+		if got := look(d); !has(got, "u5-a") || got["u5-a"].Up != 5 {
+			t.Fatalf("within the stale time after the last session: %v", got)
+		}
+	}
+	if got := look(time.Second); has(got, "u5-a") || !has(got, "u5-b") {
+		t.Fatalf("the stale time after the last session: %v", got)
+	}
+	stream()
+	look(time.Second)
+	if got := look(59 * time.Second); !has(got, "u5-b") {
+		t.Fatalf("u5-b, its stream just ended: %v", got)
+	}
+	if got := look(time.Second); has(got, "u5-b") {
+		t.Fatalf("u5-b, a minute after its stream: %v", got)
+	}
+	// A name in the file is never dropped, idle as it is.
+	if got := look(24 * time.Hour); !has(got, "u6", "u8") || len(got) != 2 {
+		t.Fatalf("the file's names: %v", got)
+	}
+	// A name dropped and back starts from 0.
+	u.set([]string{"u6", "u7", "u8"}, []string{"c", "d", "e2"}, hy2Table(&table))
+	if got := u.trafficSnapshot().Users; !has(got, "u7") || got["u7"].Up != 0 {
+		t.Fatalf("u7 back: %v", got)
+	}
+
+	// A stream holds its user's name while it lives (NewConnectionEx).
+	user := (*table.Load())["d"]
+	quiet := NewLogger("error", io.Discard)
+	silent, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer silent.Close()
+	go func() {
+		for {
+			c, err := silent.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close()
+		}
+	}()
+	var d net.Dialer
+	hc := newHandshakeConn(t)
+	ended := make(chan struct{})
+	go func() {
+		(&outbound{dial: d.DialContext, log: quiet}).NewConnectionEx(auth.ContextWithUser(context.Background(), user),
+			hc, M.Socksaddr{}, M.ParseSocksaddr(silent.Addr().String()), nil)
+		close(ended)
+	}()
+	<-hc.ok
+	if user.traffic.live.Load() != 1 {
+		t.Fatalf("a stream up: %d live", user.traffic.live.Load())
+	}
+	hc.Close()
+	<-ended
+	if user.traffic.live.Load() != 0 {
+		t.Fatalf("the stream over: %d live", user.traffic.live.Load())
+	}
+}

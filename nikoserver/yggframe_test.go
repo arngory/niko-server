@@ -75,8 +75,23 @@ var (
 	keyK    = [32]byte{0: 'K', 31: 2}
 	keyA    = [32]byte{0: 'A', 31: 3}
 	keyG    = [32]byte{0: 'G', 31: 4}
-	noGroup = func(*[32]byte) yggGroup { return 0 }
+	noGroup = func() yggGroups { return nil }
 )
+
+// testGroups are groups that relay without a bound: K and G in one, A in
+// another (when only is given, those keys in the one).
+func testGroups(only ...[32]byte) func() yggGroups {
+	relay := newYggRelay(1 << 30)
+	one, other := relay.group("u1"), relay.group("u2")
+	g := yggGroups{keyK: one, keyG: one, keyA: other}
+	if len(only) > 0 {
+		g = yggGroups{}
+		for _, k := range only {
+			g[k] = one
+		}
+	}
+	return func() yggGroups { return g }
+}
 
 func TestNekoServerYggFrameKeys(t *testing.T) {
 	var sig [64]byte
@@ -168,82 +183,150 @@ func yggWatermarkIs(frame []byte, w uint64) bool {
 }
 
 func TestNekoServerYggRule(t *testing.T) {
-	groups := map[[32]byte]yggGroup{keyK: 1, keyG: 1, keyA: 2}
-	inGroups := func(k *[32]byte) yggGroup { return groups[*k] }
+	inGroups := testGroups()
+	// K in none, G and A in one: K reaches the node only.
+	notK := testGroups(keyG, keyA)
 	const up, down = true, false
+	addrG := [32]byte(address.AddrForKey(keyG[:]).GetKey())
 	for _, c := range []struct {
 		name         string
-		groups       bool
+		groups       func() yggGroups
 		fromClient   bool
 		typ          byte
 		source, dest [32]byte
 		pass         bool
 	}{
-		{"traffic K to N", false, up, yggTraffic, keyK, keyN, true},
-		{"traffic K to another", false, up, yggTraffic, keyK, keyA, false},
-		{"traffic forging N", false, up, yggTraffic, keyN, keyA, false},
-		{"traffic forging N to N", false, up, yggTraffic, keyN, keyN, false},
-		{"traffic forging another", false, up, yggTraffic, keyA, keyN, false},
-		{"traffic K to K", false, up, yggTraffic, keyK, keyK, false},
-		{"pathNotify K to N", false, up, yggPathNotify, keyK, keyN, true},
-		{"pathNotify K to another", false, up, yggPathNotify, keyK, keyA, false},
-		{"pathBroken of N's traffic to K, back to N", false, up, yggPathBroken, keyN, keyK, true},
-		{"pathBroken of K's traffic to N", false, up, yggPathBroken, keyK, keyN, false},
-		{"pathBroken of another's traffic", false, up, yggPathBroken, keyA, keyK, false},
-		{"traffic N to K", false, down, yggTraffic, keyN, keyK, true},
-		{"traffic another to K", false, down, yggTraffic, keyA, keyK, false},
-		{"traffic N to another, through K", false, down, yggTraffic, keyN, keyA, false},
-		{"pathNotify N to K", false, down, yggPathNotify, keyN, keyK, true},
-		{"pathNotify another to K", false, down, yggPathNotify, keyA, keyK, false},
-		{"pathBroken of K's traffic to N, back to K", false, down, yggPathBroken, keyK, keyN, true},
-		{"pathBroken of N's traffic to K", false, down, yggPathBroken, keyN, keyK, false},
-		{"pathBroken of K's traffic to another", false, down, yggPathBroken, keyK, keyA, false},
+		{"traffic K to N", noGroup, up, yggTraffic, keyK, keyN, true},
+		{"traffic K to another", noGroup, up, yggTraffic, keyK, keyA, false},
+		{"traffic forging N", noGroup, up, yggTraffic, keyN, keyA, false},
+		{"traffic forging N to N", noGroup, up, yggTraffic, keyN, keyN, false},
+		{"traffic forging another", noGroup, up, yggTraffic, keyA, keyN, false},
+		{"traffic K to K", noGroup, up, yggTraffic, keyK, keyK, false},
+		{"pathNotify K to N", noGroup, up, yggPathNotify, keyK, keyN, true},
+		{"pathNotify K to another", noGroup, up, yggPathNotify, keyK, keyA, false},
+		{"pathBroken of N's traffic to K, back to N", noGroup, up, yggPathBroken, keyN, keyK, true},
+		{"pathBroken of K's traffic to N", noGroup, up, yggPathBroken, keyK, keyN, false},
+		{"pathBroken of another's traffic", noGroup, up, yggPathBroken, keyA, keyK, false},
+		{"traffic N to K", noGroup, down, yggTraffic, keyN, keyK, true},
+		{"traffic another to K", noGroup, down, yggTraffic, keyA, keyK, false},
+		{"traffic N to another, through K", noGroup, down, yggTraffic, keyN, keyA, false},
+		{"pathNotify N to K", noGroup, down, yggPathNotify, keyN, keyK, true},
+		{"pathNotify another to K", noGroup, down, yggPathNotify, keyA, keyK, false},
+		{"pathBroken of K's traffic to N, back to K", noGroup, down, yggPathBroken, keyK, keyN, true},
+		{"pathBroken of N's traffic to K", noGroup, down, yggPathBroken, keyN, keyK, false},
+		{"pathBroken of K's traffic to another", noGroup, down, yggPathBroken, keyK, keyA, false},
 		// A lookup: from the client, its source K; to the client, the node's
 		// own, for K (its key, or one from its address, iw:
 		// pathfinder.go:62-64).
-		{"pathLookup K for N", false, up, yggPathLookup, keyK, keyN, true},
-		{"pathLookup K for another", false, up, yggPathLookup, keyK, keyA, true},
-		{"pathLookup forging N", false, up, yggPathLookup, keyN, keyK, false},
-		{"pathLookup forging another", false, up, yggPathLookup, keyA, keyN, false},
-		{"pathLookup N for K", false, down, yggPathLookup, keyN, keyK, true},
-		{"pathLookup N for K's address", false, down, yggPathLookup, keyN, [32]byte(address.AddrForKey(keyK[:]).GetKey()), true},
-		{"pathLookup N for K's subnet", false, down, yggPathLookup, keyN, [32]byte(address.SubnetForKey(keyK[:]).GetKey()), true},
-		{"pathLookup N for another", false, down, yggPathLookup, keyN, keyA, false},
-		{"pathLookup N for another's address", false, down, yggPathLookup, keyN, [32]byte(address.AddrForKey(keyA[:]).GetKey()), false},
-		{"pathLookup another for K", false, down, yggPathLookup, keyA, keyK, false},
-		{"pathLookup another for N", false, down, yggPathLookup, keyA, keyN, false},
+		{"pathLookup K for N", noGroup, up, yggPathLookup, keyK, keyN, true},
+		{"pathLookup K for another", noGroup, up, yggPathLookup, keyK, keyA, true},
+		{"pathLookup forging N", noGroup, up, yggPathLookup, keyN, keyK, false},
+		{"pathLookup forging another", noGroup, up, yggPathLookup, keyA, keyN, false},
+		{"pathLookup N for K", noGroup, down, yggPathLookup, keyN, keyK, true},
+		{"pathLookup N for K's address", noGroup, down, yggPathLookup, keyN, [32]byte(address.AddrForKey(keyK[:]).GetKey()), true},
+		{"pathLookup N for K's subnet", noGroup, down, yggPathLookup, keyN, [32]byte(address.SubnetForKey(keyK[:]).GetKey()), true},
+		{"pathLookup N for another", noGroup, down, yggPathLookup, keyN, keyA, false},
+		{"pathLookup N for another's address", noGroup, down, yggPathLookup, keyN, [32]byte(address.AddrForKey(keyA[:]).GetKey()), false},
+		{"pathLookup another for K", noGroup, down, yggPathLookup, keyA, keyK, false},
+		{"pathLookup another for N", noGroup, down, yggPathLookup, keyA, keyN, false},
 		// With groups: K and G in one, A in another, N in none.
-		{"group: traffic K to G", true, up, yggTraffic, keyK, keyG, true},
-		{"group: traffic G to N, through K", true, up, yggTraffic, keyG, keyN, true},
-		{"group: traffic K to A", true, up, yggTraffic, keyK, keyA, false},
-		{"group: traffic A to N, through K", true, up, yggTraffic, keyA, keyN, false},
-		{"group: traffic G to K", true, down, yggTraffic, keyG, keyK, true},
-		{"group: traffic N to G, through K", true, down, yggTraffic, keyN, keyG, true},
-		{"group: traffic A to K", true, down, yggTraffic, keyA, keyK, false},
-		{"group: pathBroken of K's traffic to G, back to K", true, down, yggPathBroken, keyK, keyG, true},
-		{"group: pathBroken of K's traffic to A", true, down, yggPathBroken, keyK, keyA, false},
-		{"group: pathLookup G for N, through K", true, up, yggPathLookup, keyG, keyN, true},
-		{"group: pathLookup A for N, through K", true, up, yggPathLookup, keyA, keyN, false},
-		{"group: pathLookup G for K", true, down, yggPathLookup, keyG, keyK, true},
-		{"group: pathLookup N for G, through K", true, down, yggPathLookup, keyN, keyG, true},
-		{"group: pathLookup G for A, through K", true, down, yggPathLookup, keyG, keyA, false},
-		{"group: pathLookup A for K", true, down, yggPathLookup, keyA, keyK, false},
+		{"group: traffic K to G", inGroups, up, yggTraffic, keyK, keyG, true},
+		{"group: traffic G to N, through K", inGroups, up, yggTraffic, keyG, keyN, true},
+		{"group: traffic K to A", inGroups, up, yggTraffic, keyK, keyA, false},
+		{"group: traffic A to N, through K", inGroups, up, yggTraffic, keyA, keyN, false},
+		{"group: traffic G to K", inGroups, down, yggTraffic, keyG, keyK, true},
+		{"group: traffic N to G, through K", inGroups, down, yggTraffic, keyN, keyG, true},
+		{"group: traffic A to K", inGroups, down, yggTraffic, keyA, keyK, false},
+		{"group: pathBroken of K's traffic to G, back to K", inGroups, down, yggPathBroken, keyK, keyG, true},
+		{"group: pathBroken of K's traffic to A", inGroups, down, yggPathBroken, keyK, keyA, false},
+		{"group: pathLookup G for N, through K", inGroups, up, yggPathLookup, keyG, keyN, true},
+		{"group: pathLookup A for N, through K", inGroups, up, yggPathLookup, keyA, keyN, false},
+		{"group: pathLookup G for K", inGroups, down, yggPathLookup, keyG, keyK, true},
+		{"group: pathLookup N for G, through K", inGroups, down, yggPathLookup, keyN, keyG, true},
+		// A lookup is held to the rule by its source (lan-v1 §2.2): G's for
+		// anyone reaches K, behind which (in its Wi-Fi) the one G looks for
+		// may be; the node's only for what K or its group answers by key.
+		{"group: pathLookup G for A, through K", inGroups, down, yggPathLookup, keyG, keyA, true},
+		{"group: pathLookup G for G's address, through K", inGroups, down, yggPathLookup, keyG, addrG, true},
+		{"group: pathLookup N for A, through K", inGroups, down, yggPathLookup, keyN, keyA, false},
+		{"group: pathLookup N for G's address, through K", inGroups, down, yggPathLookup, keyN, addrG, false},
+		{"group: pathLookup A for K", inGroups, down, yggPathLookup, keyA, keyK, false},
+		{"group: pathLookup A for G, through K", inGroups, down, yggPathLookup, keyA, keyG, false},
+		{"group: pathLookup forging N, for G", inGroups, up, yggPathLookup, keyN, keyG, false},
+		// pathBroken goes back to its source: from K, G's traffic to K's
+		// side, back to G.
+		{"group: pathBroken of G's traffic to K, back to G", inGroups, up, yggPathBroken, keyG, keyK, true},
+		{"group: pathBroken of A's traffic to K, back to A", inGroups, up, yggPathBroken, keyA, keyK, false},
+		{"group: pathBroken of G's traffic to A, back to G", inGroups, up, yggPathBroken, keyG, keyA, false},
+		{"group: pathBroken of A's traffic to G, through K", inGroups, down, yggPathBroken, keyA, keyG, false},
+		{"group: pathNotify G to K", inGroups, down, yggPathNotify, keyG, keyK, true},
+		{"group: pathNotify K to G", inGroups, up, yggPathNotify, keyK, keyG, true},
+		{"group: pathNotify A to K", inGroups, down, yggPathNotify, keyA, keyK, false},
+		// A source forged: only one of K's group passes (behind K, in its
+		// Wi-Fi, it may be), never the node's, never another group's.
+		{"group: traffic forging N to G", inGroups, up, yggTraffic, keyN, keyG, false},
+		{"group: traffic forging A to G", inGroups, up, yggTraffic, keyA, keyG, false},
+		{"group: traffic forging A to K's own side", inGroups, up, yggTraffic, keyA, keyK, false},
+		// K in no group, G and A in one: K reaches only the node, both ways.
+		{"K in none: traffic K to G", notK, up, yggTraffic, keyK, keyG, false},
+		{"K in none: traffic G to K", notK, down, yggTraffic, keyG, keyK, false},
+		{"K in none: traffic forging G to A", notK, up, yggTraffic, keyG, keyA, false},
+		{"K in none: traffic forging G to N", notK, up, yggTraffic, keyG, keyN, false},
+		{"K in none: traffic N to G, through K", notK, down, yggTraffic, keyN, keyG, false},
+		{"K in none: pathNotify G to K", notK, down, yggPathNotify, keyG, keyK, false},
+		{"K in none: pathBroken of K's traffic to G, back to K", notK, down, yggPathBroken, keyK, keyG, false},
+		{"K in none: pathLookup G for K", notK, down, yggPathLookup, keyG, keyK, false},
+		{"K in none: pathLookup forging G, for N", notK, up, yggPathLookup, keyG, keyN, false},
+		{"K in none: traffic K to N", notK, up, yggTraffic, keyK, keyN, true},
+		{"K in none: traffic N to K", notK, down, yggTraffic, keyN, keyK, true},
 	} {
-		r := yggRule{node: keyN, key: keyK, group: noGroup}
-		if c.groups {
-			r.group = inGroups
-		}
-		if got := r.passes(c.fromClient, c.typ, &c.source, &c.dest); got != c.pass {
+		r := yggRule{node: keyN, key: keyK, groups: c.groups}
+		if got := r.passes(r.view(), c.fromClient, c.typ, &c.source, &c.dest); got != c.pass {
 			t.Errorf("%s: passes %v", c.name, got)
 		}
 	}
 	// No group is no group: two keys in none are not in one.
-	r := yggRule{node: keyN, key: keyK, group: func(k *[32]byte) yggGroup { return groups[*k] }}
-	delete(groups, keyK)
+	r := yggRule{node: keyN, key: keyK, groups: func() yggGroups { return yggGroups{keyA: nil} }}
 	a, n := keyA, keyN
-	groups[keyA] = 0
-	if r.passes(true, yggTraffic, &keyK, &a) || !r.passes(true, yggTraffic, &keyK, &n) {
+	if r.passes(r.view(), true, yggTraffic, &keyK, &a) || !r.passes(r.view(), true, yggTraffic, &keyK, &n) {
 		t.Error("two keys without a group pass as one group")
+	}
+	// Two groups of one name are one, as the backend makes them: a reload
+	// gives a name the group it had.
+	relay := newYggRelay(1)
+	u5, again, u6 := relay.group("u5"), relay.group("u5"), relay.group("u6")
+	if u5 != again || u5 == u6 {
+		t.Error("a name's group is not one")
+	}
+
+	// What the node relays, of what passed from K: neither end N; a lookup
+	// not for N, by key or by address.
+	addrN := [32]byte(address.AddrForKey(keyN[:]).GetKey())
+	for _, c := range []struct {
+		name         string
+		typ          byte
+		source, dest [32]byte
+		relayed      bool
+	}{
+		{"traffic K to G", yggTraffic, keyK, keyG, true},
+		{"traffic K to N", yggTraffic, keyK, keyN, false},
+		{"traffic G behind K to N", yggTraffic, keyG, keyN, false},
+		{"pathNotify K to G", yggPathNotify, keyK, keyG, true},
+		{"pathNotify K to N", yggPathNotify, keyK, keyN, false},
+		{"pathBroken of G's traffic to K, back to G", yggPathBroken, keyG, keyK, true},
+		{"pathBroken of N's traffic to K, back to N", yggPathBroken, keyN, keyK, false},
+		{"pathLookup K for G", yggPathLookup, keyK, keyG, true},
+		{"pathLookup K for G's address", yggPathLookup, keyK, addrG, true},
+		{"pathLookup K for N", yggPathLookup, keyK, keyN, false},
+		{"pathLookup K for N's address", yggPathLookup, keyK, addrN, false},
+	} {
+		r := yggRule{node: keyN, key: keyK, groups: inGroups}
+		if !r.passes(r.view(), true, c.typ, &c.source, &c.dest) {
+			t.Fatalf("%s: does not pass", c.name)
+		}
+		if got := r.relayed(c.typ, &c.source, &c.dest); got != c.relayed {
+			t.Errorf("%s: relayed %v", c.name, got)
+		}
 	}
 }
 
@@ -280,10 +363,10 @@ func (s *sink) Write(p []byte) (int, error) {
 
 // testFilter is a filter on K's link that writes to sinks; what it injects
 // waits until flushed.
-func testFilter(group func(*[32]byte) yggGroup) (f *yggLinkFilter, core, client *sink, dropped *atomic.Uint64) {
+func testFilter(groups func() yggGroups) (f *yggLinkFilter, core, client *sink, dropped *atomic.Uint64) {
 	dropped = new(atomic.Uint64)
 	core, client = &sink{}, &sink{}
-	f = newYggLinkFilter(yggRule{node: keyN, key: keyK, group: group}, dropped, core, client)
+	f = newYggLinkFilter(yggRule{node: keyN, key: keyK, groups: groups}, dropped, core, client)
 	return f, core, client, dropped
 }
 
@@ -533,7 +616,7 @@ func TestNekoServerYggLinkFilterAnswers(t *testing.T) {
 	// written: the client is not left waiting (the mark comes first).
 	var answered *yggLinkFilter
 	hook := hookWriter(func() { _ = answered.client.write(ka) })
-	answered = newYggLinkFilter(yggRule{node: keyN, key: keyK, group: noGroup}, new(atomic.Uint64), hook, &sink{})
+	answered = newYggLinkFilter(yggRule{node: keyN, key: keyK, groups: noGroup}, new(atomic.Uint64), hook, &sink{})
 	_ = answered.copy(&answered.core, &chunks{b: iwFrame(iwTraffic(nil, nil, keyK, keyN, 0, nil)), n: 100}, true)
 	if answered.client.waits.Load() {
 		t.Fatal("answered during the write, yet the client waits")
@@ -564,13 +647,7 @@ func TestNekoServerYggLinkFilterAnswers(t *testing.T) {
 		}
 	}
 	// To a group's key (G with K), the watermark stays.
-	groups := func(k *[32]byte) yggGroup {
-		if *k == keyK || *k == keyG {
-			return 1
-		}
-		return 0
-	}
-	f, core, _, _ = testFilter(groups)
+	f, core, _, _ = testFilter(testGroups(keyK, keyG))
 	toG := iwFrame(iwTraffic(nil, nil, keyK, keyG, 9, nil))
 	if f.testUp(&chunks{b: toG, n: 100}); !bytes.Equal(core.Bytes(), toG) {
 		t.Errorf("traffic to G: the core got %x", core.Bytes())
@@ -830,7 +907,7 @@ func BenchmarkYggLinkFilter(b *testing.B) {
 			})
 			b.Run(name+"/filter", func(b *testing.B) {
 				var dropped atomic.Uint64
-				f := newYggLinkFilter(yggRule{node: keyN, key: keyK, group: noGroup}, &dropped, discard{}, discard{})
+				f := newYggLinkFilter(yggRule{node: keyN, key: keyK, groups: noGroup}, &dropped, discard{}, discard{})
 				b.SetBytes(int64(len(stream)))
 				b.ReportAllocs()
 				for b.Loop() {
@@ -881,17 +958,15 @@ func TestNekoServerYggFrameIronwoodFilter(t *testing.T) {
 			n := &iwNet{t: t}
 			N, A, B := n.node(keys[0]), n.node(keys[1]), n.node(keys[2])
 			kn, ka, kb := [32]byte(iwKey(N)), [32]byte(iwKey(A)), [32]byte(iwKey(B))
-			group := func(k *[32]byte) yggGroup {
-				if c.groups && (*k == ka || *k == kb) {
-					return 1
-				}
-				return 0
+			group := noGroup
+			if c.groups {
+				group = testGroups(ka, kb)
 			}
 			var droppedA, droppedB atomic.Uint64
 			ca, cb := iwClient{}, iwClient{lie: yggAllOnes}
 			if c.filter {
-				ca.filter = &yggLinkFilter{rule: yggRule{node: kn, key: ka, group: group}, dropped: &droppedA}
-				cb.filter = &yggLinkFilter{rule: yggRule{node: kn, key: kb, group: group}, dropped: &droppedB}
+				ca.filter = &yggLinkFilter{rule: yggRule{node: kn, key: ka, groups: group}, dropped: &droppedA}
+				cb.filter = &yggLinkFilter{rule: yggRule{node: kn, key: kb, groups: group}, dropped: &droppedB}
 			}
 			n.link(A, N, ca)
 			n.link(B, N, cb)
@@ -984,7 +1059,7 @@ func (o *overlapping) Write(p []byte) (int, error) {
 func TestNekoServerYggLinkFilterWritesWhole(t *testing.T) {
 	client := &overlapping{}
 	var dropped atomic.Uint64
-	f := newYggLinkFilter(yggRule{node: keyN, key: keyK, group: noGroup}, &dropped, discard{}, client)
+	f := newYggLinkFilter(yggRule{node: keyN, key: keyK, groups: noGroup}, &dropped, discard{}, client)
 	defer f.close()
 	go f.client.run(f.done)
 	toK := iwFrame(iwTraffic(nil, nil, keyN, keyK, 1, make([]byte, 100)))
@@ -1024,5 +1099,124 @@ func TestNekoServerYggLinkFilterWritesWhole(t *testing.T) {
 	}
 	if passed != 2000 || keepalives == 0 {
 		t.Fatalf("%d frames passed, %d keepalives", passed, keepalives)
+	}
+}
+
+// steps reads its parts one per Read, each after its hook: a reload
+// between two reads of a link.
+type steps []struct {
+	before func()
+	b      []byte
+}
+
+func (s *steps) Read(p []byte) (int, error) {
+	if len(*s) == 0 {
+		return 0, io.EOF
+	}
+	step := &(*s)[0]
+	if step.before != nil {
+		step.before()
+		step.before = nil
+	}
+	n := copy(p, step.b)
+	if step.b = step.b[n:]; len(step.b) == 0 {
+		*s = (*s)[1:]
+	}
+	return n, nil
+}
+
+// The relay on K's link (lan-v1 §4.4): frames of K's that the node relays
+// within its group, neither end N, are charged to the group's bucket as
+// they go into the core, by their length (type and body), once; over the
+// rate dropped and answered as any dropped frame of the client's. Frames
+// to or from N are not charged, nor frames to the client (charged where
+// they came in). At 0 nothing is relayed. A reload shows at the next read.
+func TestNekoServerYggLinkFilterRelay(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	var sig [64]byte
+	addrN := [32]byte(address.AddrForKey(keyN[:]).GetKey())
+	addrG := [32]byte(address.AddrForKey(keyG[:]).GetKey())
+	payload := make([]byte, 40_000)
+	toN := iwTraffic(nil, nil, keyK, keyN, 0, payload)
+	toG := iwTraffic(nil, nil, keyK, keyG, 1, payload)
+	notifyG := iwNotify(nil, 1, keyK, keyG, 1, nil, sig)
+	lookupN, lookupAddrN := iwLookup(keyK, keyN, 1), iwLookup(keyK, addrN, 1)
+	lookupAddrG := iwLookup(keyK, addrG, 1)
+
+	// 2.5 Mbit/s: 312500 bytes a second, the burst.
+	relay := newYggRelay(2)
+	relay.rate = 312_500
+	relay.now = func() time.Time { return now }
+	u1, u2 := relay.group("u1"), relay.group("u2")
+	groups := yggGroups{keyK: u1, keyG: u1, keyA: u2}
+	f, core, client, dropped := testFilter(func() yggGroups { return groups })
+
+	// Up: N's frames free, the lookup for N by its address too; the
+	// neighbour's charged, 7 of 40 kB fit the burst; the lookup for G's
+	// address and the pathNotify to G charged.
+	var up []byte
+	for range 3 {
+		up = append(up, iwFrame(toN)...)
+	}
+	up = slices.Concat(up, iwFrame(lookupN), iwFrame(lookupAddrN), iwFrame(lookupAddrG), iwFrame(notifyG))
+	for range 10 {
+		up = append(up, iwFrame(toG)...)
+	}
+	if err := f.testUp(&chunks{b: up, n: 5000}); err != io.EOF {
+		t.Fatal(err)
+	}
+	charged := len(lookupAddrG) + len(notifyG) + 7*len(toG)
+	if relay.frames.Load() != 9 || relay.dropped.Load() != 3 || relay.bytes.Load() != uint64(charged) || u1.up.Load() != int64(charged) || dropped.Load() != 0 {
+		t.Fatalf("relayed %d frames, %d bytes (u1 %d), dropped over the rate %d, by the rule %d; want 9, %d, 3, 0",
+			relay.frames.Load(), relay.bytes.Load(), u1.up.Load(), relay.dropped.Load(), dropped.Load(), charged)
+	}
+	if want := 3*len(iwFrame(toN)) + len(iwFrame(lookupN)) + len(iwFrame(lookupAddrN)) + len(iwFrame(lookupAddrG)) + len(iwFrame(notifyG)) + 7*len(iwFrame(toG)); core.Len() != want {
+		t.Fatalf("the core got %d bytes, want %d", core.Len(), want)
+	}
+	if !bytes.Equal(client.Bytes(), yggKeepAliveFrame) {
+		t.Fatalf("the client's answer to its dropped frames: %x", client.Bytes())
+	}
+
+	// Down: G's traffic to K and N's, the bucket empty: nothing charged.
+	before := relay.frames.Load() + relay.dropped.Load()
+	down := slices.Concat([]byte("meta\x00\x00"), iwFrame(iwTraffic(nil, nil, keyG, keyK, 1, payload)),
+		iwFrame(iwTraffic(nil, nil, keyN, keyK, 1, payload)), iwFrame(iwLookup(keyG, keyK)))
+	client.Reset()
+	if err := f.testDown(&chunks{b: down, n: 5000}); err != io.EOF || client.Len() != len(down) {
+		t.Fatalf("down: %v, %d bytes of %d", err, client.Len(), len(down))
+	}
+	if relay.frames.Load()+relay.dropped.Load() != before {
+		t.Fatal("frames to the client charged")
+	}
+
+	// A second later the bucket is full again; the next read sees K moved
+	// to u2 (with A), then out of any group: K to G goes by the rule, then
+	// to A by u2's bucket; with no group, K reaches N only.
+	now = now.Add(time.Second)
+	core.Reset()
+	f, core, _, dropped = testFilter(func() yggGroups { return groups })
+	toA := iwTraffic(nil, nil, keyK, keyA, 1, payload)
+	s := &steps{
+		{nil, iwFrame(toG)},
+		{func() { groups = yggGroups{keyK: u2, keyG: u1, keyA: u2} }, slices.Concat(iwFrame(toG), iwFrame(toA))},
+		{func() { groups = yggGroups{keyG: u1, keyA: u2} }, slices.Concat(iwFrame(toA), iwFrame(toN))},
+	}
+	if err := f.testUp(s); err != io.EOF {
+		t.Fatal(err)
+	}
+	if want := slices.Concat(iwFrame(toG), iwFrame(toA), iwFrame(toN)); !bytes.Equal(core.Bytes(), want) || dropped.Load() != 2 ||
+		u1.up.Load() != int64(charged+len(toG)) || u2.up.Load() != int64(len(toA)) {
+		t.Fatalf("across reloads: the core got %d bytes, dropped %d, u1 %d, u2 %d", core.Len(), dropped.Load(), u1.up.Load(), u2.up.Load())
+	}
+
+	// lan_relay_mbps 0: nothing between neighbours, the node as before.
+	off := newYggRelay(0)
+	g := off.group("u1")
+	f, core, _, dropped = testFilter(func() yggGroups { return yggGroups{keyK: g, keyG: g} })
+	if err := f.testUp(&chunks{b: slices.Concat(iwFrame(toG), iwFrame(notifyG), iwFrame(lookupAddrG), iwFrame(toN), iwFrame(lookupAddrN)), n: 7000}); err != io.EOF {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(core.Bytes(), slices.Concat(iwFrame(toN), iwFrame(lookupAddrN))) || off.dropped.Load() != 3 || dropped.Load() != 0 || g.up.Load() != 0 {
+		t.Fatalf("relay 0: the core got %d bytes, dropped over the rate %d, by the rule %d", core.Len(), off.dropped.Load(), dropped.Load())
 	}
 }
