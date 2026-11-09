@@ -24,7 +24,7 @@ import (
 	qtls "github.com/sagernet/sing-quic"
 	"github.com/sagernet/sing-quic/hysteria"
 	"github.com/sagernet/sing-quic/hysteria2"
-	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/bufio"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -77,7 +77,21 @@ func readHy2Users(path string) ([]string, []string, error) {
 // hysteriaIdle is the Hysteria2 listener's QUIC idle timeout.
 const hysteriaIdle = 60 * time.Second
 
+// hy2MaxStreams is how many streams (TCP requests) one QUIC connection may
+// have open at once (raycontrol conn-limit-v1 §3.2); sing-quic's own is
+// 2^60. A client opens a stream without waiting, and one past the
+// connection's limit fails the whole connection ("too many open streams"):
+// so this is above a user's limit of TCP at once (1024), which answers
+// first, with its reason. With the limits off, it alone bounds a connection.
+const hy2MaxStreams = 2048
+
 func runHysteria(ctx context.Context, c *BackendConfig, conn *packetConn, log *Logger, dial dialFunc) error {
+	return runHysteriaWith(ctx, c, conn, log, dial, newHyLimits())
+}
+
+// runHysteriaWith is runHysteria with the backend's limits given (tests:
+// their numbers and clock).
+func runHysteriaWith(ctx context.Context, c *BackendConfig, conn *packetConn, log *Logger, dial dialFunc, lim *hyLimits) error {
 	tlsConfig, err := sbtls.NewServer(ctx, nopLogger(), option.InboundTLSOptions{
 		Enabled:          true,
 		ALPN:             []string{"h3"},
@@ -118,7 +132,7 @@ func runHysteria(ctx context.Context, c *BackendConfig, conn *packetConn, log *L
 	// client's keepalive, idle/2), so a client asking for 25 s (Niko 1.28)
 	// gets 25 s and not 15, which saves its battery. A dead connection
 	// without keepalives is closed 30 s later than before.
-	quicOptions := qtls.QUICOptions{IdleTimeout: hysteriaIdle}
+	quicOptions := qtls.QUICOptions{IdleTimeout: hysteriaIdle, MaxConcurrentStreams: hy2MaxStreams}
 	if salamander != "" {
 		quicOptions.InitialPacketSize = 1280 - 8
 	}
@@ -132,7 +146,7 @@ func runHysteria(ctx context.Context, c *BackendConfig, conn *packetConn, log *L
 		SalamanderPassword: salamander,
 		TLSConfig:          tlsConfig,
 		UDPTimeout:         2 * time.Minute,
-		Handler:            &outbound{dial: dial, log: log, probe: c.Options.Probe},
+		Handler:            &outbound{dial: dial, log: log, probe: c.Options.Probe, lim: lim},
 		MasqueradeHandler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Length", "0")
 			w.WriteHeader(http.StatusNotFound)
@@ -199,11 +213,38 @@ func watchUsers(ctx context.Context, path string, reload func() error, check fun
 
 type dialFunc func(ctx context.Context, network, address string) (net.Conn, error)
 
-// outbound takes the users' streams and datagrams out to public addresses.
+// outbound takes the users' streams and datagrams out to public addresses,
+// within each user's limits.
 type outbound struct {
+	// dial reaches one address (no names: those go through the limits'
+	// cache), and refuses one that is not public.
 	dial  dialFunc
 	log   *Logger
 	probe *ProbeRoute
+	// lim are the backend's limits; made at first use when nil (tests).
+	lim     *hyLimits
+	limOnce sync.Once
+}
+
+func (o *outbound) limits() *hyLimits {
+	o.limOnce.Do(func() {
+		if o.lim == nil {
+			o.lim = newHyLimits()
+		}
+	})
+	return o.lim
+}
+
+// streamContext is ctx until the stream's own end as well: a QUIC stream's
+// context ends when its client gives the stream up or the connection goes.
+func streamContext(ctx context.Context, conn net.Conn) (context.Context, func()) {
+	s, ok := common.Cast[interface{ Context() context.Context }](conn)
+	if !ok {
+		return ctx, func() {}
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(s.Context(), cancel)
+	return ctx, func() { stop(); cancel() }
 }
 
 // isProbe reports whether a destination is the probe name.
@@ -212,24 +253,35 @@ func (o *outbound) isProbe(d M.Socksaddr) bool {
 }
 
 func (o *outbound) NewConnectionEx(ctx context.Context, conn net.Conn, _ M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
-	t := trafficFrom(ctx)
+	user, t := userFrom(ctx)
 	defer t.open()()
-	dctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	var out net.Conn
-	var err error
-	if o.isProbe(destination) {
-		// The probe name leads to its address on the node, and only it.
-		var d net.Dialer
-		out, err = d.DialContext(dctx, "tcp", o.probe.Address)
-	} else {
-		out, err = o.dial(dctx, "tcp", destination.String())
+	// The user's limits, before the dial (raycontrol conn-limit-v1 §3.2): a
+	// place among the user's streams, kept until the stream ends; a token
+	// for the attempt, waited for half a second at most and no longer than
+	// the stream lasts; and no debt of failed dials. A refusal goes the
+	// way a dial's failure does, and says "too many connections".
+	wctx, stop := streamContext(ctx, conn)
+	done, kind := o.limits().tcpStart(wctx, user)
+	stop()
+	if kind != "" {
+		o.log.Debugf("too many connections")
+		_ = N.CloseOnHandshakeFailure(conn, onClose, errTooMany)
+		return
 	}
+	defer done()
+	dctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	out, err := o.dialUser(dctx, user, destination)
 	cancel()
 	if err != nil {
 		// The client hears why (Hysteria2's TCP response), not a bare EOF;
 		// the log hears neither where nor why: no destination in it.
-		o.log.Debugf("destination unreachable")
-		_ = N.CloseOnHandshakeFailure(conn, onClose, errors.New(dialReason(err)))
+		reason := dialReason(err)
+		if reason == errTooMany.Error() {
+			o.log.Debugf("too many connections")
+		} else {
+			o.log.Debugf("destination unreachable")
+		}
+		_ = N.CloseOnHandshakeFailure(conn, onClose, errors.New(reason))
 		return
 	}
 	// The answer goes now, not with the destination's first bytes: a
@@ -258,6 +310,10 @@ func (o *outbound) NewConnectionEx(ctx context.Context, conn net.Conn, _ M.Socks
 func dialReason(err error) string {
 	var dns *net.DNSError
 	switch {
+	case errors.Is(err, errTooMany), errors.Is(err, errLookups):
+		// A lookup or one more attempt past the user's limits (Niko
+		// compares the text: it must not change).
+		return errTooMany.Error()
 	case errors.Is(err, syscall.ECONNREFUSED):
 		return "connection refused"
 	case errors.Is(err, syscall.EHOSTUNREACH), errors.Is(err, syscall.ENETUNREACH):
@@ -272,95 +328,6 @@ func dialReason(err error) string {
 		return "timeout"
 	default:
 		return "unreachable"
-	}
-}
-
-func (o *outbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, _ M.Socksaddr, _ M.Socksaddr, onClose N.CloseHandlerFunc) {
-	err := relayUDP(ctx, conn, o)
-	if onClose != nil {
-		onClose(err)
-	}
-}
-
-// relayUDP carries a user's datagrams to and from public addresses and
-// counts their payloads for the user: sent to a destination up, received
-// from one and passed on down.
-func relayUDP(ctx context.Context, conn N.PacketConn, o *outbound) error {
-	t := trafficFrom(ctx)
-	defer t.open()()
-	var probeAddr netip.AddrPort
-	var probeFrom atomic.Pointer[M.Socksaddr] // what the client sent to: replies come from it
-	if o != nil && o.probe != nil {
-		probeAddr, _ = netip.ParseAddrPort(o.probe.Address)
-	}
-	udp, err := net.ListenUDP("udp", nil)
-	if err != nil {
-		conn.Close()
-		return err
-	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	go func() {
-		<-ctx.Done()
-		udp.Close()
-		conn.Close()
-	}()
-	var resolved sync.Map // name -> netip.Addr
-	go func() {
-		defer cancel()
-		b := make([]byte, 65535)
-		for {
-			_ = udp.SetReadDeadline(time.Now().Add(2 * time.Minute))
-			n, from, err := udp.ReadFromUDPAddrPort(b)
-			if err != nil {
-				return
-			}
-			buffer := buf.As(b[:n])
-			// A dual-stack socket reports IPv4 senders as ::ffff:a.b.c.d.
-			sender := netip.AddrPortFrom(from.Addr().Unmap(), from.Port())
-			source := M.SocksaddrFromNetIP(sender)
-			if probeAddr.IsValid() && sender == probeAddr {
-				if p := probeFrom.Load(); p != nil {
-					source = *p
-				}
-			}
-			if err := conn.WritePacket(buffer, source); err != nil {
-				return
-			}
-			t.down.Add(int64(n))
-		}
-	}()
-	for {
-		buffer := buf.NewPacket()
-		destination, err := conn.ReadPacket(buffer)
-		if err != nil {
-			buffer.Release()
-			return err
-		}
-		if probeAddr.IsValid() && o.isProbe(destination) {
-			d := destination
-			probeFrom.Store(&d)
-			if n, err := udp.WriteToUDPAddrPort(buffer.Bytes(), probeAddr); err == nil {
-				t.up.Add(int64(n))
-			}
-			buffer.Release()
-			continue
-		}
-		addr := destination.Addr
-		if destination.IsFqdn() {
-			if a, ok := resolved.Load(destination.Fqdn); ok {
-				addr = a.(netip.Addr)
-			} else if ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", destination.Fqdn); err == nil && len(ips) > 0 {
-				addr = ips[0].Unmap()
-				resolved.Store(destination.Fqdn, addr)
-			}
-		}
-		if addr.IsValid() && (Public(addr) || anyDestination()) {
-			if n, err := udp.WriteToUDPAddrPort(buffer.Bytes(), netip.AddrPortFrom(addr.Unmap(), destination.Port)); err == nil {
-				t.up.Add(int64(n))
-			}
-		}
-		buffer.Release()
 	}
 }
 
