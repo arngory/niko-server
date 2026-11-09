@@ -17,7 +17,8 @@ import (
 // client's link the filter passes the frames between two keys of one
 // group (yggRule), and charges those the node relays between them, neither
 // end the node, to the group's bucket (lan-v1 §4.4): lan_relay_mbps a
-// group, a second's worth of burst. Over it a frame is dropped and TCP
+// group, a second's worth of burst, the largest frame at least (yggBurst).
+// Over it a frame is dropped and TCP
 // inside slows down; at 0 nothing is relayed. What passed counts for
 // raycontrol's traffic limits (traffic-limit-v1 §2.2) by group, on the
 // stats socket's traffic line, as Hysteria2's names do: the relay goes
@@ -39,7 +40,8 @@ var yggLANName = regexp.MustCompile(`^[a-z0-9-]{1,32}$`)
 // until it has relayed nothing for trafficStale since it left, as
 // Hysteria2's names (prune).
 type yggRelay struct {
-	rate  float64 // a group's bytes a second, its burst too; 0: nothing relayed
+	rate  float64 // a group's bytes a second; 0: nothing relayed
+	burst float64 // what a group's bucket holds at most (yggBurst)
 	boot  string  // random at each start, as Hysteria2's
 	now   func() time.Time
 	stale time.Duration // trafficStale when 0 (tests make it short)
@@ -54,7 +56,19 @@ type yggRelay struct {
 func newYggRelay(mbps int) *yggRelay {
 	var b [8]byte
 	_, _ = rand.Read(b[:]) // never fails (Go 1.24)
-	return &yggRelay{rate: float64(mbps) * 1e6 / 8, boot: hex.EncodeToString(b[:]), now: time.Now}
+	rate := float64(mbps) * 1e6 / 8
+	return &yggRelay{rate: rate, burst: yggBurst(rate), boot: hex.EncodeToString(b[:]), now: time.Now}
+}
+
+// yggBurst is what a group's bucket holds at a rate, bytes a second: a
+// second's worth, and never less than the largest frame (type and body,
+// 131070 bytes), so that one always passes at any rate above 0 (at 1
+// Mbit/s a second is 125000 bytes). At 0, nothing.
+func yggBurst(rate float64) float64 {
+	if rate <= 0 {
+		return 0
+	}
+	return max(rate, yggFrameMax)
 }
 
 // group is the group of a name, its bucket full at its first sight.
@@ -71,7 +85,7 @@ func (r *yggRelay) groupOf(name string) *yggLAN {
 		if r.byName == nil {
 			r.byName = map[string]*yggLAN{}
 		}
-		g = &yggLAN{relay: r, tokens: r.rate, last: r.now()}
+		g = &yggLAN{relay: r, tokens: r.burst, last: r.now()}
 		r.byName[name] = g
 	}
 	return g
@@ -140,7 +154,7 @@ type yggLAN struct {
 	relay *yggRelay
 
 	mu     sync.Mutex
-	tokens float64   // bytes; up to a second's worth
+	tokens float64   // bytes; up to the relay's burst
 	last   time.Time // the bucket's last fill: the last frame charged
 
 	up   atomic.Int64
@@ -162,7 +176,7 @@ func (g *yggLAN) pass(size int) bool {
 	if r.rate > 0 {
 		g.mu.Lock()
 		now := r.now()
-		g.tokens = min(r.rate, g.tokens+now.Sub(g.last).Seconds()*r.rate)
+		g.tokens = min(r.burst, g.tokens+now.Sub(g.last).Seconds()*r.rate)
 		g.last = now
 		if ok = g.tokens >= float64(size); ok {
 			g.tokens -= float64(size)

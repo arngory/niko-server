@@ -1145,7 +1145,7 @@ func TestNekoServerYggLinkFilterRelay(t *testing.T) {
 
 	// 2.5 Mbit/s: 312500 bytes a second, the burst.
 	relay := newYggRelay(2)
-	relay.rate = 312_500
+	relay.rate, relay.burst = 312_500, 312_500
 	relay.now = func() time.Time { return now }
 	u1, u2 := relay.group("u1"), relay.group("u2")
 	groups := yggGroups{keyK: u1, keyG: u1, keyA: u2}
