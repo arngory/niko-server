@@ -19,10 +19,11 @@ import (
 // chunks: the filter sends on exactly the frames a reference built from
 // ironwood's framing and decoders and the spec (lanSpec) would, drops as
 // many, charges as many, and ends the link where it would. world picks
-// the groups: K and G in u1 (or, bit 2, G alone in u1 with A, K in none;
-// or, bit 3, A in u2), and the node's public peers (bit 0) with G linked
-// here (bit 1) or not. The relay is unbounded, or (relayOff) 0: then what
-// it charges is dropped too.
+// the groups: K, G and H in u1 (or, bit 2, G, H and A in u1, K in none; or,
+// bit 3, A in u2), and the node's public peers (bit 0) with G (bit 1) and H
+// (bit 4) linked here or not. The relay is unbounded, or (relayOff) 0:
+// then what it charges is dropped too. Each key of a keyed frame, under the
+// core's bloom transform: yggXKey as yggdrasil-go's own.
 func FuzzYggFrames(f *testing.F) {
 	var sig [64]byte
 	addrN := [32]byte(address.AddrForKey(keyN[:]).GetKey())
@@ -52,10 +53,25 @@ func FuzzYggFrames(f *testing.F) {
 		iwLookup(keyN, keyG),
 		iwLookup(keyA, keyK, 3),
 		iwLookup(keyG, keyA, 3),
+		iwTraffic(nil, nil, keyH, keyK, 1, []byte{2}),
+		iwTraffic(nil, []uint64{6}, keyG, keyH, 1, []byte("between two others of K's")),
+		iwTraffic(nil, nil, keyH, keyN, 0, nil),
+		iwNotify(nil, 1, keyK, keyH, 1, []uint64{2}, sig),
+		iwNotify(nil, 1, keyH, keyK, 1, []uint64{2}, sig),
+		iwBroken(nil, 1, keyH, keyG),
+		iwBroken(nil, 1, keyK, keyH),
+		iwLookup(keyH, keyN, 2),
+		iwLookup(keyH, keyG),
+		iwLookup(keyK, keyN, lanPorts(0, lanCoordsMax+1)...),
+		iwLookup(keyG, keyA, lanPorts(0, lanCoordsMax)...),
+		iwLookup(keyN, keyK, lanPorts(0, lanCoordsMax+1)...),
+		iwNotify(nil, 1, keyK, keyN, 1, lanPorts(0, lanCoordsMax+1), sig),
+		iwNotify(lanPorts(0, lanCoordsMax+1), 1, keyN, keyK, 1, nil, sig),
+		iwNotify(lanPorts(0, lanCoordsMax), 1, keyH, keyK, 1, lanPorts(0, lanCoordsMax), sig),
 		{1}, {2, 1, 2}, {5},
 	}
 	for i, fr := range frames {
-		w := uint8(i % 16)
+		w := uint8(i % 32)
 		f.Add(fr, uint16(7), true, false, w)
 		f.Add(iwFrame(fr), uint16(3), false, false, w)
 		f.Add(iwFrame(fr), uint16(5), true, true, w^1)
@@ -65,7 +81,7 @@ func FuzzYggFrames(f *testing.F) {
 	for _, fr := range frames {
 		stream = append(stream, iwFrame(fr)...)
 	}
-	for w := range uint8(16) {
+	for w := range uint8(32) {
 		f.Add(stream, uint16(w*7), w&1 == 0, w&2 == 0, w)
 	}
 	f.Add(append([]byte{0x81, 0x80, 0x00, 1}, bytes.Repeat([]byte{0x80}, 10)...), uint16(1), true, false, uint8(0))
@@ -76,25 +92,30 @@ func FuzzYggFrames(f *testing.F) {
 		if keyed != rkeyed || ok != rok || keyed && ok && (*source != rs || *dest != rd) {
 			t.Fatalf("frame %x: keyed %v ok %v, ironwood %v %v", data, keyed, ok, rkeyed, rok)
 		}
+		for _, k := range [][32]byte{rs, rd} {
+			if keyed && ok && yggXKey(&k) != [32]byte(address.SubnetForKey(k[:]).GetKey()) {
+				t.Fatalf("key %x: the transform %x, yggdrasil-go's %x", k, yggXKey(&k), address.SubnetForKey(k[:]).GetKey())
+			}
+		}
 
 		relay := newYggRelay(1 << 30)
 		if relayOff {
 			relay = newYggRelay(0)
 		}
 		g := relay.group("u1")
-		groups := yggGroups{keyK: g, keyG: g}
-		spec := lanSpec{node: keyN, key: keyK, group: map[[32]byte]string{keyK: "u1", keyG: "u1"}, public: world&1 != 0}
+		groups := yggGroups{keyK: g, keyG: g, keyH: g}
+		spec := lanSpec{node: keyN, key: keyK, group: map[[32]byte]string{keyK: "u1", keyG: "u1", keyH: "u1"}, public: world&1 != 0}
 		switch {
 		case world&4 != 0:
-			groups = yggGroups{keyG: g, keyA: g}
-			spec.group = map[[32]byte]string{keyG: "u1", keyA: "u1"}
+			groups = yggGroups{keyG: g, keyH: g, keyA: g}
+			spec.group = map[[32]byte]string{keyG: "u1", keyH: "u1", keyA: "u1"}
 		case world&8 != 0:
 			groups[keyA] = relay.group("u2")
 			spec.group[keyA] = "u2"
 		}
-		linked := yggKeys{keyK: true, keyG: world&2 != 0}
+		linked := yggKeys{keyK: true, keyG: world&2 != 0, keyH: world&16 != 0}
 		if spec.public {
-			spec.linked = map[[32]byte]bool{keyK: true, keyG: world&2 != 0}
+			spec.linked = map[[32]byte]bool{keyK: true, keyG: world&2 != 0, keyH: world&16 != 0}
 		}
 		rule := yggRule{node: keyN, key: keyK, groups: func() yggGroups { return groups }, public: spec.public,
 			linked: func() yggKeys { return linked }}
@@ -276,15 +297,40 @@ func (s lanSpec) verdict(up bool, typ byte, source, dest [32]byte) yggVerdict {
 		return yggPass
 	case up && !forNode && !(s.public && s.group[s.key] != ""):
 		return yggPass // charged where it goes out
-	case !up && !lookup && from != s.node && s.public && s.linked[from]:
+	case !up && from != s.node && s.public && s.linked[from]:
 		return yggPass // charged where it came in from its link
 	}
 	return yggCharge
 }
 
+// lanCoordsMax is the most ports of a tree's coordinates a frame may carry
+// on a client's link: a lookup's from, a pathNotify's path and info path.
+const lanCoordsMax = 64
+
+// iwRefCoordsFit: a frame's coordinates, as ironwood decodes them, each of
+// lanCoordsMax ports or fewer.
+func iwRefCoordsFit(frame []byte) bool {
+	data := frame[1:]
+	var path, coords []uint64
+	var watermark, seq uint64
+	switch frame[0] {
+	case 6:
+		data = data[64:]
+		iwChopPath(&coords, &data)
+	case 7:
+		iwChopPath(&path, &data)
+		iwChopUint(&watermark, &data)
+		data = data[64:]
+		iwChopUint(&seq, &data)
+		iwChopPath(&coords, &data)
+	}
+	return len(path) <= lanCoordsMax && len(coords) <= lanCoordsMax
+}
+
 // iwRefFilter is the filter as ironwood frames a stream and the spec rules
 // on it: what it would send on (a frame of the client's to the node with
-// its watermark 0, in as many bytes), how many it would drop, and whether
+// its watermark 0, in as many bytes), how many it would drop (by the spec,
+// or for coordinates over lanCoordsMax ports), and whether
 // the core would end the link; and, before a flush, the answers to the
 // dropped frames (yggLinkFilter.answer): pings, to the copy's own end (the
 // client), and the answers to the other end, the client's keepalive or the
@@ -363,6 +409,9 @@ func iwRefFilter(stream []byte, spec lanSpec, fromClient, relayOff bool) (out, p
 		verdict := yggPass
 		if keyed {
 			verdict = spec.verdict(fromClient, frame[0], source, dest)
+		}
+		if keyed && !iwRefCoordsFit(frame) {
+			verdict = yggDrop
 		}
 		if verdict == yggDrop {
 			dropped++

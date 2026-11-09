@@ -75,6 +75,7 @@ var (
 	keyK    = [32]byte{0: 'K', 31: 2}
 	keyA    = [32]byte{0: 'A', 31: 3}
 	keyG    = [32]byte{0: 'G', 31: 4}
+	keyH    = [32]byte{0: 'H', 31: 5}
 	noGroup = func() yggGroups { return nil }
 )
 
@@ -299,7 +300,7 @@ func TestNekoServerYggRule(t *testing.T) {
 		{"group: traffic forging A to K's own side", inGroups, up, yggTraffic, keyA, keyK, drop, false, nil},
 		// With public peers: what K sends a neighbour is charged as it comes
 		// in, as it may leave through them; then what comes to K from a key
-		// linked here was charged where it came in. Lookups each copy.
+		// linked here, a lookup too, was charged where it came in.
 		{"public: traffic K to G", inGroups, up, yggTraffic, keyK, keyG, charge, true, linkedG},
 		{"public: pathLookup K for G", inGroups, up, yggPathLookup, keyK, keyG, charge, true, linkedG},
 		{"public: pathLookup K for A", inGroups, up, yggPathLookup, keyK, keyA, charge, true, linkedG},
@@ -309,7 +310,9 @@ func TestNekoServerYggRule(t *testing.T) {
 		{"public: traffic G linked to K", inGroups, down, yggTraffic, keyG, keyK, pass, true, linkedG},
 		{"public: traffic G not linked to K", inGroups, down, yggTraffic, keyG, keyK, charge, true, yggKeys{keyK: true}},
 		{"public: pathBroken of K's traffic to G linked, back to K", inGroups, down, yggPathBroken, keyK, keyG, pass, true, linkedG},
-		{"public: pathLookup G linked for K", inGroups, down, yggPathLookup, keyG, keyK, charge, true, linkedG},
+		{"public: pathLookup G linked for K", inGroups, down, yggPathLookup, keyG, keyK, pass, true, linkedG},
+		{"public: pathLookup G not linked for K", inGroups, down, yggPathLookup, keyG, keyK, charge, true, yggKeys{keyK: true}},
+		{"public: pathLookup G linked for N, to K", inGroups, down, yggPathLookup, keyG, keyN, drop, true, linkedG},
 		{"public: traffic N to G, through K", inGroups, down, yggTraffic, keyN, keyG, charge, true, yggKeys{keyN: true, keyG: true}},
 		{"public: traffic N to K", inGroups, down, yggTraffic, keyN, keyK, pass, true, linkedG},
 		{"public: K in none, pathLookup K for A", notK, up, yggPathLookup, keyK, keyA, pass, true, linkedG},
@@ -366,6 +369,125 @@ func testSpec(groups func() yggGroups, public bool, linked yggKeys) lanSpec {
 // String names a verdict in the tests' messages.
 func (v yggVerdict) String() string {
 	return [...]string{yggDrop: "drop", yggPass: "pass", yggCharge: "charge"}[v]
+}
+
+// The core's bloom transform made without allocating, against yggdrasil-go's
+// own: keys of zeros and of ones, every count of leading zeros, random keys,
+// and the keys of an address and a subnet, which are the key's own under it.
+func TestYggXKey(t *testing.T) {
+	check := func(k [32]byte) {
+		t.Helper()
+		if got, want := yggXKey(&k), [32]byte(address.SubnetForKey(k[:]).GetKey()); got != want {
+			t.Fatalf("key %x: %x, want %x", k, got, want)
+		}
+	}
+	var zeros, ones [32]byte
+	for i := range ones {
+		ones[i] = 0xff
+	}
+	check(zeros)
+	check(ones)
+	for z := 0; z <= 256; z++ {
+		for range 50 {
+			var k [32]byte
+			rand.Read(k[:])
+			for i := range z {
+				k[i/8] &^= 0x80 >> (i % 8)
+			}
+			if z < 256 {
+				k[z/8] |= 0x80 >> (z % 8)
+			}
+			check(k)
+		}
+	}
+	for range 10000 {
+		var k [32]byte
+		rand.Read(k[:])
+		check(k)
+		addr, subnet := [32]byte(address.AddrForKey(k[:]).GetKey()), [32]byte(address.SubnetForKey(k[:]).GetKey())
+		if !yggAnswers(&addr, &k) || !yggAnswers(&subnet, &k) {
+			t.Fatalf("key %x: its address or subnet not answered", k)
+		}
+	}
+	k := keyN
+	if n := testing.AllocsPerRun(100, func() { _ = yggXKey(&k) }); n != 0 {
+		t.Errorf("%v allocations", n)
+	}
+	// A rule's own keys, transformed once (prepare) or not at all yet: the
+	// same answers.
+	r := yggRule{node: keyN, key: keyK, groups: noGroup}
+	addrN, addrK := [32]byte(address.AddrForKey(keyN[:]).GetKey()), [32]byte(address.AddrForKey(keyK[:]).GetKey())
+	for range 2 {
+		if !r.forNode(&addrN) || r.forNode(&addrK) || !r.answers(&addrK) || r.answers(&addrN) {
+			t.Fatalf("prepared %v: whom a lookup is for, wrong", r.xNode != [32]byte{})
+		}
+		r.prepare()
+	}
+	// A filter's rule is prepared: its lookups never transform N's or K's
+	// key again.
+	f := newYggLinkFilter(yggRule{node: keyN, key: keyK, groups: noGroup}, new(atomic.Uint64), discard{}, discard{})
+	if f.rule.xNode != yggXKey(&keyN) || f.rule.xKey != yggXKey(&keyK) {
+		t.Error("a filter's rule not prepared")
+	}
+}
+
+// yggPathMax on a client's link, either way: a lookup's from, a
+// pathNotify's path and info path of 64 ports pass, of 65 are dropped,
+// counted and answered; the end of a path in two bytes is an end; traffic's
+// paths are not coordinates and are not held to it.
+func TestNekoServerYggPathMax(t *testing.T) {
+	var sig [64]byte
+	ports := func(n int) []uint64 { return lanPorts(0, n) }
+	long := ports(yggPathMax + 1)
+	endInTwo := append(append([]byte{yggPathLookup}, keyK[:]...), keyN[:]...)
+	for range yggPathMax {
+		endInTwo = append(endInTwo, 1)
+	}
+	endInTwo = append(endInTwo, 0x80, 0x00)
+	for _, c := range []struct {
+		name  string
+		up    bool
+		frame []byte
+		pass  bool
+	}{
+		{"K's lookup for N, a from of 64", true, iwLookup(keyK, keyN, ports(yggPathMax)...), true},
+		{"K's lookup for N, a from of 65", true, iwLookup(keyK, keyN, long...), false},
+		{"K's lookup for another, a from of 65", true, iwLookup(keyK, keyA, long...), false},
+		{"K's lookup, 64 ports, the end in two bytes", true, endInTwo, true},
+		{"K's pathNotify to N, both paths of 64", true, iwNotify(ports(yggPathMax), 1, keyK, keyN, 1, ports(yggPathMax), sig), true},
+		{"K's pathNotify to N, an info path of 65", true, iwNotify(nil, 1, keyK, keyN, 1, long, sig), false},
+		{"K's pathNotify to N, a path of 65", true, iwNotify(long, 1, keyK, keyN, 1, nil, sig), false},
+		{"K's traffic to N, paths of 65", true, iwTraffic(long, long, keyK, keyN, 0, nil), true},
+		{"N's lookup for K, a from of 64", false, iwLookup(keyN, keyK, ports(yggPathMax)...), true},
+		{"N's lookup for K, a from of 65", false, iwLookup(keyN, keyK, long...), false},
+		{"N's pathNotify to K, an info path of 65", false, iwNotify(nil, 1, keyN, keyK, 1, long, sig), false},
+		{"N's traffic to K, paths of 65", false, iwTraffic(long, long, keyN, keyK, 1, nil), true},
+	} {
+		f, core, client, dropped := testFilter(noGroup)
+		// Where the frame goes, and what its sender gets if it is dropped:
+		// up, the core and the client's keepalive; down, the client and its
+		// ping (after the core's handshake).
+		var err error
+		var out []byte
+		answered := false
+		if c.up {
+			err = f.testUp(&chunks{b: iwFrame(c.frame), n: 100})
+			out, answered = core.Bytes(), bytes.Equal(client.Bytes(), yggKeepAliveFrame)
+		} else {
+			err = f.testDown(&chunks{b: slices.Concat([]byte("meta\x00\x00"), iwFrame(c.frame)), n: 100})
+			if out = client.Bytes()[6:]; bytes.Equal(out, iwFrame(iwBroken(nil, 0, keyN, keyK))) {
+				answered, out = true, nil // the ping, all that came
+			}
+		}
+		switch {
+		case err != io.EOF:
+			t.Errorf("%s: %v", c.name, err)
+		case c.pass && (dropped.Load() != 0 || len(out) != len(iwFrame(c.frame))):
+			t.Errorf("%s: dropped (%d), %d bytes of %d went on", c.name, dropped.Load(), len(out), len(iwFrame(c.frame)))
+		case !c.pass && (dropped.Load() != 1 || len(out) != 0 || !answered):
+			t.Errorf("%s: dropped %d, %d bytes went on, answered %v", c.name, dropped.Load(), len(out), answered)
+		}
+	}
 }
 
 // chunks reads at most n bytes a time, as a TLS record or a socket gives
@@ -711,6 +833,7 @@ type iwSeen struct {
 	keyed, ok    bool
 	source, dest [32]byte
 	size         int // the frame's type and body
+	coords       int // the most ports of its coordinates (a lookup's from, a pathNotify's path or info path)
 }
 
 func (n *iwNet) node(key ed25519.PrivateKey) *iwn.PacketConn {
@@ -828,7 +951,7 @@ func (n *iwNet) relay(src, dst net.Conn, from, to ed25519.PublicKey, lie func([]
 		if lie != nil {
 			frame = lie(frame)
 		}
-		seen := iwSeen{from: from, to: to, typ: frame[0], size: len(frame)}
+		seen := iwSeen{from: from, to: to, typ: frame[0], size: len(frame), coords: iwCoords(frame)}
 		source, dest, keyed, ok := yggFrameKeys(frame)
 		seen.keyed, seen.ok = keyed, ok
 		if keyed && ok {
@@ -841,6 +964,30 @@ func (n *iwNet) relay(src, dst net.Conn, from, to ed25519.PublicKey, lie func([]
 			return
 		}
 	}
+}
+
+// iwCoords is the most ports of a frame's coordinates, as ironwood decodes
+// them: a lookup's from, a pathNotify's path and info path; 0 for any other
+// frame, or one that does not decode.
+func iwCoords(frame []byte) int {
+	if _, _, keyed, ok := iwRefKeys(frame); !keyed || !ok {
+		return 0
+	}
+	data := frame[1:]
+	var path, coords []uint64
+	var u uint64
+	switch frame[0] {
+	case yggPathLookup:
+		data = data[64:]
+		iwChopPath(&coords, &data)
+	case yggPathNotify:
+		iwChopPath(&path, &data)
+		iwChopUint(&u, &data)
+		data = data[64:]
+		iwChopUint(&u, &data)
+		iwChopPath(&coords, &data)
+	}
+	return max(len(path), len(coords))
 }
 
 // up: the link that a (its first end) is on has not ended, at either end.
@@ -999,6 +1146,45 @@ func BenchmarkYggLinkFilterLAN(b *testing.B) {
 			for b.Loop() {
 				_ = f.copy(dst, &chunks{b: stream, n: 16 << 10}, c.fromClient)
 			}
+			if dropped.Load() != 0 {
+				b.Fatalf("%d frames dropped", dropped.Load())
+			}
+		})
+	}
+}
+
+// BenchmarkYggLinkFilterLookups: the filter on lookups, each with a from of
+// 3 ports as ironwood makes them, read 16 KiB at a time: K's own (in a
+// group or not), a neighbour's for N through K, the node's for K and for
+// a neighbour, a neighbour's for another to K (charged, unbounded).
+func BenchmarkYggLinkFilterLookups(b *testing.B) {
+	for _, c := range []struct {
+		name         string
+		fromClient   bool
+		source, dest [32]byte
+		groups       func() yggGroups
+	}{
+		{"up/none/K's", true, keyK, keyA, noGroup},
+		{"up/grouped/K's", true, keyK, keyA, testGroups()},
+		{"up/grouped/G's for N", true, keyG, keyN, testGroups()},
+		{"down/none/N's for K", false, keyN, keyK, noGroup},
+		{"down/grouped/N's for G", false, keyN, keyG, testGroups()},
+		{"down/grouped/G's for another", false, keyG, keyA, testGroups()},
+	} {
+		frame := iwFrame(iwLookup(c.source, c.dest, 3, 1, 2))
+		stream := bytes.Repeat(frame, (64<<10)/len(frame))
+		b.Run(c.name, func(b *testing.B) {
+			var dropped atomic.Uint64
+			f := newYggLinkFilter(yggRule{node: keyN, key: keyK, groups: c.groups}, &dropped, discard{}, discard{})
+			dst := &f.client
+			if c.fromClient {
+				dst = &f.core
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				_ = f.copy(dst, &chunks{b: stream, n: 16 << 10}, c.fromClient)
+			}
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/float64(len(stream)/len(frame)), "ns/frame")
 			if dropped.Load() != 0 {
 				b.Fatalf("%d frames dropped", dropped.Load())
 			}
@@ -1408,8 +1594,8 @@ func TestNekoServerYggLinkFilterRelay(t *testing.T) {
 
 	// Public peers: what K sends a neighbour may leave through one, past
 	// every client: charged as it comes in. What comes to K from a key
-	// linked here was charged where it came in from its link; from one not
-	// linked (on the public mesh), here. A lookup each copy.
+	// linked here, a lookup too, was charged where it came in from its link;
+	// from one not linked (on the public mesh), here.
 	for _, gLinked := range []bool{true, false} {
 		open := newYggRelay(1 << 30)
 		g := open.group("u1")
@@ -1419,9 +1605,9 @@ func TestNekoServerYggLinkFilterRelay(t *testing.T) {
 		_ = f.testUp(&chunks{b: slices.Concat(iwFrame(toG), iwFrame(kLookupAddrG), iwFrame(toN), iwFrame(kLookupN)), n: 7000})
 		upCharged := g.up.Load()
 		_ = f.testDown(&chunks{b: slices.Concat(meta, iwFrame(gToK), iwFrame(gLookupAddrG), iwFrame(nNotifyG), iwFrame(nToK)), n: 7000})
-		want := len(gLookupAddrG) + len(nNotifyG)
+		want := len(nNotifyG)
 		if !gLinked {
-			want += len(gToK)
+			want += len(gToK) + len(gLookupAddrG)
 		}
 		if upCharged != int64(len(toG)+len(kLookupAddrG)) || g.up.Load()-upCharged != int64(want) {
 			t.Errorf("public peers, G linked %v: charged %d up, %d down; want %d, %d",

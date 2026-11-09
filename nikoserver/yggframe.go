@@ -3,14 +3,12 @@
 package nikoserver
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"io"
+	"math/bits"
 	"sync"
 	"sync/atomic"
-
-	"github.com/yggdrasil-network/yggdrasil-go/src/address"
 )
 
 // The frame filter on a client's link (raycontrol docs/spec/lan-v1.md §2.2).
@@ -33,9 +31,15 @@ import (
 //     and on which ports, never whose. The occupancy v0.15.0 hid for frames
 //     to the node (yggZeroWatermark); zeroing these would leave the node no
 //     path to relay them on;
-//   - with public peers, a frame that comes in through theirs bears the
-//     source its sender wrote: in the node's name, or that of a key linked
-//     here, it passes free (yggRule.judge; lan-v1 §7.4);
+//   - with public peers (lan-v1 §7.4: their links need a hook of their
+//     own), past both lan_relay_mbps and raycontrol's traffic limit, either
+//     way: a frame that comes in through theirs bears the source its sender
+//     wrote, and in the node's name, or that of a key linked here, passes to
+//     a client free; and a client's own lookup for the node, or pathNotify
+//     to it, free as ever, steers the node's answer, or its traffic to the
+//     client, to a public peer's port with the client's data in the path. A
+//     client in no group can do it too: it came with public peers, not with
+//     LAN. yggPathMax bounds what such a path carries, 64 ports;
 //   - the node's bloom filter to a client holds every other on-tree peer's
 //     key as the core transforms it, its /64 (iw: bloomfilter.go:216-234,
 //     ygg: src/core/core.go:96-98): a client can tell whether an address
@@ -167,6 +171,54 @@ func yggFrameRead(frame []byte) (source, dest *[yggKeySize]byte, wm int, keyed, 
 	return nil, nil, 0, false, true
 }
 
+// yggPathMax is the most ports the filter lets a path have where it is a
+// tree's coordinates: a lookup's from, a pathNotify's path and its info
+// path, either way on a client's link. Ironwood makes each of them the
+// path from the root to a node, a port a hop (iw: pathfinder.go:37-41,
+// 67-76, router.go:637-670), so it is as long as that node is deep in the
+// tree: a client of a node with no public peers is 3 deep at most, and
+// ironwood decodes a path of up to 128 ports in place (wire.go:104-105).
+// Longer ones are a client's data in a path, which the node then sends on
+// along it: its answer to a lookup goes along the from, its traffic to a
+// key along that key's info path (pathfinder.go:66-70, 198-210), to a
+// public peer's port past every charge, or back to the client, as large as
+// a frame. Dropped and counted in dropped_frames; what a path still
+// carries is 64 ports of up to 10 bytes.
+const yggPathMax = 64
+
+// yggPathsFit: a frame that yggFrameRead took has no coordinates over
+// yggPathMax ports.
+func yggPathsFit(frame []byte) bool {
+	b := frame[1:]
+	switch frame[0] {
+	case yggPathLookup:
+		return yggPathFits(b[2*yggKeySize:])
+	case yggPathNotify:
+		if !yggPathFits(b) {
+			return false
+		}
+		b, _ = yggSkipPath(b)                // path
+		b, _ = yggSkipUint(b)                // watermark
+		b, _ = yggSkipUint(b[2*yggKeySize:]) // the keys, then info: seq
+		return yggPathFits(b)                // info: path
+	}
+	return true
+}
+
+// yggPathFits: the path at the start of b, which yggFrameRead took, has
+// yggPathMax ports or fewer.
+func yggPathFits(b []byte) bool {
+	for range yggPathMax {
+		u, n := binary.Uvarint(b)
+		if u == 0 {
+			return true
+		}
+		b = b[n:]
+	}
+	u, _ := binary.Uvarint(b)
+	return u == 0
+}
+
 // yggSkipUint is ironwood's wireChopUint without the value.
 func yggSkipUint(b []byte) ([]byte, bool) {
 	_, n := binary.Uvarint(b)
@@ -213,6 +265,14 @@ type yggRule struct {
 	// linked: the keys with a client's link here now (yggUsers), read only
 	// with public peers.
 	linked func() yggKeys
+	// xNode, xKey: N's and K's keys under the core's bloom transform
+	// (yggXKey), made once (prepare); zero until then.
+	xNode, xKey [yggKeySize]byte
+}
+
+// prepare makes the rule's transformed keys.
+func (r *yggRule) prepare() {
+	r.xNode, r.xKey = yggXKey(&r.node), yggXKey(&r.key)
 }
 
 // yggKeys is a set of keys, swapped whole, never changed.
@@ -278,12 +338,16 @@ const (
 //     pathNotify along the lookup's from, traffic along the notified path;
 //   - with public peers, a frame for a neighbour: it may leave through a
 //     public peer's link. Then a frame on its way out to K from a key
-//     linked here was charged where it came in, and is not again (a lookup
-//     is: the node sends a copy to each peer whose bloom claims its dest).
+//     linked here, a lookup too, was charged where it came in, and is not
+//     again. A frame from K in the name of a neighbour with no link here (a
+//     device behind K) is charged both ways: where it goes out nothing
+//     tells it from one of a public peer's.
 //
 // With public peers the source of a frame that comes in through theirs is
 // what its sender wrote: one in the node's name, or in that of a key linked
-// here, passes as that key's (their links need a hook of their own, lan-v1
+// here, passes as that key's; and a client's own frames to the node steer
+// the node's to a public peer's port, past every charge (yggPathMax bounds
+// how much each carries). Their links need a hook of their own (lan-v1
 // §7.4). Without them every link is a client's.
 func (r *yggRule) judge(v yggView, fromClient bool, typ byte, source, dest *[yggKeySize]byte) yggVerdict {
 	if typ == yggPathLookup {
@@ -327,42 +391,96 @@ func (r *yggRule) judge(v yggView, fromClient bool, typ byte, source, dest *[ygg
 //     the node has it, and passes it on only to a client whose bloom claims
 //     the node, its from as its sender made it. For anyone else (one behind
 //     K, in its Wi-Fi, may be the one looked for): charged, each copy where
-//     it goes out.
+//     it goes out; with public peers, not one from a key linked here (judge).
 //   - Else dropped. A client that claims every key in its bloom would get
 //     every other client's lookup for the node, and the node's own for each
 //     of them, keys and all.
+//
+// Whom a lookup is for is asked only where it matters: never for K's own
+// without public peers, the lookups a client sends most.
 func (r *yggRule) lookup(v yggView, fromClient bool, source, dest *[yggKeySize]byte) yggVerdict {
-	forNode := yggAnswers(dest, &r.node)
 	if fromClient {
 		switch {
-		case !r.is(v, source, &r.key):
+		case *source == r.key:
+			if r.public && v.own != nil && !r.forNode(dest) {
+				return yggCharge
+			}
+			return yggPass
+		case !v.in(source):
 			return yggDrop
-		case forNode && *source != r.key:
-			return yggCharge
-		case !forNode && r.public && v.own != nil:
+		case r.public || r.forNode(dest):
 			return yggCharge
 		}
 		return yggPass
 	}
 	switch {
-	case *source == r.node && (r.is(v, dest, &r.key) || r.answers(dest)):
-		return yggPass
-	case *source == r.node || !v.in(source) || forNode:
+	case *source == r.node:
+		if r.is(v, dest, &r.key) || r.answers(dest) {
+			return yggPass
+		}
 		return yggDrop
+	case !v.in(source) || r.forNode(dest):
+		return yggDrop
+	case v.linked[*source]: // public peers: charged where it came in
+		return yggPass
 	}
 	return yggCharge
+}
+
+// forNode: the node answers a lookup for dest (iw: pathfinder.go:62-64).
+func (r *yggRule) forNode(dest *[yggKeySize]byte) bool {
+	return yggXKey(dest) == r.x(&r.xNode, &r.node)
 }
 
 // answers: K would answer a lookup for dest, as ironwood decides it
 // (iw: pathfinder.go:62-64), dest being a whole key or one from an address.
 // Only for the node's lookups and not for K's very key: never on the way
 // of traffic.
-func (r *yggRule) answers(dest *[yggKeySize]byte) bool { return yggAnswers(dest, &r.key) }
+func (r *yggRule) answers(dest *[yggKeySize]byte) bool { return yggXKey(dest) == r.x(&r.xKey, &r.key) }
+
+// x is a transformed key of the rule's, made now if prepare has not.
+func (r *yggRule) x(made, key *[yggKeySize]byte) [yggKeySize]byte {
+	if *made == ([yggKeySize]byte{}) { // never a transform: it keeps a 1 bit
+		return yggXKey(key)
+	}
+	return *made
+}
 
 // yggAnswers: the owner of key answers a lookup for dest: the two are one
 // under the core's bloom transform (ygg: src/core/core.go:96-98).
-func yggAnswers(dest, key *[yggKeySize]byte) bool {
-	return bytes.Equal(address.SubnetForKey(dest[:]).GetKey(), address.SubnetForKey(key[:]).GetKey())
+func yggAnswers(dest, key *[yggKeySize]byte) bool { return yggXKey(dest) == yggXKey(key) }
+
+// yggXKey is the core's bloom transform of a key (ygg: src/core/core.go:
+// 96-98): the key its /64 gives back, address.SubnetForKey(key).GetKey(),
+// made without allocating. The subnet holds the count of the key's leading
+// zeros (of its inverse's leading ones, address.go AddrForKey) and the
+// whole bytes after its first 1 bit, 6 at most; GetKey puts them back and
+// sets every bit after them. So the transform keeps the key up to there and
+// sets the rest; a key of zeros, whose count wraps to 0, becomes all ones.
+func yggXKey(key *[yggKeySize]byte) [yggKeySize]byte {
+	const n = 8 * yggKeySize
+	z := 0 // the leading zero bits
+	for _, b := range key {
+		if b != 0 {
+			z += bits.LeadingZeros8(b)
+			break
+		}
+		z += 8
+	}
+	keep := 0 // the bits kept
+	if z < n {
+		keep = z + 1 + 8*min(6, (n-1-z)/8)
+	}
+	x := *key
+	i := keep / 8
+	if keep%8 != 0 {
+		x[i] |= 0xff >> (keep % 8)
+		i++
+	}
+	for ; i < yggKeySize; i++ {
+		x[i] = 0xff
+	}
+	return x
 }
 
 // is: x is want, or G(x) = G(K) ≠ ∅.
@@ -398,8 +516,10 @@ func newYggLinkFilter(rule yggRule, dropped *atomic.Uint64, core, client io.Writ
 	return f
 }
 
-// attach gives the filter the two ends it writes to.
+// attach gives the filter the two ends it writes to, and makes its rule's
+// transformed keys.
 func (f *yggLinkFilter) attach(core, client io.Writer) {
+	f.rule.prepare()
 	f.done = make(chan struct{})
 	f.core.init(core)
 	f.client.init(client)
@@ -498,7 +618,11 @@ func (f *yggLinkFilter) copy(dst *yggOut, src io.Reader, fromClient bool) error 
 			}
 			drop := false
 			if keyed {
-				switch f.rule.judge(view, fromClient, frame[0], source, dest) {
+				verdict := f.rule.judge(view, fromClient, frame[0], source, dest)
+				if (frame[0] == yggPathLookup || frame[0] == yggPathNotify) && !yggPathsFit(frame) {
+					verdict = yggDrop
+				}
+				switch verdict {
 				case yggDrop:
 					drop = true
 					f.dropped.Add(1)
