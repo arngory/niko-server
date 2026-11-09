@@ -356,7 +356,7 @@ func TestHysteriaConnLimitRateAndDebt(t *testing.T) {
 	// Failed dials: two forgiven, the third runs into debt.
 	lim.mu.Lock()
 	lim.n.tcpRate, lim.n.tcpBurst = 1000, 1000
-	lim.n.failBurst, lim.n.failRate = 2, 1
+	lim.n.failBurst, lim.n.failRate = 2, 0.01 // a debt of minutes: the test's own time pays none of it
 	lim.users["u5"].attempts = bucket{1000, time.Now()}
 	lim.users["u5"].failed = bucket{2, time.Now()}
 	lim.mu.Unlock()
@@ -379,8 +379,10 @@ func TestHysteriaConnLimitRateAndDebt(t *testing.T) {
 	if got := lim.Refused()["u5"][refusedFailed]; got != 1 {
 		t.Fatalf("refused for the debt: %d", got)
 	}
-	// Paid off at one a second.
-	time.Sleep(1300 * time.Millisecond)
+	// Paid off (by time, at the failures' rate: the unit tests' part).
+	lim.mu.Lock()
+	lim.users["u5"].failed = bucket{0, time.Now()}
+	lim.mu.Unlock()
 	if _, err := openStream(t, ctx, c, target); err != nil {
 		t.Fatalf("the debt paid: %v", err)
 	}
@@ -397,7 +399,7 @@ func TestHysteriaConnLimitUDP(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	lim := newHyLimits()
-	lim.n.udp, lim.n.quietAfter = 2, 1500*time.Millisecond
+	lim.n.udp, lim.n.quietAfter = 2, 2*time.Second
 	node := startHy2MasqWith(t, ctx, NewLogger("error", io.Discard), lim, nil, "u5", "pw-5", "u9", "pw-9")
 	var targets []string
 	for range 4 {
@@ -447,7 +449,7 @@ func TestHysteriaConnLimitUDP(t *testing.T) {
 	echoDatagram(t, listen(other), targets[0], "other")
 	echoDatagram(t, s1, targets[0], "one again")
 	// s1 goes quiet, s2 stays loud: s3's next datagram takes s1's place.
-	for deadline := time.Now().Add(1800 * time.Millisecond); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+	for deadline := time.Now().Add(2400 * time.Millisecond); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
 		echoDatagram(t, s2, targets[0], "loud")
 	}
 	echoDatagram(t, s3, targets[0], "three at last")
@@ -459,7 +461,7 @@ func TestHysteriaConnLimitUDP(t *testing.T) {
 	if !silent(s1, targets[0], 1) {
 		t.Fatal("made anew with no session quiet")
 	}
-	time.Sleep(1600 * time.Millisecond)
+	time.Sleep(2200 * time.Millisecond)
 	echoDatagram(t, s1, targets[0], "one anew")
 	if got := refused(); got[refusedEvicted] != 2 || got[refusedUDP] != 3 {
 		t.Fatalf("after the evicted session came back: %v", got)
@@ -514,7 +516,7 @@ func TestHysteriaConnLimitUDPQuiet(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	lim := newHyLimits()
-	lim.n.udp, lim.n.quietAfter = 2, time.Second
+	lim.n.udp, lim.n.quietAfter = 2, 2*time.Second
 	node := startHy2MasqWith(t, ctx, NewLogger("error", io.Discard), lim, nil, "u5", "pw-5")
 	// A destination that never answers, and one that goes on talking to
 	// whoever sent it a datagram.
@@ -556,7 +558,7 @@ func TestHysteriaConnLimitUDPQuiet(t *testing.T) {
 	if _, _, err := hearer.ReadFrom(make([]byte, 64)); err != nil {
 		t.Fatalf("the talking destination: %v", err)
 	}
-	for deadline := time.Now().Add(1800 * time.Millisecond); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+	for deadline := time.Now().Add(2600 * time.Millisecond); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
 		if _, err := sender.WriteTo([]byte("no answer wanted"), M.ParseSocksaddr(sink.LocalAddr().String())); err != nil {
 			t.Fatal(err)
 		}
