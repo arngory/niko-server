@@ -13,50 +13,64 @@ import (
 	"github.com/yggdrasil-network/yggdrasil-go/src/address"
 )
 
-// FuzzYggFrames: the link filter against ironwood's own reading. Data as
-// one frame: the parser and ironwood's decoders agree on whether it is
-// good and on its keys. Data as a link's stream, read in chunks: the filter
-// sends on exactly the frames a reference built from ironwood's framing
-// and decoders would, drops as many, and ends the link where it would. K
-// and G are in a group whose relay is unbounded, or (relayOff) 0: then the
-// frames of the client's between the two, neither end N, are dropped too,
-// and counted by the relay.
+// FuzzYggFrames: the link filter against ironwood's own reading and the
+// spec's rule. Data as one frame: the parser and ironwood's decoders agree
+// on whether it is good and on its keys. Data as a link's stream, read in
+// chunks: the filter sends on exactly the frames a reference built from
+// ironwood's framing and decoders and the spec (lanSpec) would, drops as
+// many, charges as many, and ends the link where it would. world picks
+// the groups: K and G in u1 (or, bit 2, G alone in u1 with A, K in none;
+// or, bit 3, A in u2), and the node's public peers (bit 0) with G linked
+// here (bit 1) or not. The relay is unbounded, or (relayOff) 0: then what
+// it charges is dropped too.
 func FuzzYggFrames(f *testing.F) {
 	var sig [64]byte
+	addrN := [32]byte(address.AddrForKey(keyN[:]).GetKey())
 	frames := [][]byte{
 		iwTraffic([]uint64{1, 300}, []uint64{2}, keyK, keyN, ^uint64(0), []byte("payload")),
 		iwTraffic(nil, nil, keyN, keyK, 0, nil),
+		iwTraffic(nil, nil, keyN, keyG, 0, []byte("through K")),
 		iwTraffic(nil, nil, keyG, keyN, 1, []byte{1}),
+		iwTraffic(nil, nil, keyG, keyK, 1, []byte{1}),
 		iwTraffic(nil, []uint64{4}, keyK, keyG, 1, []byte("to a neighbour")),
 		iwNotify([]uint64{5}, 7, keyN, keyK, 1700000000, []uint64{1, 2, 3}, sig),
+		iwNotify([]uint64{5}, 7, keyN, keyG, 1700000000, []uint64{1, 2, 3}, sig),
 		iwNotify(nil, 1, keyK, keyA, 1, nil, sig),
 		iwNotify(nil, 1, keyK, keyG, 1, nil, sig),
+		iwNotify(nil, 1, keyG, keyN, 1, []uint64{7}, sig),
 		iwBroken(nil, ^uint64(0), keyK, keyN),
 		iwBroken([]uint64{9}, 1, keyN, keyK),
 		iwBroken(nil, 1, keyG, keyK),
+		iwBroken(nil, 1, keyG, keyN),
+		iwBroken(nil, 1, keyN, keyG),
 		iwLookup(keyK, keyN, 1, 2),
-		iwLookup(keyK, [32]byte(address.AddrForKey(keyN[:]).GetKey())),
+		iwLookup(keyK, addrN),
+		iwLookup(keyG, keyN, 1),
+		iwLookup(keyG, addrN, 1),
 		iwLookup(keyK, [32]byte(address.AddrForKey(keyG[:]).GetKey()), 1),
 		iwLookup(keyN, keyK),
+		iwLookup(keyN, keyG),
 		iwLookup(keyA, keyK, 3),
 		iwLookup(keyG, keyA, 3),
 		{1}, {2, 1, 2}, {5},
 	}
-	for _, fr := range frames {
-		f.Add(fr, uint16(7), true, false)
-		f.Add(iwFrame(fr), uint16(3), false, false)
-		f.Add(iwFrame(fr), uint16(5), true, true)
+	for i, fr := range frames {
+		w := uint8(i % 16)
+		f.Add(fr, uint16(7), true, false, w)
+		f.Add(iwFrame(fr), uint16(3), false, false, w)
+		f.Add(iwFrame(fr), uint16(5), true, true, w^1)
+		f.Add(iwFrame(fr), uint16(5), false, true, w^3)
 	}
 	var stream []byte
 	for _, fr := range frames {
 		stream = append(stream, iwFrame(fr)...)
 	}
-	f.Add(stream, uint16(0), true, false)
-	f.Add(stream, uint16(100), false, false)
-	f.Add(stream, uint16(30), true, true)
-	f.Add(append([]byte{0x81, 0x80, 0x00, 1}, bytes.Repeat([]byte{0x80}, 10)...), uint16(1), true, false)
+	for w := range uint8(16) {
+		f.Add(stream, uint16(w*7), w&1 == 0, w&2 == 0, w)
+	}
+	f.Add(append([]byte{0x81, 0x80, 0x00, 1}, bytes.Repeat([]byte{0x80}, 10)...), uint16(1), true, false, uint8(0))
 
-	f.Fuzz(func(t *testing.T, data []byte, chunk uint16, fromClient, relayOff bool) {
+	f.Fuzz(func(t *testing.T, data []byte, chunk uint16, fromClient, relayOff bool, world uint8) {
 		source, dest, keyed, ok := yggFrameKeys(data)
 		rs, rd, rkeyed, rok := iwRefKeys(data)
 		if keyed != rkeyed || ok != rok || keyed && ok && (*source != rs || *dest != rd) {
@@ -69,8 +83,22 @@ func FuzzYggFrames(f *testing.F) {
 		}
 		g := relay.group("u1")
 		groups := yggGroups{keyK: g, keyG: g}
-		rule := yggRule{node: keyN, key: keyK, groups: func() yggGroups { return groups }}
-		want, wantPings, wantAnswers, wantDropped, wantRelayed, wantBad := iwRefFilter(data, &rule, fromClient, relayOff)
+		spec := lanSpec{node: keyN, key: keyK, group: map[[32]byte]string{keyK: "u1", keyG: "u1"}, public: world&1 != 0}
+		switch {
+		case world&4 != 0:
+			groups = yggGroups{keyG: g, keyA: g}
+			spec.group = map[[32]byte]string{keyG: "u1", keyA: "u1"}
+		case world&8 != 0:
+			groups[keyA] = relay.group("u2")
+			spec.group[keyA] = "u2"
+		}
+		linked := yggKeys{keyK: true, keyG: world&2 != 0}
+		if spec.public {
+			spec.linked = map[[32]byte]bool{keyK: true, keyG: world&2 != 0}
+		}
+		rule := yggRule{node: keyN, key: keyK, groups: func() yggGroups { return groups }, public: spec.public,
+			linked: func() yggKeys { return linked }}
+		want, wantPings, wantAnswers, wantDropped, wantRelayed, wantBad := iwRefFilter(data, spec, fromClient, relayOff)
 		var dropped atomic.Uint64
 		out, other := &sink{}, &sink{} // where the copy writes; the other end, which gets the answers
 		var lf *yggLinkFilter
@@ -87,11 +115,11 @@ func FuzzYggFrames(f *testing.F) {
 			t.Fatalf("stream %x in reads of %d: sent %x dropped %d (%v), want %x %d bad %v",
 				data, int(chunk)+1, out.Bytes(), dropped.Load(), err, want, wantDropped, wantBad)
 		}
-		// Each frame the relay saw: dropped at 0, else passed and counted,
-		// its bytes the group's.
+		// Each frame the relay charged: dropped at 0, else passed and
+		// counted, its bytes K's group's (none but u1 is ever charged).
 		relayed := relay.frames.Load() + relay.dropped.Load()
 		if relayed != wantRelayed || relayOff && relay.frames.Load() != 0 || !relayOff && relay.dropped.Load() != 0 ||
-			uint64(g.up.Load()) != relay.bytes.Load() {
+			uint64(g.up.Load()) != relay.bytes.Load() || world&4 != 0 && relayed != 0 {
 			t.Fatalf("stream %x: relayed %d, dropped over the rate %d, %d bytes (group %d); want %d",
 				data, relay.frames.Load(), relay.dropped.Load(), relay.bytes.Load(), g.up.Load(), wantRelayed)
 		}
@@ -190,25 +218,81 @@ func iwRefKeys(frame []byte) (source, dest [32]byte, keyed, ok bool) {
 	return source, dest, true, true
 }
 
-// iwRefFilter is the filter as ironwood frames a stream: what it would
-// send on (a frame of the client's to the node with its watermark 0, in as
-// many bytes), how many it would drop, and whether the core would end the
-// link; and, before a flush, the answers to the dropped frames
-// (yggLinkFilter.answer): pings, to the copy's own end (the client), and
-// the answers to the other end, the client's keepalive or the core's
-// pathBrokens for the node's traffic. A keepalive and a ping wait once,
-// all within yggInjectMax. relayed counts the frames of the client's that
-// the node relays within K's group, neither end the node (a lookup's dest
-// the node would not answer); relayOff drops them, as an answered drop.
-func iwRefFilter(stream []byte, rule *yggRule, fromClient, relayOff bool) (out, pings, answers []byte, dropped, relayed uint64, bad bool) {
-	view := rule.view()
-	xNode := address.SubnetForKey(rule.node[:]).GetKey()
-	neighbours := func(typ byte, source, dest [32]byte) bool {
-		if !fromClient || view.groups[rule.key] == nil || source == rule.node || dest == rule.node {
-			return false
-		}
-		return typ != yggPathLookup || !bytes.Equal(address.SubnetForKey(dest[:]).GetKey(), xNode)
+// lanSpec is lan-v1 §2.2 and §4.4 on K's link, and the charge as v0.16.0
+// places it, written from the spec and apart from the filter
+// (yggRule.judge): the reference of FuzzYggFrames, of TestNekoServerYggRule
+// and of the accounting the ironwood tests check.
+type lanSpec struct {
+	node, key [32]byte
+	group     map[[32]byte]string // a key's group; absent or "": none
+	public    bool                // the node has public peers (R4-18)
+	linked    map[[32]byte]bool   // with public peers: the keys with a client's link here
+}
+
+// mate: G(x) = G(K) ≠ ∅.
+func (s lanSpec) mate(x [32]byte) bool { return s.group[s.key] != "" && s.group[x] == s.group[s.key] }
+
+// lanOwns: the owner of key answers a lookup for x, the two one under the
+// core's bloom transform (iw: pathfinder.go:62-64; ygg: src/core/core.go:96-98).
+func lanOwns(key, x [32]byte) bool {
+	return bytes.Equal(address.SubnetForKey(key[:]).GetKey(), address.SubnetForKey(x[:]).GetKey())
+}
+
+// verdict is what becomes of a frame of type typ with source and dest, from
+// the client K (up) or to it. Its ends as the spec has them: where it comes
+// from, where it goes (pathBroken goes back to its traffic's source); a
+// lookup goes to whoever answers for the key it looks for.
+func (s lanSpec) verdict(up bool, typ byte, source, dest [32]byte) yggVerdict {
+	from, to := source, dest
+	if typ == yggPathBroken {
+		from, to = dest, source
 	}
+	lookup := typ == yggPathLookup
+	forNode := to == s.node || lookup && lanOwns(s.node, to)
+	// §2.2: who may stand at each end. A lookup by its source; to K, the
+	// node's only for what K or its group answers, its group's not for the
+	// node.
+	var ok bool
+	switch {
+	case up:
+		ok = (from == s.key || s.mate(from)) && (lookup || forNode || s.mate(to))
+	case lookup && from == s.node:
+		ok = to == s.key || lanOwns(s.key, to) || s.mate(to)
+	case lookup:
+		ok = s.mate(from) && !forNode
+	default:
+		ok = (from == s.node || s.mate(from)) && (to == s.key || s.mate(to))
+	}
+	if !ok {
+		return yggDrop
+	}
+	// §4.4: free is only what K and the node send each other; the rest is
+	// relayed for K's group and charged once, where it goes out to a client,
+	// or where nothing would: as it comes in from K, a frame for the node
+	// in a neighbour's name (the node answers that neighbour) and, with
+	// public peers, one for a neighbour (it may leave through them).
+	switch {
+	case up && from == s.key && forNode, !up && from == s.node && (to == s.key || lookup):
+		return yggPass
+	case up && !forNode && !(s.public && s.group[s.key] != ""):
+		return yggPass // charged where it goes out
+	case !up && !lookup && from != s.node && s.public && s.linked[from]:
+		return yggPass // charged where it came in from its link
+	}
+	return yggCharge
+}
+
+// iwRefFilter is the filter as ironwood frames a stream and the spec rules
+// on it: what it would send on (a frame of the client's to the node with
+// its watermark 0, in as many bytes), how many it would drop, and whether
+// the core would end the link; and, before a flush, the answers to the
+// dropped frames (yggLinkFilter.answer): pings, to the copy's own end (the
+// client), and the answers to the other end, the client's keepalive or the
+// core's pathBrokens for the node's traffic. A keepalive and a ping wait
+// once, all within yggInjectMax. relayed counts the frames charged to K's
+// group; relayOff drops them, as an answered drop.
+func iwRefFilter(stream []byte, spec lanSpec, fromClient, relayOff bool) (out, pings, answers []byte, dropped, relayed uint64, bad bool) {
+	rule := struct{ node, key [32]byte }{spec.node, spec.key}
 	keepalive := false
 	ping := iwFrame(iwBroken(nil, 0, rule.node, rule.key))
 	answer := func(frame []byte, source, dest [32]byte) {
@@ -276,12 +360,16 @@ func iwRefFilter(stream []byte, rule *yggRule, fromClient, relayOff bool) (out, 
 		if !ok {
 			return out, pings, answers, dropped, relayed, true
 		}
-		if keyed && !rule.passes(view, fromClient, frame[0], &source, &dest) {
+		verdict := yggPass
+		if keyed {
+			verdict = spec.verdict(fromClient, frame[0], source, dest)
+		}
+		if verdict == yggDrop {
 			dropped++
 			answer(frame, source, dest)
 			continue
 		}
-		if keyed && neighbours(frame[0], source, dest) {
+		if verdict == yggCharge {
 			relayed++
 			if relayOff {
 				answer(frame, source, dest)

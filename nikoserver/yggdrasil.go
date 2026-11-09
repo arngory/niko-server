@@ -160,7 +160,8 @@ func runYggdrasil(ctx context.Context, c *BackendConfig, log *Logger) error {
 	}()
 	log.Infof("yggdrasil backend on %s: address %s, public key %s, exit ports %v",
 		c.Socket, address, hex.EncodeToString(node.PublicKey()), c.Options.ExitPorts)
-	l := &yggLinks{tls: tlsConfig, users: users, node: [32]byte(node.PublicKey()), dir: dir, log: log}
+	l := &yggLinks{tls: tlsConfig, users: users, node: [32]byte(node.PublicKey()), dir: dir, log: log,
+		public: len(c.Options.Peers) > 0}
 	started := time.Now()
 	defer startStatsTraffic(c.StatsSocket, func() any {
 		return YggdrasilSnapshot{Started: started.Unix(), DroppedFrames: l.dropped.Load(),
@@ -262,6 +263,10 @@ type yggUsers struct {
 	// groups is the latest reading, for the filters: swapped whole, never
 	// changed.
 	groups atomic.Pointer[yggGroups]
+	// linked is the keys with a link open now, for the filters with public
+	// peers (yggRule.linked): swapped whole as a key gets its first link or
+	// loses its last.
+	linked atomic.Pointer[yggKeys]
 
 	mu    sync.Mutex
 	keys  map[[32]byte]string
@@ -288,6 +293,7 @@ func (u *yggUsers) set(keys map[[32]byte]string) (dropped, grouped int) {
 	defer u.mu.Unlock()
 	u.groups.Store(&groups)
 	u.keys = keys
+	gone := false
 	for key, conns := range u.links {
 		if _, ok := keys[key]; ok {
 			continue
@@ -297,6 +303,10 @@ func (u *yggUsers) set(keys map[[32]byte]string) (dropped, grouped int) {
 			dropped++
 		}
 		delete(u.links, key)
+		gone = true
+	}
+	if gone {
+		u.relink()
 	}
 	return dropped, len(groups)
 }
@@ -310,6 +320,23 @@ func (u *yggUsers) group() yggGroups {
 	return nil
 }
 
+// linkedKeys is linked, for the filters.
+func (u *yggUsers) linkedKeys() yggKeys {
+	if k := u.linked.Load(); k != nil {
+		return *k
+	}
+	return nil
+}
+
+// relink makes linked anew from links. Under u.mu.
+func (u *yggUsers) relink() {
+	keys := make(yggKeys, len(u.links))
+	for key := range u.links {
+		keys[key] = true
+	}
+	u.linked.Store(&keys)
+}
+
 func (u *yggUsers) admit(key [32]byte, conn net.Conn) bool {
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -321,6 +348,7 @@ func (u *yggUsers) admit(key [32]byte, conn net.Conn) bool {
 	}
 	if u.links[key] == nil {
 		u.links[key] = map[net.Conn]bool{}
+		defer u.relink()
 	}
 	u.links[key][conn] = true
 	return true
@@ -329,9 +357,14 @@ func (u *yggUsers) admit(key [32]byte, conn net.Conn) bool {
 func (u *yggUsers) leave(key [32]byte, conn net.Conn) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	delete(u.links[key], conn)
-	if len(u.links[key]) == 0 {
+	conns, ok := u.links[key]
+	if !ok {
+		return // gone with its key (set)
+	}
+	delete(conns, conn)
+	if len(conns) == 0 {
 		delete(u.links, key)
+		u.relink()
 	}
 }
 
@@ -370,6 +403,7 @@ type yggLinks struct {
 	tls     sbtls.ServerConfig
 	users   *yggUsers
 	node    [32]byte // the node's key
+	public  bool     // the core has public peers (yggRule.public)
 	dir     string
 	log     *Logger
 	seq     atomic.Uint64
@@ -381,10 +415,10 @@ type yggLinks struct {
 // the bytes by group are on the traffic line (v0.16.0).
 type YggdrasilSnapshot struct {
 	Started       int64  `json:"started"`        // the backend's start, Unix seconds
-	DroppedFrames uint64 `json:"dropped_frames"` // traffic, pathNotify, pathBroken and pathLookup on a client's link between it and another than the node or its group: dropped
-	// LAN (v0.16.0): the frames the node relayed between two keys of a
-	// group, neither end the node, and their bytes (type and body, as
-	// charged where they came in); and those dropped over their group's
+	DroppedFrames uint64 `json:"dropped_frames"` // traffic, pathNotify, pathBroken and pathLookup on a client's link between it and another than the node or its group, or a group's lookup for the node: dropped
+	// LAN (v0.16.0): the frames the node relayed for a group and their
+	// bytes (type and body, as charged, once, mostly where they went out to
+	// a member: yggRule.judge); and those dropped over their group's
 	// lan_relay_mbps (all of them at 0).
 	RelayedFrames      uint64 `json:"relayed_frames"`
 	RelayedBytes       uint64 `json:"relayed_bytes"`
@@ -448,7 +482,7 @@ func (l *yggLinks) serve(ctx context.Context, raw net.Conn) {
 	}
 	// Frame by frame, through the filter; nothing of it in the log. A link
 	// has no half-close: when either side ends, both do.
-	f := newYggLinkFilter(yggRule{node: l.node, key: key, groups: l.users.group}, &l.dropped, link, conn)
+	f := newYggLinkFilter(l.rule(key), &l.dropped, link, conn)
 	defer f.close()
 	done := make(chan struct{}, 2)
 	go func() {
@@ -465,6 +499,12 @@ func (l *yggLinks) serve(ctx context.Context, raw net.Conn) {
 	}
 	_ = conn.Close()
 	_ = link.Close()
+}
+
+// rule is the filter's rule on the link of key: the groups and the keys
+// linked as the users file and the links have them now.
+func (l *yggLinks) rule(key [32]byte) yggRule {
+	return yggRule{node: l.node, key: key, groups: l.users.group, public: l.public, linked: l.users.linkedKeys}
 }
 
 // siteAnswer is what a web server says to a request it has nothing for:

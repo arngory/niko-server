@@ -83,17 +83,19 @@ func TestYggRelayBucket(t *testing.T) {
 	if slow.frames.Load() != 3 || slow.bytes.Load() != 3*yggFrameMax {
 		t.Fatalf("1 Mbit/s: %d frames, %d bytes", slow.frames.Load(), slow.bytes.Load())
 	}
-	// Through a link: K's largest frame to G goes into the core; the next,
-	// with the bucket empty, does not.
+	// Through a link: G's largest frame to K goes out to K; the next, with
+	// the bucket empty, does not (K gets the ping for it).
 	link := newYggRelay(1).group("u1")
-	largest := iwTraffic(nil, nil, keyK, keyG, 0, nil)
+	largest := iwTraffic(nil, nil, keyG, keyK, 0, nil)
 	largest = append(largest, make([]byte, yggFrameMax-len(largest))...)
-	f, core, _, _ := testFilter(func() yggGroups { return yggGroups{keyK: link, keyG: link} })
-	if err := f.testUp(&chunks{b: slices.Concat(iwFrame(largest), iwFrame(largest)), n: 32 << 10}); err != io.EOF {
+	f, _, client, _ := testFilter(func() yggGroups { return yggGroups{keyK: link, keyG: link} })
+	meta := []byte("meta\x00\x00")
+	if err := f.testDown(&chunks{b: slices.Concat(meta, iwFrame(largest), iwFrame(largest)), n: 32 << 10}); err != io.EOF {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(core.Bytes(), iwFrame(largest)) || link.up.Load() != yggFrameMax || link.relay.dropped.Load() != 1 {
-		t.Fatalf("1 Mbit/s, the largest frame: the core got %d bytes, the group %d, dropped %d", core.Len(), link.up.Load(), link.relay.dropped.Load())
+	if !bytes.Equal(client.Bytes(), slices.Concat(meta, iwFrame(largest), iwFrame(iwBroken(nil, 0, keyN, keyK)))) ||
+		link.up.Load() != yggFrameMax || link.relay.dropped.Load() != 1 {
+		t.Fatalf("1 Mbit/s, the largest frame: the client got %d bytes, the group %d, dropped %d", client.Len(), link.up.Load(), link.relay.dropped.Load())
 	}
 }
 
@@ -311,32 +313,82 @@ func TestYggUsersGroups(t *testing.T) {
 		t.Fatalf("the node's key made a group: %v", other.relay.traffic().Users)
 	}
 	n, gk, ka := keyN, keyG, keyA
-	if !rule.passes(rule.view(), true, yggTraffic, &keyK, &gk) || rule.passes(rule.view(), true, yggTraffic, &n, &gk) {
+	passes := func(source, dest *[32]byte) bool {
+		return rule.judge(rule.view(), true, yggTraffic, source, dest) != yggDrop
+	}
+	if !passes(&keyK, &gk) || passes(&n, &gk) {
 		t.Fatal("K to G, or N forged within u5")
 	}
+	// The keys linked here, for the filters with public peers: a key with
+	// its first link, until its last goes.
+	linked := func(want ...[32]byte) {
+		t.Helper()
+		got := u.linkedKeys()
+		if len(got) != len(want) {
+			t.Fatalf("linked %v, want %d keys", got, len(want))
+		}
+		for _, k := range want {
+			if !got[k] {
+				t.Fatalf("linked %v, without %x", got, k[:1])
+			}
+		}
+	}
+	linked()
 	conns := map[[32]byte]*closeConn{keyK: {}, keyG: {}, keyA: {}}
 	for k, c := range conns {
 		if !u.admit(k, c) {
 			t.Fatal("not admitted")
 		}
 	}
+	second := &closeConn{}
+	u.admit(keyK, second)
+	linked(keyK, keyG, keyA)
+	u.leave(keyK, second)
+	linked(keyK, keyG, keyA)
 	// K moves to u6, G leaves.
 	dropped, grouped := u.set(map[[32]byte]string{keyK: "u6", keyA: "u6"})
 	if dropped != 1 || grouped != 2 || conns[keyK].closed || !conns[keyG].closed || conns[keyA].closed {
 		t.Fatalf("dropped %d, grouped %d; closed K %v G %v A %v", dropped, grouped, conns[keyK].closed, conns[keyG].closed, conns[keyA].closed)
 	}
-	if rule.passes(rule.view(), true, yggTraffic, &keyK, &gk) || !rule.passes(rule.view(), true, yggTraffic, &keyK, &ka) {
+	linked(keyK, keyA)
+	u.leave(keyG, conns[keyG]) // as serve does once the link is closed
+	linked(keyK, keyA)
+	if passes(&keyK, &gk) || !passes(&keyK, &ka) {
 		t.Fatal("the new groups are not seen")
 	}
 	// K out of any group: its link stays, it reaches N only.
 	if dropped, _ := u.set(map[[32]byte]string{keyK: "", keyA: "u6"}); dropped != 0 || conns[keyK].closed {
 		t.Fatal("K's link closed as it left its group")
 	}
-	if rule.passes(rule.view(), true, yggTraffic, &keyK, &ka) || !rule.passes(rule.view(), true, yggTraffic, &keyK, &n) {
+	if passes(&keyK, &ka) || !passes(&keyK, &n) {
 		t.Fatal("K without a group")
 	}
 	if u.admit(keyG, &closeConn{}) {
 		t.Fatal("a key gone admitted")
+	}
+	u.leave(keyA, conns[keyA])
+	linked(keyK)
+}
+
+// The backend's rule on a link: the users file's groups and, with public
+// peers, the keys linked now. A frame of G's to K, two clients of one
+// group, is charged once: where it goes out to K, or, with public peers,
+// where it comes in from G.
+func TestYggLinksRule(t *testing.T) {
+	u := &yggUsers{node: keyN, relay: newYggRelay(20)}
+	u.set(map[[32]byte]string{keyK: "u5", keyG: "u5"})
+	for _, k := range [][32]byte{keyK, keyG} {
+		u.admit(k, &closeConn{})
+	}
+	for _, public := range []bool{false, true} {
+		l := &yggLinks{node: keyN, users: u, public: public}
+		k, g := l.rule(keyK), l.rule(keyG)
+		gk, kk := keyG, keyK
+		in := g.judge(g.view(), true, yggTraffic, &gk, &kk)
+		out := k.judge(k.view(), false, yggTraffic, &gk, &kk)
+		if k.node != keyN || k.key != keyK || (in == yggCharge) == (out == yggCharge) || (in == yggCharge) != public {
+			t.Errorf("public peers %v: G to K %v as it comes in, %v as it goes out", public, in, out)
+		}
 	}
 }
 
