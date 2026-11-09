@@ -56,6 +56,8 @@ import (
 // Clients reach the node and no one else: on each link a filter drops the
 // frames between the client and another than the node (yggframe.go), and
 // the core answers no one's getSelf, getPeers or getTree (DebugPrivacy).
+// The keys of one LAN group, a user's devices, reach each other too, the
+// node relaying at most lan_relay_mbps between them (ygglan.go).
 
 // yggMetaMax bounds the link handshake (yggdrasil-go's is 6+80 bytes).
 const yggMetaMax = 1024
@@ -83,23 +85,26 @@ func runYggdrasil(ctx context.Context, c *BackendConfig, log *Logger) error {
 	}
 	defer tlsConfig.Close()
 
-	users := &yggUsers{}
+	relay := newYggRelay(c.Options.lanRelayMbps())
+	users := &yggUsers{node: [32]byte(key.Public().(ed25519.PublicKey)), relay: relay}
 	reload := func() error {
 		keys, err := readYggUsers(c.UsersFile)
 		if err != nil {
 			return err
 		}
-		if dropped := users.set(keys); dropped > 0 {
-			log.Infof("%d users, %d links of removed users closed", len(keys), dropped)
+		// Counts only: whose keys and which groups, never (lan-v1 §4.3).
+		dropped, grouped := users.set(keys)
+		if dropped > 0 {
+			log.Infof("%d users (%d in LAN groups), %d links of removed users closed", len(keys), grouped, dropped)
 		} else {
-			log.Infof("%d users", len(keys))
+			log.Infof("%d users (%d in LAN groups)", len(keys), grouped)
 		}
 		return nil
 	}
 	if err := reload(); err != nil {
 		return envError("users: %v", err)
 	}
-	go watchUsers(ctx, c.UsersFile, reload, log)
+	go watchUsers(ctx, c.UsersFile, reload, relay.check, log)
 
 	// The core listens where only this process reaches: links come in
 	// through serveLink, after the key check.
@@ -155,11 +160,13 @@ func runYggdrasil(ctx context.Context, c *BackendConfig, log *Logger) error {
 	}()
 	log.Infof("yggdrasil backend on %s: address %s, public key %s, exit ports %v",
 		c.Socket, address, hex.EncodeToString(node.PublicKey()), c.Options.ExitPorts)
-	l := &yggLinks{tls: tlsConfig, users: users, node: [32]byte(node.PublicKey()), dir: dir, log: log}
+	l := &yggLinks{tls: tlsConfig, users: users, node: [32]byte(node.PublicKey()), dir: dir, log: log,
+		public: len(c.Options.Peers) > 0}
 	started := time.Now()
-	defer startStats(c.StatsSocket, func() any {
-		return YggdrasilSnapshot{Started: started.Unix(), DroppedFrames: l.dropped.Load()}
-	}, log)()
+	defer startStatsTraffic(c.StatsSocket, func() any {
+		return YggdrasilSnapshot{Started: started.Unix(), DroppedFrames: l.dropped.Load(),
+			RelayedFrames: relay.frames.Load(), RelayedBytes: relay.bytes.Load(), RelayDroppedFrames: relay.dropped.Load()}
+	}, func() any { return relay.traffic() }, log)()
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -211,7 +218,11 @@ func yggCertificate(key ed25519.PrivateKey) (*tls.Certificate, error) {
 	return &tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, nil
 }
 
-func readYggUsers(path string) (map[[32]byte]bool, error) {
+// readYggUsers reads the keys of the enabled users, each with its LAN
+// group ("" none). A key that is not 64 hex digits, a group that is not
+// 1-32 of a-z, 0-9 and -, or one key listed twice with two groups refuses
+// the whole file: the backend keeps what it had.
+func readYggUsers(path string) (map[[32]byte]string, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -220,7 +231,7 @@ func readYggUsers(path string) (map[[32]byte]bool, error) {
 	if err := json.Unmarshal(b, &f); err != nil {
 		return nil, err
 	}
-	keys := map[[32]byte]bool{}
+	keys := map[[32]byte]string{}
 	for _, u := range f.Users {
 		if !u.Enabled || u.Yggdrasil == nil || u.Yggdrasil.PublicKey == "" {
 			continue
@@ -229,25 +240,62 @@ func readYggUsers(path string) (map[[32]byte]bool, error) {
 		if err != nil || len(raw) != ed25519.PublicKeySize {
 			return nil, fmt.Errorf("user %s: yggdrasil.public_key is not 64 hex digits", u.Name)
 		}
-		keys[[32]byte(raw)] = true
+		lan := u.Yggdrasil.LAN
+		if lan != "" && !yggLANName.MatchString(lan) {
+			return nil, fmt.Errorf("user %s: yggdrasil.lan is not 1-32 of a-z, 0-9 and -", u.Name)
+		}
+		key := [32]byte(raw)
+		if other, ok := keys[key]; ok && other != lan {
+			return nil, fmt.Errorf("user %s: yggdrasil.public_key is listed before with another lan", u.Name)
+		}
+		keys[key] = lan
 	}
 	return keys, nil
 }
 
-// yggUsers are the keys let in, and the links open under each: a key
-// removed from the users file loses its links at once.
+// yggUsers are the keys let in, the links open under each, and the keys'
+// LAN groups: a key removed from the users file loses its links at once;
+// one whose group changes keeps them, and the filter sees its new group
+// at its next read (yggView).
 type yggUsers struct {
+	node  [32]byte  // the node's key: in no group, whatever the file says
+	relay *yggRelay // the groups by name
+	// groups is the latest reading, for the filters: swapped whole, never
+	// changed.
+	groups atomic.Pointer[yggGroups]
+	// linked is the keys with a link open now, for the filters with public
+	// peers (yggRule.linked): swapped whole as a key gets its first link or
+	// loses its last.
+	linked atomic.Pointer[yggKeys]
+
 	mu    sync.Mutex
-	keys  map[[32]byte]bool
+	keys  map[[32]byte]string
 	links map[[32]byte]map[net.Conn]bool
 }
 
-func (u *yggUsers) set(keys map[[32]byte]bool) (dropped int) {
+// set takes a reading of the users file: the keys, and their groups' names.
+// The groups change first, then the links of the keys gone close.
+func (u *yggUsers) set(keys map[[32]byte]string) (dropped, grouped int) {
+	names := map[string]bool{}
+	for key, name := range keys {
+		if name != "" && key != u.node {
+			names[name] = true
+		}
+	}
+	byName := u.relay.take(names)
+	groups := yggGroups{}
+	for key, name := range keys {
+		if name != "" && key != u.node {
+			groups[key] = byName[name]
+		}
+	}
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	u.groups.Store(&groups)
 	u.keys = keys
+	gone := false
 	for key, conns := range u.links {
-		if keys[key] {
+		if _, ok := keys[key]; ok {
 			continue
 		}
 		for conn := range conns {
@@ -255,14 +303,44 @@ func (u *yggUsers) set(keys map[[32]byte]bool) (dropped int) {
 			dropped++
 		}
 		delete(u.links, key)
+		gone = true
 	}
-	return dropped
+	if gone {
+		u.relink()
+	}
+	return dropped, len(groups)
+}
+
+// group is G of the link filter (raycontrol lan-v1 §2.2): the keys' LAN
+// groups as the users file has them now.
+func (u *yggUsers) group() yggGroups {
+	if g := u.groups.Load(); g != nil {
+		return *g
+	}
+	return nil
+}
+
+// linkedKeys is linked, for the filters.
+func (u *yggUsers) linkedKeys() yggKeys {
+	if k := u.linked.Load(); k != nil {
+		return *k
+	}
+	return nil
+}
+
+// relink makes linked anew from links. Under u.mu.
+func (u *yggUsers) relink() {
+	keys := make(yggKeys, len(u.links))
+	for key := range u.links {
+		keys[key] = true
+	}
+	u.linked.Store(&keys)
 }
 
 func (u *yggUsers) admit(key [32]byte, conn net.Conn) bool {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	if !u.keys[key] {
+	if _, ok := u.keys[key]; !ok {
 		return false
 	}
 	if u.links == nil {
@@ -270,6 +348,7 @@ func (u *yggUsers) admit(key [32]byte, conn net.Conn) bool {
 	}
 	if u.links[key] == nil {
 		u.links[key] = map[net.Conn]bool{}
+		defer u.relink()
 	}
 	u.links[key][conn] = true
 	return true
@@ -278,16 +357,16 @@ func (u *yggUsers) admit(key [32]byte, conn net.Conn) bool {
 func (u *yggUsers) leave(key [32]byte, conn net.Conn) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	delete(u.links[key], conn)
-	if len(u.links[key]) == 0 {
+	conns, ok := u.links[key]
+	if !ok {
+		return // gone with its key (set)
+	}
+	delete(conns, conn)
+	if len(conns) == 0 {
 		delete(u.links, key)
+		u.relink()
 	}
 }
-
-// group is G(key) of the link filter (raycontrol lan-v1 §2.2): the key's
-// LAN group. The users file has none yet (yggdrasil.lan comes with LAN):
-// no key is in one, and a client reaches only the node.
-func (u *yggUsers) group(*[32]byte) yggGroup { return 0 }
 
 // yggMetaKey reads the key of a link handshake (yggdrasil-go's version
 // metadata without a password: TLVs, then an ed25519 signature over the
@@ -324,6 +403,7 @@ type yggLinks struct {
 	tls     sbtls.ServerConfig
 	users   *yggUsers
 	node    [32]byte // the node's key
+	public  bool     // the core has public peers (yggRule.public)
 	dir     string
 	log     *Logger
 	seq     atomic.Uint64
@@ -331,10 +411,18 @@ type yggLinks struct {
 }
 
 // YggdrasilSnapshot is what the Yggdrasil backend gives on stats_socket
-// (v0.15.0). Totals only: nothing of whose frames (raycontrol lan-v1 §4.3).
+// (v0.15.0). Totals only: nothing of whose frames (raycontrol lan-v1 §4.3);
+// the bytes by group are on the traffic line (v0.16.0).
 type YggdrasilSnapshot struct {
 	Started       int64  `json:"started"`        // the backend's start, Unix seconds
-	DroppedFrames uint64 `json:"dropped_frames"` // traffic, pathNotify, pathBroken and pathLookup on a client's link between it and another than the node: dropped
+	DroppedFrames uint64 `json:"dropped_frames"` // traffic, pathNotify, pathBroken and pathLookup on a client's link between it and another than the node or its group, or a group's lookup for the node: dropped
+	// LAN (v0.16.0): the frames the node relayed for a group and their
+	// bytes (type and body, as charged, once, mostly where they went out to
+	// a member: yggRule.judge); and those dropped over their group's
+	// lan_relay_mbps (all of them at 0).
+	RelayedFrames      uint64 `json:"relayed_frames"`
+	RelayedBytes       uint64 `json:"relayed_bytes"`
+	RelayDroppedFrames uint64 `json:"relay_dropped_frames"`
 }
 
 // serve takes one stream from tcpmux: TLS, then a Yggdrasil link of a
@@ -394,7 +482,7 @@ func (l *yggLinks) serve(ctx context.Context, raw net.Conn) {
 	}
 	// Frame by frame, through the filter; nothing of it in the log. A link
 	// has no half-close: when either side ends, both do.
-	f := newYggLinkFilter(yggRule{node: l.node, key: key, group: l.users.group}, &l.dropped, link, conn)
+	f := newYggLinkFilter(l.rule(key), &l.dropped, link, conn)
 	defer f.close()
 	done := make(chan struct{}, 2)
 	go func() {
@@ -411,6 +499,12 @@ func (l *yggLinks) serve(ctx context.Context, raw net.Conn) {
 	}
 	_ = conn.Close()
 	_ = link.Close()
+}
+
+// rule is the filter's rule on the link of key: the groups and the keys
+// linked as the users file and the links have them now.
+func (l *yggLinks) rule(key [32]byte) yggRule {
+	return yggRule{node: l.node, key: key, groups: l.users.group, public: l.public, linked: l.users.linkedKeys}
 }
 
 // siteAnswer is what a web server says to a request it has nothing for:

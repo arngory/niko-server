@@ -173,10 +173,24 @@ type BackendOptions struct {
 	// by default: clients connect directly, raycontrol decision P-14).
 	ExitPorts []int    `json:"exit_ports,omitempty"`
 	Peers     []string `json:"peers,omitempty"`
+	// LANRelayMbps (yggdrasil, v0.16.0): the ceiling of what the node relays
+	// between the keys of one LAN group, neither end the node (raycontrol
+	// lan-v1 §4.4), Mbit/s a group with a second's worth of burst (the
+	// largest frame, 131070 bytes, at least); absent
+	// 20, 0 nothing relayed.
+	LANRelayMbps *int `json:"lan_relay_mbps,omitempty"`
 	// hy2-*: a name that leads to an address on the node, TCP and UDP (the
 	// channel probes of raycontrol, probe-v1); nothing else of the node is
 	// reachable.
 	Probe *ProbeRoute `json:"probe,omitempty"`
+}
+
+// lanRelayMbps is lan_relay_mbps, its default when absent.
+func (o BackendOptions) lanRelayMbps() int {
+	if o.LANRelayMbps == nil {
+		return yggLANRelayDefault
+	}
+	return *o.LANRelayMbps
 }
 
 // ProbeRoute sends streams and datagrams for Name to Address.
@@ -207,7 +221,8 @@ type BackendConfig struct {
 	// StatsSocket (hy2-*): where the backend answers for the sessions of a
 	// client address (raycontrol's channel probes). dnstt: where it gives
 	// its counters (dnsttserver.StatsSnapshot, JSON) to whoever connects;
-	// yggdrasil (v0.15.0) the same with YggdrasilSnapshot.
+	// yggdrasil (v0.15.0) the same with YggdrasilSnapshot, and (v0.16.0)
+	// the LAN groups' relayed bytes on the line traffic, as hy2-*.
 	StatsSocket string `json:"stats_socket,omitempty"`
 }
 
@@ -640,6 +655,9 @@ func (c *BackendConfig) validate() []ConfigError {
 				e.add(fmt.Sprintf("options.peers[%d]", i), "scheme %q: tls, tcp, quic, ws or wss", u.Scheme)
 			}
 		}
+		if c.Options.lanRelayMbps() < 0 {
+			e.add("options.lan_relay_mbps", "not below 0 (0: nothing relayed between a group's devices)")
+		}
 	case "":
 		e.add("kind", "missing")
 	default:
@@ -675,6 +693,9 @@ func (c *BackendConfig) validate() []ConfigError {
 	}
 	if c.Kind != "yggdrasil" && (len(c.Options.ExitPorts) > 0 || len(c.Options.Peers) > 0) {
 		e.add("options", "exit_ports and peers are Yggdrasil options")
+	}
+	if c.Kind != "yggdrasil" && c.Options.LANRelayMbps != nil {
+		e.add("options.lan_relay_mbps", "a Yggdrasil option")
 	}
 	if c.Options.AuthScanHMACs < 0 {
 		e.add("options.auth_scan_hmacs", "not below 0")

@@ -200,14 +200,14 @@ func TestSealWatchKeys(t *testing.T) {
 	if !opens(a) || opens(b) {
 		t.Fatal("before: wrong keys")
 	}
-	os.WriteFile(path, []byte(hex.EncodeToString(b)+"\n"+hex.EncodeToString(a)+"\n"), 0o600)
+	writeAtomic(t, path, []byte(hex.EncodeToString(b)+"\n"+hex.EncodeToString(a)+"\n"))
 	wait("a new key", func() bool { return s.Keys() == 2 && opens(a) && opens(b) })
-	os.WriteFile(path, []byte("not hex at all, and longer than before to change the size\n"), 0o600)
+	writeAtomic(t, path, []byte("not hex at all, and longer than before to change the size\n"))
 	time.Sleep(50 * time.Millisecond)
 	if s.Keys() != 2 || !opens(a) || !opens(b) {
 		t.Fatal("a bad file changed the keys")
 	}
-	os.WriteFile(path, []byte(hex.EncodeToString(b)+"\n"), 0o600)
+	writeAtomic(t, path, []byte(hex.EncodeToString(b)+"\n"))
 	wait("the previous key gone", func() bool { return s.Keys() == 1 && !opens(a) && opens(b) })
 }
 

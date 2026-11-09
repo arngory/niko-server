@@ -3,14 +3,12 @@
 package nikoserver
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"io"
+	"math/bits"
 	"sync"
 	"sync/atomic"
-
-	"github.com/yggdrasil-network/yggdrasil-go/src/address"
 )
 
 // The frame filter on a client's link (raycontrol docs/spec/lan-v1.md §2.2).
@@ -18,12 +16,30 @@ import (
 // user's device to another user's, or to anyone through the node. On each
 // client's link the backend reads the frames as ironwood frames them, and
 // of traffic, pathNotify, pathBroken and pathLookup it lets through only
-// those between the client and the node; in LAN (later) also those within
-// the client's group. Everything else passes as it is (keepalive, the tree,
+// those between the client and the node, and (LAN, v0.16.0) those within
+// the client's group; what the node relays for a group it charges to the
+// group's bucket (ygglan.go), once, mostly where it goes out to a member
+// (yggRule.judge). Everything else passes as it is (keepalive, the tree,
 // the bloom filters): without them there is no route at all. The filter
 // says nothing in any log: counters only (§4.3).
 //
 // Left, known and accepted (docs/SPEC.md §3.4):
+//   - between two keys of a group frames keep their path and watermark,
+//     along which the node relays them: a grouped client can steer one to
+//     any port of the node's and tell by what comes back (a pathBroken from
+//     the node, or nothing) whether a client is on it, how many there are
+//     and on which ports, never whose. The occupancy v0.15.0 hid for frames
+//     to the node (yggZeroWatermark); zeroing these would leave the node no
+//     path to relay them on;
+//   - with public peers (lan-v1 §7.4: their links need a hook of their
+//     own), past both lan_relay_mbps and raycontrol's traffic limit, either
+//     way: a frame that comes in through theirs bears the source its sender
+//     wrote, and in the node's name, or that of a key linked here, passes to
+//     a client free; and a client's own lookup for the node, or pathNotify
+//     to it, free as ever, steers the node's answer, or its traffic to the
+//     client, to a public peer's port with the client's data in the path. A
+//     client in no group can do it too: it came with public peers, not with
+//     LAN. yggPathMax bounds what such a path carries, 64 ports;
 //   - the node's bloom filter to a client holds every other on-tree peer's
 //     key as the core transforms it, its /64 (iw: bloomfilter.go:216-234,
 //     ygg: src/core/core.go:96-98): a client can tell whether an address
@@ -155,6 +171,54 @@ func yggFrameRead(frame []byte) (source, dest *[yggKeySize]byte, wm int, keyed, 
 	return nil, nil, 0, false, true
 }
 
+// yggPathMax is the most ports the filter lets a path have where it is a
+// tree's coordinates: a lookup's from, a pathNotify's path and its info
+// path, either way on a client's link. Ironwood makes each of them the
+// path from the root to a node, a port a hop (iw: pathfinder.go:37-41,
+// 67-76, router.go:637-670), so it is as long as that node is deep in the
+// tree: a client of a node with no public peers is 3 deep at most, and
+// ironwood decodes a path of up to 128 ports in place (wire.go:104-105).
+// Longer ones are a client's data in a path, which the node then sends on
+// along it: its answer to a lookup goes along the from, its traffic to a
+// key along that key's info path (pathfinder.go:66-70, 198-210), to a
+// public peer's port past every charge, or back to the client, as large as
+// a frame. Dropped and counted in dropped_frames; what a path still
+// carries is 64 ports of up to 10 bytes.
+const yggPathMax = 64
+
+// yggPathsFit: a frame that yggFrameRead took has no coordinates over
+// yggPathMax ports.
+func yggPathsFit(frame []byte) bool {
+	b := frame[1:]
+	switch frame[0] {
+	case yggPathLookup:
+		return yggPathFits(b[2*yggKeySize:])
+	case yggPathNotify:
+		if !yggPathFits(b) {
+			return false
+		}
+		b, _ = yggSkipPath(b)                // path
+		b, _ = yggSkipUint(b)                // watermark
+		b, _ = yggSkipUint(b[2*yggKeySize:]) // the keys, then info: seq
+		return yggPathFits(b)                // info: path
+	}
+	return true
+}
+
+// yggPathFits: the path at the start of b, which yggFrameRead took, has
+// yggPathMax ports or fewer.
+func yggPathFits(b []byte) bool {
+	for range yggPathMax {
+		u, n := binary.Uvarint(b)
+		if u == 0 {
+			return true
+		}
+		b = b[n:]
+	}
+	u, _ := binary.Uvarint(b)
+	return u == 0
+}
+
 // yggSkipUint is ironwood's wireChopUint without the value.
 func yggSkipUint(b []byte) ([]byte, bool) {
 	_, n := binary.Uvarint(b)
@@ -179,61 +243,251 @@ func yggSkipPath(b []byte) ([]byte, bool) {
 	}
 }
 
-// yggGroup is a key's LAN group (lan-v1 §2.2); 0 is none (∅).
-type yggGroup uint32
+// yggGroup is a key's LAN group (lan-v1 §2.2): one per name in the users
+// file, the same for the life of the process (yggLAN, ygglan.go); nil is
+// none (∅).
+type yggGroup = *yggLAN
 
-// yggRule is lan-v1 §2.2 on one client's link: N the node's key, K the
-// link's, G(x) the group of a key.
+// yggGroups is G as one reading of the users file gives it: the keys in a
+// group, each with its group. A reading is never changed: a reload makes
+// another.
+type yggGroups map[[yggKeySize]byte]yggGroup
+
+// yggRule is lan-v1 §2.2 and §4.4 on one client's link: N the node's key,
+// K the link's, G(x) the group of a key, as the users file has it now.
 type yggRule struct {
 	node, key [yggKeySize]byte
-	group     func(*[yggKeySize]byte) yggGroup
+	groups    func() yggGroups
+	// public: the node has public peers (R4-18). The core dials their links
+	// itself, past any filter (yggdrasil.go): a frame of a client's may
+	// leave through one, and one may come in through one in anyone's name.
+	public bool
+	// linked: the keys with a client's link here now (yggUsers), read only
+	// with public peers.
+	linked func() yggKeys
+	// xNode, xKey: N's and K's keys under the core's bloom transform
+	// (yggXKey), made once (prepare); zero until then.
+	xNode, xKey [yggKeySize]byte
 }
 
-// passes is the rule for a frame of type pathLookup, pathNotify,
-// pathBroken or traffic with its source and dest. From the client (K to the
-// core): the source is K, the dest N. To the client (the core to K): the
-// source is N, the dest K. Either end may instead be a key of K's group,
-// when K has one. pathBroken carries the source and dest of the traffic it
-// reports on, but goes back to that source (iw: pathfinder.go:228-236): for
-// it the two trade places. A lookup goes out to whoever might answer it:
-// from the client only its source is held to the rule, K's lookups for
-// anyone pass; to the client the source is N and the dest one K would
-// answer. Else a client that claims every key in its bloom filter (iw:
-// bloomfilter.go:301-329) would get every other client's lookup for the
-// node, and the node's own for each of them, keys and all.
-func (r *yggRule) passes(fromClient bool, typ byte, source, dest *[yggKeySize]byte) bool {
-	switch typ {
-	case yggPathLookup:
-		if fromClient {
-			return r.is(source, &r.key)
-		}
-		return r.is(source, &r.node) && (r.is(dest, &r.key) || r.answers(dest))
-	case yggPathBroken:
+// prepare makes the rule's transformed keys.
+func (r *yggRule) prepare() {
+	r.xNode, r.xKey = yggXKey(&r.node), yggXKey(&r.key)
+}
+
+// yggKeys is a set of keys, swapped whole, never changed.
+type yggKeys map[[yggKeySize]byte]bool
+
+// yggView is G for a run of frames: one reading of the users file, and K's
+// group in it. A frame is judged on one reading, so a reload between two
+// lookups of it never mixes two; a reload shows at the next read of the
+// link. With public peers, the keys linked here too.
+type yggView struct {
+	groups yggGroups
+	own    yggGroup // G(K)
+	linked yggKeys
+}
+
+func (r *yggRule) view() yggView {
+	g := r.groups()
+	v := yggView{groups: g, own: g[r.key]}
+	if r.public && r.linked != nil {
+		v.linked = r.linked()
+	}
+	return v
+}
+
+// yggVerdict is what the rule makes of a frame (judge).
+type yggVerdict uint8
+
+const (
+	yggDrop   yggVerdict = iota // dropped and answered, counted in dropped_frames
+	yggPass                     // passes, free
+	yggCharge                   // passes if K's group's bucket holds it, charged either way (lan-v1 §4.4)
+)
+
+// judge is lan-v1 §2.2 and §4.4 for a frame of type pathLookup,
+// pathNotify, pathBroken or traffic with its source and dest, in v.
+//
+// The rule (§2.2). From the client (K to the core): the source is K, the
+// dest N. To the client (the core to K): the source is N, the dest K.
+// Either end may instead be a key of K's group, when K has one. pathBroken
+// carries the source and dest of the traffic it reports on, but goes back
+// to that source (iw: pathfinder.go:228-236): for it the two trade places.
+// Lookups: lookup.
+//
+// The charge (§4.4). Only K to N and N to K are free. What the node relays
+// for K's group is charged to the group's bucket once, by the frame's
+// length (type and body), and dropped over the rate (at 0, all of it). A
+// frame reaches a member through that member's link, whichever link it came
+// in by, a client's or a public peer's: it is charged there, on its way out
+// to the client:
+//   - a frame from a key of K's group, the node relaying it;
+//   - the node's own frame for another than K, through K: for a device
+//     behind K (niko-ygg-via, lan-v1 §2.3), or a member's data. The node
+//     answers a lookup along its from (iw: pathfinder.go:66-70) and sends
+//     its traffic along the path a pathNotify gave it (pathfinder.go:198-210):
+//     both paths are the member's to make, data and all, and lead where it
+//     likes, to its neighbour's link (review of v0.16.0).
+//
+// From the client, what nothing charges on its way out is charged as it
+// comes in:
+//   - a frame for the node in a neighbour's name (a device behind K; one
+//     user's devices share their keys): the node answers that neighbour,
+//     its own frame to it, free on its link. An echo of the bytes, a
+//     pathNotify along the lookup's from, traffic along the notified path;
+//   - with public peers, a frame for a neighbour: it may leave through a
+//     public peer's link. Then a frame on its way out to K from a key
+//     linked here, a lookup too, was charged where it came in, and is not
+//     again. A frame from K in the name of a neighbour with no link here (a
+//     device behind K) is charged both ways: where it goes out nothing
+//     tells it from one of a public peer's.
+//
+// With public peers the source of a frame that comes in through theirs is
+// what its sender wrote: one in the node's name, or in that of a key linked
+// here, passes as that key's; and a client's own frames to the node steer
+// the node's to a public peer's port, past every charge (yggPathMax bounds
+// how much each carries). Their links need a hook of their own (lan-v1
+// §7.4). Without them every link is a client's.
+func (r *yggRule) judge(v yggView, fromClient bool, typ byte, source, dest *[yggKeySize]byte) yggVerdict {
+	if typ == yggPathLookup {
+		return r.lookup(v, fromClient, source, dest)
+	}
+	if typ == yggPathBroken {
 		source, dest = dest, source
 	}
 	if fromClient {
-		return r.is(source, &r.key) && r.is(dest, &r.node)
+		switch {
+		case *source == r.key && *dest == r.node:
+			return yggPass
+		case !r.is(v, source, &r.key) || !r.is(v, dest, &r.node):
+			return yggDrop
+		case *dest == r.node || r.public: // a neighbour's for N; for a neighbour, maybe past every client
+			return yggCharge
+		}
+		return yggPass // for a neighbour: charged where it goes out to it
 	}
-	return r.is(source, &r.node) && r.is(dest, &r.key)
+	switch {
+	case *source == r.node && *dest == r.key:
+		return yggPass
+	case !r.is(v, source, &r.node) || !r.is(v, dest, &r.key):
+		return yggDrop
+	case *source != r.node && v.linked[*source]: // public peers: charged where it came in
+		return yggPass
+	}
+	return yggCharge // relayed, or N's own through K
+}
+
+// lookup is judge for pathLookup, held to the rule by its source (lan-v1
+// §2.2): a lookup goes to every peer whose bloom filter claims its dest (iw:
+// bloomfilter.go:301-329), and the node passes one on even when it answers
+// it itself (pathfinder.go:56-60).
+//   - From K: K's own or its group's, for anyone. Charged: a neighbour's
+//     for the node, which the node answers to that neighbour (judge); with
+//     public peers, one not for the node, which may go out through theirs.
+//   - To K, the node's: free, for what K would answer or a key of its group.
+//     Its from is the node's own path.
+//   - To K, its group's: dropped if for the node (by key or by address):
+//     the node has it, and passes it on only to a client whose bloom claims
+//     the node, its from as its sender made it. For anyone else (one behind
+//     K, in its Wi-Fi, may be the one looked for): charged, each copy where
+//     it goes out; with public peers, not one from a key linked here (judge).
+//   - Else dropped. A client that claims every key in its bloom would get
+//     every other client's lookup for the node, and the node's own for each
+//     of them, keys and all.
+//
+// Whom a lookup is for is asked only where it matters: never for K's own
+// without public peers, the lookups a client sends most.
+func (r *yggRule) lookup(v yggView, fromClient bool, source, dest *[yggKeySize]byte) yggVerdict {
+	if fromClient {
+		switch {
+		case *source == r.key:
+			if r.public && v.own != nil && !r.forNode(dest) {
+				return yggCharge
+			}
+			return yggPass
+		case !v.in(source):
+			return yggDrop
+		case r.public || r.forNode(dest):
+			return yggCharge
+		}
+		return yggPass
+	}
+	switch {
+	case *source == r.node:
+		if r.is(v, dest, &r.key) || r.answers(dest) {
+			return yggPass
+		}
+		return yggDrop
+	case !v.in(source) || r.forNode(dest):
+		return yggDrop
+	case v.linked[*source]: // public peers: charged where it came in
+		return yggPass
+	}
+	return yggCharge
+}
+
+// forNode: the node answers a lookup for dest (iw: pathfinder.go:62-64).
+func (r *yggRule) forNode(dest *[yggKeySize]byte) bool {
+	return yggXKey(dest) == r.x(&r.xNode, &r.node)
 }
 
 // answers: K would answer a lookup for dest, as ironwood decides it
-// (iw: pathfinder.go:62-64) with the core's bloom transform (ygg:
-// src/core/core.go:96-98), dest being a whole key or one from an address.
+// (iw: pathfinder.go:62-64), dest being a whole key or one from an address.
 // Only for the node's lookups and not for K's very key: never on the way
-// of traffic. A group of LAN will want G of such a key too.
-func (r *yggRule) answers(dest *[yggKeySize]byte) bool {
-	return bytes.Equal(address.SubnetForKey(dest[:]).GetKey(), address.SubnetForKey(r.key[:]).GetKey())
+// of traffic.
+func (r *yggRule) answers(dest *[yggKeySize]byte) bool { return yggXKey(dest) == r.x(&r.xKey, &r.key) }
+
+// x is a transformed key of the rule's, made now if prepare has not.
+func (r *yggRule) x(made, key *[yggKeySize]byte) [yggKeySize]byte {
+	if *made == ([yggKeySize]byte{}) { // never a transform: it keeps a 1 bit
+		return yggXKey(key)
+	}
+	return *made
+}
+
+// yggAnswers: the owner of key answers a lookup for dest: the two are one
+// under the core's bloom transform (ygg: src/core/core.go:96-98).
+func yggAnswers(dest, key *[yggKeySize]byte) bool { return yggXKey(dest) == yggXKey(key) }
+
+// yggXKey is the core's bloom transform of a key (ygg: src/core/core.go:
+// 96-98): the key its /64 gives back, address.SubnetForKey(key).GetKey(),
+// made without allocating. The subnet holds the count of the key's leading
+// zeros (of its inverse's leading ones, address.go AddrForKey) and the
+// whole bytes after its first 1 bit, 6 at most; GetKey puts them back and
+// sets every bit after them. So the transform keeps the key up to there and
+// sets the rest; a key of zeros, whose count wraps to 0, becomes all ones.
+func yggXKey(key *[yggKeySize]byte) [yggKeySize]byte {
+	const n = 8 * yggKeySize
+	z := 0 // the leading zero bits
+	for _, b := range key {
+		if b != 0 {
+			z += bits.LeadingZeros8(b)
+			break
+		}
+		z += 8
+	}
+	keep := 0 // the bits kept
+	if z < n {
+		keep = z + 1 + 8*min(6, (n-1-z)/8)
+	}
+	x := *key
+	i := keep / 8
+	if keep%8 != 0 {
+		x[i] |= 0xff >> (keep % 8)
+		i++
+	}
+	for ; i < yggKeySize; i++ {
+		x[i] = 0xff
+	}
+	return x
 }
 
 // is: x is want, or G(x) = G(K) ≠ ∅.
-func (r *yggRule) is(x, want *[yggKeySize]byte) bool {
-	if *x == *want {
-		return true
-	}
-	g := r.group(&r.key)
-	return g != 0 && r.group(x) == g
-}
+func (r *yggRule) is(v yggView, x, want *[yggKeySize]byte) bool { return *x == *want || v.in(x) }
+
+// in: G(x) = G(K) ≠ ∅.
+func (v yggView) in(x *[yggKeySize]byte) bool { return v.own != nil && v.groups[*x] == v.own }
 
 // The buffers of the filter, from pools: each direction of a link reads
 // into one of yggReadSize, as io.Copy would; a frame larger than that is
@@ -262,8 +516,10 @@ func newYggLinkFilter(rule yggRule, dropped *atomic.Uint64, core, client io.Writ
 	return f
 }
 
-// attach gives the filter the two ends it writes to.
+// attach gives the filter the two ends it writes to, and makes its rule's
+// transformed keys.
 func (f *yggLinkFilter) attach(core, client io.Writer) {
+	f.rule.prepare()
 	f.done = make(chan struct{})
 	f.core.init(core)
 	f.client.init(client)
@@ -310,7 +566,10 @@ func (f *yggLinkFilter) handshake(core io.Reader) error {
 // copy passes src's frames to dst, those the rule lets through, as they
 // came: runs of them in one write. A frame the core would refuse, or a
 // length over its largest frame, ends the copy (what passed before it is
-// written). For each frame it drops it injects the answers (answer).
+// written). For each frame it drops it injects the answers (answer). A
+// frame the rule charges (judge) is charged to K's group's bucket here,
+// once, and dropped over the group's rate: mostly frames on their way to
+// the client.
 func (f *yggLinkFilter) copy(dst *yggOut, src io.Reader, fromClient bool) error {
 	sender := &f.core // the end whose frames these are
 	if fromClient {
@@ -329,8 +588,9 @@ func (f *yggLinkFilter) copy(dst *yggOut, src io.Reader, fromClient bool) error 
 	for {
 		n, rerr := src.Read(buf[w:])
 		w += n
-		start, need := r, 0 // buf[start:r]: frames to send; need: what the next one takes from r
-		asks := false       // a frame in buf[start:r] asks for an answer
+		view := f.rule.view() // the groups as the users file has them now
+		start, need := r, 0   // buf[start:r]: frames to send; need: what the next one takes from r
+		asks := false         // a frame in buf[start:r] asks for an answer
 		var bad bool
 		for r < w {
 			size, sn := binary.Uvarint(buf[r:w])
@@ -356,12 +616,28 @@ func (f *yggLinkFilter) copy(dst *yggOut, src io.Reader, fromClient bool) error 
 				bad = true
 				break
 			}
-			if keyed && !f.rule.passes(fromClient, frame[0], source, dest) {
+			drop := false
+			if keyed {
+				verdict := f.rule.judge(view, fromClient, frame[0], source, dest)
+				if (frame[0] == yggPathLookup || frame[0] == yggPathNotify) && !yggPathsFit(frame) {
+					verdict = yggDrop
+				}
+				switch verdict {
+				case yggDrop:
+					drop = true
+					f.dropped.Add(1)
+				case yggCharge: // only ever with K in a group
+					drop = !view.own.pass(len(frame)) // the group counts it either way
+				}
+			}
+			if drop {
 				if err := yggSend(dst, sender, buf[start:r], asks); err != nil {
 					return err
 				}
 				start, asks = end, false
-				f.dropped.Add(1)
+				// Dropped, the frame still asked for an answer: its sender
+				// waits as for one passed (answer).
+				sender.wait()
 				f.answer(fromClient, frame, source, dest)
 			} else {
 				if keyed && fromClient {
@@ -406,8 +682,8 @@ func (f *yggLinkFilter) copy(dst *yggOut, src io.Reader, fromClient bool) error 
 // sender now waits for one. Marked before the write, so that an answer
 // that overtakes it can only clear it (a keepalive too many at worst).
 func yggSend(dst, sender *yggOut, b []byte, asks bool) error {
-	if asks && !sender.waits.Load() {
-		sender.waits.Store(true)
+	if asks {
+		sender.wait()
 	}
 	return dst.write(b)
 }
@@ -450,11 +726,16 @@ func yggZeroWatermark(frame []byte, wm int, node, source, dest *[yggKeySize]byte
 //     (iw: pathfinder.go:228-236), which also puts right the node's stale
 //     path that brought it (clients steer none, yggZeroWatermark); the
 //     client, if it waits, a keepalive;
-//   - anything else to the client: the client gets a ping (yggPing), which
-//     its own ironwood answers with a keepalive to the core. Nothing is
-//     said to the core for the client: a link whose client is gone without
-//     a word (TCP dead, no reset) gets no answer, and the core ends it in
-//     3 s, whoever looks the client up meanwhile.
+//   - anything else to the client: the client gets a ping (injectPing),
+//     which its own ironwood answers with a keepalive to the core, or with
+//     whatever it sends first. The core waits meanwhile (copy marks the
+//     sender of every frame dropped), so if that is a frame the filter
+//     drops too, the core gets the keepalive for it (above): a client that
+//     has just left a group keeps sending its old neighbours traffic,
+//     dropped, and its link would end in 3 s. Nothing is said to the core
+//     for the client otherwise: a link whose client is gone without a word
+//     (TCP dead, no reset) gets no answer, and the core ends it in 3 s,
+//     whoever looks the client up meanwhile.
 //
 // One answer per dropped frame, pings and keepalives waiting once.
 func (f *yggLinkFilter) answer(fromClient bool, frame []byte, source, dest *[yggKeySize]byte) {
@@ -503,8 +784,9 @@ const yggInjectMax = 16 << 10
 type yggOut struct {
 	mu sync.Mutex // around every Write to w
 	w  io.Writer
-	// waits: this end sent a frame that asks for an answer, and has had
-	// nothing since.
+	// waits: this end sent a frame that asks for an answer, passed or
+	// dropped, and has had nothing since: ironwood's read deadline on its
+	// side of the link (iw: peers.go:140-160).
 	waits atomic.Bool
 
 	pmu       sync.Mutex // around pending, spare, keepalive
@@ -518,6 +800,14 @@ type yggOut struct {
 func (o *yggOut) init(w io.Writer) {
 	o.w = w
 	o.wake = make(chan struct{}, 1)
+}
+
+// wait marks that this end sent a frame that asks for an answer; anything
+// written to it clears the mark (write).
+func (o *yggOut) wait() {
+	if !o.waits.Load() {
+		o.waits.Store(true)
+	}
 }
 
 // write sends whole frames to the end.
