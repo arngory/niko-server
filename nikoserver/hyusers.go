@@ -9,6 +9,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/sagernet/sing-quic/hysteria2"
 	"github.com/sagernet/sing/common/auth"
@@ -23,7 +24,9 @@ import (
 //
 // The counters are by name only, up and down since the process started:
 // nothing of destinations, addresses, ports or times. Neither they nor
-// destinations go to the log.
+// destinations go to the log. A name gone from the users file keeps its
+// counters while it has a connection, a stream or a datagram session, and
+// trafficStale after the last one ends (prune, v0.16.0).
 
 // hy2User is the service's user: one per name and password. A reload keeps
 // it while the users file gives that password to that name; otherwise it
@@ -40,7 +43,23 @@ type hy2User struct {
 // hy2Traffic are a name's bytes at the destinations' side: up sent to
 // them, down received from them (and passed on to the client). A stream or
 // a datagram session looks them up once; a buffer costs an atomic add.
-type hy2Traffic struct{ up, down atomic.Int64 }
+// live and gone tell when the counters of a name the users file no longer
+// has may go (prune): nothing of the name's left, and gone trafficStale
+// ago.
+type hy2Traffic struct {
+	up, down atomic.Int64
+	live     atomic.Int64 // the name's connections, streams and datagram sessions
+	gone     time.Time    // under hy2Users.mu: when prune first saw it out and idle
+}
+
+// trafficStale is how long the counters of a name gone from the users file
+// stay readable once nothing of it is left (raycontrol's naive keeps them
+// as long, its prune): rayd reads them every 15 s, so it has their last
+// bytes long before. Without it a process running for months would keep a
+// name for each credential that ever rotated (raycontrol v0.23.0 names
+// each credential for life) and answer traffic with more names than rayd
+// reads (4 MiB, 65536 names), and limits would go unenforced.
+const trafficStale = 5 * time.Minute
 
 // hy2Conn is an authenticated QUIC connection: close ends it, its streams
 // and datagram sessions with it.
@@ -50,10 +69,20 @@ type hy2Users struct {
 	mu     sync.Mutex
 	byPass map[string]*hy2User // the service's table
 	conns  map[*hy2User]map[*hy2Conn]bool
-	// traffic is by name and kept until the process ends, the names gone
-	// from the users file too: raycontrol counts by name.
+	// traffic is by name, the names gone from the users file too until
+	// prune drops them: raycontrol counts by name.
 	traffic map[string]*hy2Traffic
+	names   map[string]bool // the users file's names
 	boot    string
+	stale   time.Duration    // trafficStale when 0 (tests make it short)
+	now     func() time.Time // time.Now when nil (tests)
+}
+
+func (u *hy2Users) clock() time.Time {
+	if u.now != nil {
+		return u.now()
+	}
+	return time.Now()
 }
 
 func newHy2Users() *hy2Users {
@@ -72,7 +101,9 @@ func newHy2Users() *hy2Users {
 func (u *hy2Users) set(names, passwords []string, update func([]*hy2User, []string)) (closed int) {
 	u.mu.Lock()
 	next := make(map[string]*hy2User, len(names))
+	u.names = make(map[string]bool, len(names))
 	for i, name := range names {
+		u.names[name] = true
 		user := u.byPass[passwords[i]]
 		if user == nil || user.name != name {
 			user = &hy2User{name: name, traffic: u.trafficOf(name)}
@@ -96,11 +127,43 @@ func (u *hy2Users) set(names, passwords []string, update func([]*hy2User, []stri
 		delete(u.conns, user)
 	}
 	u.byPass = next
+	u.prune(u.clock())
 	u.mu.Unlock()
 	for _, c := range doomed {
 		c.close()
 	}
 	return len(doomed)
+}
+
+// check is the watch's look every few seconds, whether the users file
+// changed or not: prune.
+func (u *hy2Users) check() {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.prune(u.clock())
+}
+
+// prune drops the counters of the names the users file no longer has,
+// nothing of them left (no connection, stream or datagram session) for
+// trafficStale or longer, from the first look that saw both. A name back
+// in the file keeps its counters; one dropped and back starts from 0,
+// which rayd takes as a name it has not seen. As raycontrol's naive does.
+// Under u.mu.
+func (u *hy2Users) prune(now time.Time) {
+	stale := u.stale
+	if stale <= 0 {
+		stale = trafficStale
+	}
+	for name, t := range u.traffic {
+		switch {
+		case u.names[name] || t.live.Load() > 0:
+			t.gone = time.Time{}
+		case t.gone.IsZero():
+			t.gone = now
+		case now.Sub(t.gone) >= stale:
+			delete(u.traffic, name)
+		}
+	}
 }
 
 // trafficOf is a name's counters, made at its first sight; under u.mu.
@@ -131,12 +194,15 @@ func (u *hy2Users) admit(user *hy2User, c *hy2Conn) bool {
 		u.conns[user] = map[*hy2Conn]bool{}
 	}
 	u.conns[user][c] = true
+	user.traffic.live.Add(1)
 	return true
 }
 
+// leave takes out a connection that admit let in.
 func (u *hy2Users) leave(user *hy2User, c *hy2Conn) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	user.traffic.live.Add(-1)
 	delete(u.conns[user], c)
 	if len(u.conns[user]) == 0 {
 		delete(u.conns, user)
@@ -173,10 +239,19 @@ func trafficFrom(ctx context.Context) *hy2Traffic {
 	return new(hy2Traffic)
 }
 
+// open counts a stream or a datagram session as the name's until the
+// returned func: prune keeps the counters meanwhile.
+func (t *hy2Traffic) open() (done func()) {
+	t.live.Add(1)
+	return func() { t.live.Add(-1) }
+}
+
 // HysteriaTraffic answers the stats socket's traffic query: each name's
-// bytes since the process started, as raycontrol's rayd reads them
-// (traffic-limit-v1 §2.2). Reading resets nothing; Boot is random at each
-// start, so a new one means the counters began again.
+// bytes since the process started (or since it came back, prune having
+// dropped it), as raycontrol's rayd reads them (traffic-limit-v1 §2.2).
+// Reading resets nothing; Boot is random at each start, so a new one means
+// the counters began again. The Yggdrasil backend answers in it too, by
+// LAN group (yggRelay.traffic).
 type HysteriaTraffic struct {
 	V     int                    `json:"v"`
 	Boot  string                 `json:"boot"`

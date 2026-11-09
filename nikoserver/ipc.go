@@ -117,15 +117,19 @@ func peerUID(conn *net.UnixConn) (int, error) {
 	return int(cred.Uid), nil
 }
 
-// listenPacketSocket creates the backend's SOCK_SEQPACKET socket, mode 0660
-// (its directory, made by systemd, limits who can reach it).
+// listenPacketSocket creates the backend's SOCK_SEQPACKET socket, mode 0660,
+// as the stats sockets are: made under the process's umask, then set. Its
+// directory, made by systemd (0710, docs/IPC.md), limits who can reach it
+// at all, and until the chmod the umask makes it no wider: under systemd's
+// 0022 it is 0755, and only its owner may connect to it. The umask is never
+// changed here: it is the whole process's. A directory another goroutine
+// made meanwhile got 0117 too, without its owner's search bit, and two
+// sockets made at once could each restore the other's 0117 and leave it.
 func listenPacketSocket(path string) (*net.UnixListener, error) {
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	old := syscall.Umask(0o117)
 	listener, err := net.ListenUnix("unixpacket", &net.UnixAddr{Name: path, Net: "unixpacket"})
-	syscall.Umask(old)
 	if err != nil {
 		return nil, err
 	}
