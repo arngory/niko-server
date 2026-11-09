@@ -18,6 +18,8 @@ Data plane ноды под управлением [raycontrol](https://github.co
 | naive-quic, DoH3 | в `rayd` raycontrol за udpmux (HTTP/3) |
 | Бэкенд `site` | не нужен: сайт-приманку держит `rayd site` raycontrol (решения R2-12, R4-8) |
 | Бэкенд `yggdrasil`: tls-линк за tcpmux (TLS 1.3 с `X25519MLKEM768`), ключи пользователей из `users_file` без перезапуска, выход с портов выхода в `inner` | готово (v0.4) |
+| Yggdrasil: клиенты изолированы фильтром кадров на линке, достают только до узла (raycontrol `docs/spec/lan-v1.md` §2) | готово (v0.15) |
+| Yggdrasil LAN: устройства одной группы (`yggdrasil.lan`) достают друг до друга через узел, пересылка — до `lan_relay_mbps` на группу и в строке `traffic` (raycontrol `docs/spec/lan-v1.md` §2.2, §4.4) | готово (v0.16) |
 | Нагрузочный тест (SPEC §6.6): 200 потоков через каждый мультиплексор (TCP: fd и proxy-v2, UDP, DNS) без утечек горутин и памяти | готово: `NIKO_LOAD=10m go test -run Load ./nikoserver` (10 мин: 878 611 раундов, 47 неудач UDP, 0,005 %); в CI — минута |
 
 REALITY (Xray), DoH и naive (`rayd`), Yggdrasil стоят за tcpmux; Hysteria2, naive-quic и DoH3 — за udpmux.
