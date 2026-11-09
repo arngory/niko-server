@@ -226,6 +226,11 @@ func (x *expiries) drop(m map[string]cachedName, gone func(expiry) bool) {
 	}
 }
 
+// nameKey is a name as the cache keeps it: one entry a name, however the
+// client spells it (lower case, no final dot). Every reader of the cache
+// goes through it.
+func nameKey(name string) string { return strings.ToLower(strings.TrimSuffix(name, ".")) }
+
 // errLookups is a miss without a lookup token.
 var errLookups = errors.New("too many lookups")
 
@@ -244,8 +249,7 @@ func (l *hyLimits) lookupNameUntil(ctx context.Context, user, name string) ([]ne
 	if !domainName(name) {
 		return nil, time.Time{}, errBadName
 	}
-	// One entry a name, however the client spells it.
-	name = strings.ToLower(strings.TrimSuffix(name, "."))
+	name = nameKey(name)
 	c := &l.names
 	c.mu.Lock()
 	if addrs, until, err, ok := c.getLocked(name, l.clock()); ok {

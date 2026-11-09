@@ -1233,3 +1233,35 @@ func TestHysteriaConnLimitStats(t *testing.T) {
 		t.Fatal("a second read: the refusals or the uptime")
 	}
 }
+
+// A session's own memory of a failed lookup yields to the shared cache's
+// answer however the name is spelt: the cache keeps one entry a name, in
+// lower case and without the final dot.
+func TestHysteriaUDPNameSpelling(t *testing.T) {
+	var slow atomic.Bool
+	slow.Store(true)
+	lim, c := fakeHyLimits()
+	lim.resolve = func(context.Context, string) ([]netip.Addr, error) {
+		if slow.Load() {
+			return nil, &net.DNSError{Err: "i/o timeout", IsTimeout: true, IsTemporary: true}
+		}
+		return []netip.Addr{netip.MustParseAddr("192.0.2.7")}, nil
+	}
+	for _, spelt := range []string{"Slow.Test", "slow.test.", "SLOW.TEST."} {
+		slow.Store(true)
+		lim.names = hyNames{}
+		s := &udpSession{lim: lim, user: "u5", slot: slotOf(t, lim, "u5"), ctx: context.Background(), names: map[string]udpResolved{}}
+		d := M.ParseSocksaddrHostPort(spelt, 53)
+		if _, ok := s.resolve(d, c.t); ok {
+			t.Fatalf("%s: resolved through a timeout", spelt)
+		}
+		// Another user's lookup gets the answer into the shared cache.
+		slow.Store(false)
+		if _, err := lim.lookupName(context.Background(), "u6", "slow.test"); err != nil {
+			t.Fatal(err)
+		}
+		if ap, ok := s.resolve(d, c.t); !ok || ap != netip.MustParseAddrPort("192.0.2.7:53") {
+			t.Fatalf("%s: the session's own failure did not yield to the shared answer: %v %v", spelt, ap, ok)
+		}
+	}
+}

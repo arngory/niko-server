@@ -208,7 +208,7 @@ func (s *udpSession) resolve(d M.Socksaddr, now time.Time) (netip.AddrPort, bool
 // until when the session may keep it (zero: not); ok false when the cache
 // does not know the name.
 func (s *udpSession) cachedName(name string, now time.Time) (netip.Addr, time.Time, bool) {
-	addrs, until, err, ok := s.lim.names.get(name, now)
+	addrs, until, err, ok := s.lim.names.get(nameKey(name), now)
 	if !ok {
 		return netip.Addr{}, time.Time{}, false
 	}
