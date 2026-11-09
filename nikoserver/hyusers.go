@@ -76,6 +76,9 @@ type hy2Users struct {
 	boot    string
 	stale   time.Duration    // trafficStale when 0 (tests make it short)
 	now     func() time.Time // time.Now when nil (tests)
+	// limits are the backend's per-user connection limits, whose refusals
+	// the traffic line gives too; set before the stats socket serves.
+	limits *hyLimits
 }
 
 func (u *hy2Users) clock() time.Time {
@@ -265,7 +268,22 @@ type HysteriaTraffic struct {
 	V     int                    `json:"v"`
 	Boot  string                 `json:"boot"`
 	Users map[string]UserTraffic `json:"users"`
+	// Limit (v0.17.0, Hysteria2) are the refusals of the per-user
+	// connection limits by base name (u5 for each of u5's credentials: the
+	// limits are a user's, the bytes a credential's) and kind (tcp, rate,
+	// failed, udp, evicted, dest, live, lookup), since the process started
+	// (raycontrol conn-limit-v1 §2, §7); only names and kinds with some,
+	// and absent with none. As rayd naive answers (raycontrol v0.24.0): a
+	// field a rayd before that does not read.
+	Limit map[string]map[string]int64 `json:"limit,omitempty"`
+	// Uptime (v0.17.0) is how long the process has run, in whole seconds:
+	// by it rayd tells a process started since its last round, whose
+	// refusals are all new, from one it reads for the first time.
+	Uptime int64 `json:"uptime"`
 }
+
+// uptime is how long the process has run, in whole seconds.
+func uptime() int64 { return int64(time.Since(procStart) / time.Second) }
 
 // UserTraffic are a name's bytes at the destinations' side.
 type UserTraffic struct {
@@ -275,10 +293,13 @@ type UserTraffic struct {
 
 func (u *hy2Users) trafficSnapshot() HysteriaTraffic {
 	u.mu.Lock()
-	defer u.mu.Unlock()
-	st := HysteriaTraffic{V: 1, Boot: u.boot, Users: make(map[string]UserTraffic, len(u.traffic))}
+	st := HysteriaTraffic{V: 1, Boot: u.boot, Users: make(map[string]UserTraffic, len(u.traffic)), Uptime: uptime()}
 	for name, t := range u.traffic {
 		st.Users[name] = UserTraffic{Up: t.up.Load(), Down: t.down.Load()}
+	}
+	u.mu.Unlock()
+	if u.limits != nil {
+		st.Limit = u.limits.Refused() // none: left out of the answer
 	}
 	return st
 }

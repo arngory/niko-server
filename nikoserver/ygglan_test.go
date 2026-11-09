@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -111,9 +112,15 @@ func TestYggRelayTraffic(t *testing.T) {
 		tr.Users["u5"] != (UserTraffic{Up: 1234}) || tr.Users["u6"] != (UserTraffic{}) {
 		t.Fatalf("traffic %+v", tr)
 	}
+	// With v0.17.0 the answer says how long the process has run, as
+	// Hysteria2's: after the users, where an older reader does not look.
 	b, _ := json.Marshal(tr)
-	if want := `{"v":1,"boot":"` + tr.Boot + `","users":{"u5":{"up":1234,"down":0},"u6":{"up":0,"down":0}}}`; string(b) != want {
+	if want := `{"v":1,"boot":"` + tr.Boot + `","users":{"u5":{"up":1234,"down":0},"u6":{"up":0,"down":0}},"uptime":` +
+		strconv.FormatInt(tr.Uptime, 10) + `}`; string(b) != want {
 		t.Fatalf("%s, want %s", b, want)
+	}
+	if !waitFor(3*time.Second, func() bool { return relay.traffic().Uptime >= 1 }) || relay.traffic().Uptime > 3600 {
+		t.Fatalf("uptime %d s", relay.traffic().Uptime)
 	}
 }
 
@@ -183,7 +190,9 @@ func TestYggRelayPruned(t *testing.T) {
 func TestYggStatsTraffic(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "stats.sock")
 	stop, err := serveStatsTraffic(path, func() any { return YggdrasilSnapshot{Started: 7, DroppedFrames: 3, RelayedFrames: 2} },
-		func() any { return HysteriaTraffic{V: 1, Boot: "b", Users: map[string]UserTraffic{"u5": {Up: 5}}} }, NewLogger("error", io.Discard))
+		func() any {
+			return HysteriaTraffic{V: 1, Boot: "b", Users: map[string]UserTraffic{"u5": {Up: 5}}, Uptime: 42}
+		}, NewLogger("error", io.Discard))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +222,7 @@ func TestYggStatsTraffic(t *testing.T) {
 		return strings.TrimSpace(line), time.Since(start)
 	}
 	snapshot := `{"started":7,"dropped_frames":3,"relayed_frames":2,"relayed_bytes":0,"relay_dropped_frames":0}`
-	traffic := `{"v":1,"boot":"b","users":{"u5":{"up":5,"down":0}}}`
+	traffic := `{"v":1,"boot":"b","users":{"u5":{"up":5,"down":0}},"uptime":42}`
 	for _, c := range []struct {
 		send       string
 		closeWrite bool

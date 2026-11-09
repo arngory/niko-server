@@ -5,6 +5,7 @@ package nikoserver
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -1086,4 +1087,138 @@ func TestHysteriaConnLimitSwitch(t *testing.T) {
 	// No file: on.
 	hup("off\n", false)
 	hup("", true)
+}
+
+// The refusals on the stats socket's traffic line, as rayd reads them
+// (raycontrol internal/traffic, parseLine): a top-level limit object by
+// base name and kind, absent while nobody was refused, and the process's
+// uptime in seconds; the users' bytes as before, by the credentials' names.
+// A rayd that knows neither field reads the answer as it did.
+func TestHysteriaConnLimitStats(t *testing.T) {
+	t.Setenv(unsafeAnyDestination, "1")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	lim := newHyLimits()
+	lim.n.tcp, lim.n.udp = 1, 1
+	node := startHy2MasqWith(t, ctx, NewLogger("error", io.Discard), lim, nil,
+		"u5-1111111111111111", "pw-5a", "u5-2222222222222222", "pw-5b", "u9", "pw-9")
+	// rayd's reading of the answer (raycontrol v0.24.0).
+	type answer struct {
+		V     int    `json:"v"`
+		Boot  string `json:"boot"`
+		Users map[string]struct {
+			Up   int64 `json:"up"`
+			Down int64 `json:"down"`
+		} `json:"users"`
+		Limit  map[string]map[string]int64 `json:"limit"`
+		Uptime *int64                      `json:"uptime"`
+	}
+	read := func() (answer, string) {
+		raw := node.ask(t, "traffic\n")
+		var a answer
+		d := json.NewDecoder(strings.NewReader(string(raw)))
+		d.DisallowUnknownFields() // nothing rayd does not know
+		if err := d.Decode(&a); err != nil {
+			t.Fatalf("traffic %s: %v", raw, err)
+		}
+		return a, string(raw)
+	}
+	// A process in its first second says so: uptime 0 is in the answer.
+	if b, _ := json.Marshal(HysteriaTraffic{V: 1, Boot: "b"}); string(b) != `{"v":1,"boot":"b","users":null,"uptime":0}` {
+		t.Fatalf("an empty answer: %s", b)
+	}
+	before, raw := read()
+	if before.Limit != nil || strings.Contains(raw, "limit") {
+		t.Fatalf("limit before any refusal: %s", raw)
+	}
+	if before.Uptime == nil || *before.Uptime < 0 || *before.Uptime > 3600 || before.V != 1 || len(before.Users) != 3 {
+		t.Fatalf("before: %s", raw)
+	}
+	if !strings.HasPrefix(raw, `{"v":1,"boot":"`+before.Boot+`","users":{`) || !strings.HasSuffix(raw, "}\n") || strings.Count(raw, "\n") != 1 {
+		t.Fatalf("the line: %q", raw)
+	}
+
+	// The stats socket is asked all the while (the race detector's part).
+	stop := make(chan struct{})
+	var asking sync.WaitGroup
+	asking.Add(1)
+	go func() {
+		defer asking.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				read()
+			}
+		}
+	}()
+	target, _ := holdTarget(t)
+	_, udp := echoPair(t)
+	a, b := node.client(t, ctx, "pw-5a"), node.client(t, ctx, "pw-5b")
+	if _, err := openStream(t, ctx, a, target); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []*hysteria2.Client{a, b, b} {
+		if _, err := openStream(t, ctx, c, target); !tooMany(err) {
+			t.Fatalf("past the limit: %v", err)
+		}
+	}
+	first, err := a.ListenPacket(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	echoDatagram(t, first, udp.LocalAddr().String(), "one")
+	second, err := b.ListenPacket(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	for range 3 {
+		second.WriteTo([]byte("refused"), M.ParseSocksaddr(udp.LocalAddr().String()))
+	}
+	var after answer
+	if !waitFor(5*time.Second, func() bool {
+		after, raw = read()
+		return after.Limit["u5"]["udp"] == 1
+	}) {
+		t.Fatalf("after the refusals: %s", raw)
+	}
+	close(stop)
+	asking.Wait()
+	// By base name, the kinds with refusals only; another user has none.
+	if len(after.Limit) != 1 || len(after.Limit["u5"]) != 2 || after.Limit["u5"]["tcp"] != 3 {
+		t.Fatalf("limit: %v", after.Limit)
+	}
+	if !strings.Contains(raw, `"limit":{"u5":{"tcp":3,"udp":1}},"uptime":`) {
+		t.Fatalf("the line: %s", raw)
+	}
+	if !strings.HasPrefix(raw, `{"v":1,"boot":"`+before.Boot+`","users":{`) {
+		t.Fatalf("the line: %s", raw)
+	}
+	// The bytes are the credentials', as before.
+	if _, ok := after.Users["u5-1111111111111111"]; !ok || len(after.Users) != 3 {
+		t.Fatalf("users: %v", after.Users)
+	}
+	if _, ok := after.Users["u5"]; ok {
+		t.Fatalf("users by base name: %v", after.Users)
+	}
+	// A rayd before v0.24.0 (and niko-server's own reader of v0.15.0):
+	// version, boot and users, the rest passed over.
+	var old struct {
+		V     int                    `json:"v"`
+		Boot  string                 `json:"boot"`
+		Users map[string]UserTraffic `json:"users"`
+	}
+	if err := json.Unmarshal([]byte(raw), &old); err != nil || old.V != 1 || old.Boot != before.Boot || len(old.Users) != 3 {
+		t.Fatalf("an older reader: %+v (%v)", old, err)
+	}
+	// Reading resets nothing; the uptime runs on.
+	if !waitFor(3*time.Second, func() bool {
+		again, _ := read()
+		return *again.Uptime >= 1 && *again.Uptime > *before.Uptime-1 && again.Limit["u5"]["tcp"] == 3
+	}) {
+		t.Fatal("a second read: the refusals or the uptime")
+	}
 }

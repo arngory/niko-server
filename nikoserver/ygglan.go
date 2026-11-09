@@ -142,7 +142,7 @@ func (r *yggRelay) prune(now time.Time) {
 func (r *yggRelay) traffic() HysteriaTraffic {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	t := HysteriaTraffic{V: 1, Boot: r.boot, Users: make(map[string]UserTraffic, len(r.byName))}
+	t := HysteriaTraffic{V: 1, Boot: r.boot, Users: make(map[string]UserTraffic, len(r.byName)), Uptime: uptime()}
 	for name, g := range r.byName {
 		t.Users[name] = UserTraffic{Up: g.up.Load()}
 	}
