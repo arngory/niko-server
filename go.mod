@@ -2,6 +2,8 @@ module github.com/arngory/niko-server
 
 go 1.26.0
 
+toolchain go1.26.10
+
 require (
 	github.com/Arceliar/ironwood v0.0.0-20261023231900-0712eccbb962
 	github.com/quic-go/quic-go v0.64.1
@@ -13,7 +15,7 @@ require (
 	github.com/xtaci/smux v1.5.24
 	github.com/yggdrasil-network/yggdrasil-go v0.5.14
 	golang.org/x/crypto v0.58.0
-	golang.org/x/net v0.61.0
+	golang.org/x/net v0.62.0
 	golang.org/x/sys v0.49.0
 	masterdnsvpn-go v0.0.0
 	www.bamsoftware.com/git/dnstt.git v1.20260501.0
@@ -30,7 +32,7 @@ require (
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/BurntSushi/toml v1.4.1-0.20240526193622-a339e1f7089c // indirect
-	github.com/andybalholm/brotli v1.1.0 // indirect
+	github.com/andybalholm/brotli v1.2.8 // indirect
 	github.com/caddyserver/certmagic v0.25.3-0.20260421143802-60d9d8b415d6 // indirect
 	github.com/caddyserver/zerossl v0.1.5 // indirect
 	github.com/cloudflare/circl v1.6.5 // indirect
@@ -46,7 +48,7 @@ require (
 	github.com/google/gopacket v1.1.19 // indirect
 	github.com/huin/goupnp v1.3.0 // indirect
 	github.com/jackpal/go-nat-pmp v1.0.2 // indirect
-	github.com/klauspost/compress v1.19.1 // indirect
+	github.com/klauspost/compress v1.20.4 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/klauspost/reedsolomon v1.12.0 // indirect
 	github.com/koron/go-ssdp v0.0.4 // indirect
