@@ -338,7 +338,7 @@ func TestHysteriaTraffic(t *testing.T) {
 		}
 	}
 	// Reading resets nothing; the boot stays.
-	if again := node.traffic(t); fmt.Sprint(again) != fmt.Sprint(got) || again.Boot != before.Boot {
+	if again := node.traffic(t); fmt.Sprint(again.Users) != fmt.Sprint(got.Users) || again.Boot != before.Boot || again.V != 1 {
 		t.Fatalf("a second read %+v, the first %+v", again, got)
 	}
 	// The JSON as raycontrol reads it, then the socket closes.

@@ -130,6 +130,7 @@ func runHysteriaWith(ctx context.Context, c *BackendConfig, conn *packetConn, lo
 	connLimit()
 	var live sessions
 	users := newHy2Users()
+	users.limits = lim
 	if c.StatsSocket != "" {
 		stop, err := live.serveStats(c.StatsSocket, users, log)
 		if err != nil {
