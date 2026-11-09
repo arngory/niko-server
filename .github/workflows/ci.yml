@@ -66,6 +66,11 @@ jobs:
       - name: dnstt's dns package (vendored, changed by niko)
         working-directory: third_party/dnstt
         run: go vet ./dns && go test -race -count=1 ./dns
+      # The vendored sing-quic is a module of its own too: its hysteria2
+      # package, which niko changes (salamander, the session map).
+      - name: sing-quic's hysteria2 package (vendored, changed by niko)
+        working-directory: third_party/sing-quic
+        run: go vet ./hysteria2 && go test -race -count=1 ./hysteria2
       - name: Load through every multiplexer (SPEC §6.6, a minute; NIKO_LOAD=10m for the full run)
         run: NIKO_LOAD=60s go test -count=1 -timeout 300s -run TestNekoServerLoad -v ./nikoserver
       - name: Build niko-server

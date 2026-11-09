@@ -74,6 +74,13 @@ type hy2Node struct {
 
 func startHy2Masq(t *testing.T, ctx context.Context, log *Logger, pairs ...string) *hy2Node {
 	t.Helper()
+	return startHy2MasqWith(t, ctx, log, newHyLimits(), nil, pairs...)
+}
+
+// startHy2MasqWith is startHy2Masq with the backend's limits (a test's
+// numbers) and changes to its config before it starts.
+func startHy2MasqWith(t *testing.T, ctx context.Context, log *Logger, lim *hyLimits, change func(*BackendConfig), pairs ...string) *hy2Node {
+	t.Helper()
 	dir := t.TempDir()
 	uid := os.Getuid()
 	cert := selfSigned(t, "h.example.com")
@@ -86,6 +93,9 @@ func startHy2Masq(t *testing.T, ctx context.Context, log *Logger, pairs ...strin
 	sock := filepath.Join(dir, "hy2-masq.sock")
 	c := &BackendConfig{Schema: 1, Role: "backend", Kind: "hy2-masq", Socket: sock, FrontUID: uid, UsersFile: node.users,
 		TLS: &BackendTLS{CertificateFile: certFile, KeyFile: keyFile}, StatsSocket: node.stats}
+	if change != nil {
+		change(c)
+	}
 	if errs := c.validate(); len(errs) > 0 {
 		t.Fatal(errs)
 	}
@@ -97,7 +107,7 @@ func startHy2Masq(t *testing.T, ctx context.Context, log *Logger, pairs ...strin
 	conn.port = 443
 	go conn.acceptLoop()
 	var direct net.Dialer
-	go runHysteria(ctx, c, conn, log, direct.DialContext)
+	go runHysteriaWith(ctx, c, conn, log, direct.DialContext, lim)
 	fc := &FrontUDP{Listen: []string{"127.0.0.1:0"}, Routes: []UDPRoute{{SNI: []string{"h.example.com"}, Backend: "hy2-masq"}}}
 	front, err := newUDPFront(fc, map[string]BackendRef{"hy2-masq": {Socket: sock, Mode: "packet", UID: uid}}, log)
 	if err != nil {
@@ -328,7 +338,7 @@ func TestHysteriaTraffic(t *testing.T) {
 		}
 	}
 	// Reading resets nothing; the boot stays.
-	if again := node.traffic(t); fmt.Sprint(again) != fmt.Sprint(got) || again.Boot != before.Boot {
+	if again := node.traffic(t); fmt.Sprint(again.Users) != fmt.Sprint(got.Users) || again.Boot != before.Boot || again.V != 1 {
 		t.Fatalf("a second read %+v, the first %+v", again, got)
 	}
 	// The JSON as raycontrol reads it, then the socket closes.
