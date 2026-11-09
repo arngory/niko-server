@@ -1009,3 +1009,81 @@ func TestHysteriaUDPNames(t *testing.T) {
 		t.Fatalf("expired names not pruned: %d kept", len(s.names))
 	}
 }
+
+// The switch: conn_limit "off" in the backend's config, or a file that
+// says "off", read again on SIGHUP and at the watch's look every 5 s,
+// without a restart: what is open stays.
+func TestHysteriaConnLimitSwitch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	target, _ := holdTarget(t)
+	free := func(c *hysteria2.Client, n int) error {
+		for range n {
+			if _, err := openStream(t, ctx, c, target); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	// Off in the config: no limit, whatever a file says.
+	lim := newHyLimits()
+	lim.n.tcp = 1
+	file := t.TempDir() + "/conn-limit"
+	os.WriteFile(file, []byte("on\n"), 0o600)
+	logs := &lockedLog{}
+	node := startHy2MasqWith(t, ctx, NewLogger("info", logs), lim, func(c *BackendConfig) {
+		c.Options.ConnLimit, c.Options.ConnLimitFile = "off", file
+	}, "u5", "pw-5")
+	if err := free(node.client(t, ctx, "pw-5"), 3); err != nil {
+		t.Fatalf("conn_limit off: %v", err)
+	}
+	if !strings.Contains(logs.String(), "INFO per-user connection limits off") {
+		t.Fatalf("the log:\n%s", logs)
+	}
+
+	// The file. It says off at the start.
+	lim = newHyLimits()
+	lim.n.tcp = 1
+	os.WriteFile(file, []byte("off\n"), 0o600)
+	node = startHy2MasqWith(t, ctx, NewLogger("error", io.Discard), lim, func(c *BackendConfig) {
+		c.Options.ConnLimitFile = file
+	}, "u5", "pw-5")
+	client := node.client(t, ctx, "pw-5")
+	if err := free(client, 3); err != nil {
+		t.Fatalf("the file says off: %v", err)
+	}
+	// On, at SIGHUP (at once: the watch's own look is 5 s away at most,
+	// and two changes in a row cannot both be its doing): the open streams
+	// stay, a new one takes the user's one place, the next is refused.
+	hup := func(content string, on bool) {
+		t.Helper()
+		if content == "" {
+			os.Remove(file)
+		} else {
+			os.WriteFile(file, []byte(content), 0o600)
+		}
+		syscall.Kill(os.Getpid(), syscall.SIGHUP)
+		if !waitFor(1500*time.Millisecond, func() bool { return lim.off.Load() != on }) {
+			t.Fatalf("the file says %q: on %v after SIGHUP", content, !on)
+		}
+	}
+	hup("on\n", true)
+	if err := free(client, 1); err != nil {
+		t.Fatalf("on again, the first stream: %v", err)
+	}
+	if err := free(client, 1); !tooMany(err) {
+		t.Fatalf("on again, past the limit: %v", err)
+	}
+	hup("off\n", false)
+	if err := free(client, 2); err != nil {
+		t.Fatalf("off again: %v", err)
+	}
+	// On again without a signal: at the watch's next look.
+	os.WriteFile(file, []byte("on\n"), 0o600)
+	if !waitFor(8*time.Second, func() bool { return !lim.off.Load() }) {
+		t.Fatal("not on within the watch's look")
+	}
+	// No file: on.
+	hup("off\n", false)
+	hup("", true)
+}

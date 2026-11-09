@@ -115,6 +115,19 @@ func runHysteriaWith(ctx context.Context, c *BackendConfig, conn *packetConn, lo
 		}
 		salamander = strings.TrimRight(string(b), "\r\n")
 	}
+	// The switch of the per-user limits (conn_limit, conn_limit_file):
+	// read now, and again at each look of the users file's watch.
+	connLimit := func() {
+		if on := c.Options.connLimitOn(); on == lim.off.Load() {
+			lim.SetConnLimit(on)
+			if on {
+				log.Infof("per-user connection limits on")
+			} else {
+				log.Infof("per-user connection limits off")
+			}
+		}
+	}
+	connLimit()
 	var live sessions
 	users := newHy2Users()
 	if c.StatsSocket != "" {
@@ -172,7 +185,7 @@ func runHysteriaWith(ctx context.Context, c *BackendConfig, conn *packetConn, lo
 	if err := reload(); err != nil {
 		return envError("users: %v", err)
 	}
-	go watchUsers(ctx, c.UsersFile, reload, users.check, log)
+	go watchUsers(ctx, c.UsersFile, reload, func() { users.check(); connLimit() }, log)
 	if err := service.Start(conn); err != nil {
 		return err
 	}
@@ -181,7 +194,7 @@ func runHysteriaWith(ctx context.Context, c *BackendConfig, conn *packetConn, lo
 }
 
 // watchUsers reloads the users file on SIGHUP and when it changes; check
-// runs at each look, every 5 s, whether it changed or not.
+// runs at each look, every 5 s and on SIGHUP, whether it changed or not.
 func watchUsers(ctx context.Context, path string, reload func() error, check func(), log *Logger) {
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
@@ -197,6 +210,7 @@ func watchUsers(ctx context.Context, path string, reload func() error, check fun
 		case <-ctx.Done():
 			return
 		case <-hup:
+			check()
 		case <-tick.C:
 			check()
 			st, err := os.Stat(path)
