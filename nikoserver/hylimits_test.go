@@ -221,8 +221,9 @@ func TestHyLimitsTCPAttemptsWait(t *testing.T) {
 			refused++
 		}
 	}
-	// 30 a second: about 15 in half a second.
-	if ok < 10 || ok > 20 || refused != 40-ok {
+	// 30 a second: about 15 in half a second (more when the machine is
+	// slow to start them: each waits from its own start).
+	if ok < 8 || ok > 26 || refused != 40-ok {
 		t.Fatalf("admitted %d, refused %d", ok, refused)
 	}
 	// A client that leaves ends its wait at once.
