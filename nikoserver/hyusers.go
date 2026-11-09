@@ -233,10 +233,19 @@ func connectionHook(users *hy2Users, live *sessions) func(net.Addr, any, func() 
 // came with. Without one (the outbound driven directly) they count for
 // nobody.
 func trafficFrom(ctx context.Context) *hy2Traffic {
+	_, t := userFrom(ctx)
+	return t
+}
+
+// userFrom is whose limits a stream or a datagram session takes (the base
+// name of the user it came with: u5 for each of u5's credentials,
+// raycontrol conn-limit-v1 §2) and the counters of its name. Without a
+// user the name is "": limited by nothing, counted for nobody.
+func userFrom(ctx context.Context) (base string, t *hy2Traffic) {
 	if user, _ := auth.UserFromContext[*hy2User](ctx); user != nil {
-		return user.traffic
+		return baseName(user.name), user.traffic
 	}
-	return new(hy2Traffic)
+	return "", new(hy2Traffic)
 }
 
 // open counts a stream or a datagram session as the name's until the
