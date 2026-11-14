@@ -2,7 +2,7 @@ module github.com/arngory/niko-server
 
 go 1.26.0
 
-toolchain go1.26.10
+toolchain go1.26.11
 
 require (
 	github.com/Arceliar/ironwood v0.0.0-20261023231900-0712eccbb962
