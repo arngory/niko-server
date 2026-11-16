@@ -427,3 +427,69 @@ func TestNekoServerQUICRebind(t *testing.T) {
 		}
 	})
 }
+
+// How many address changes a quic-go v0.64.1 server survives (review 2 of
+// quic-cid-route-v1, S1). A client with connection IDs of no length (Chromium,
+// quic-go's DialAddr, sing-quic's Hysteria2) moves as often as it likes. A
+// client with IDs of its own (quic-go on a Transport with a length, some
+// other stacks) moves twice: at each move the server takes one of the
+// client's spare IDs for its probe of the new path and, once it switched,
+// neither makes it the active one nor retires the old one (path_manager.go
+// SwitchToPath), so the spares run out; at the third move it skips the
+// validation ("no connection ID is available") and never moves. When quic-go
+// is fixed (raycontrol docs/04-roadmap.md), this test fails: lift the limit
+// here and in spec quic-cid-route-v1 §5.
+func TestNekoServerQUICRebindLimit(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		cidLen int
+		moves  int // the moves that work; one more fails, unless all do
+	}{
+		{"client IDs of no length", 0, 6},
+		{"client IDs of 8 bytes", 8, 2},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			relay := newNATRelay(t, h3Node(t, true))
+			var qc *quic.Conn
+			var err error
+			if c.cidLen == 0 {
+				qc, err = quic.DialAddr(ctx, relay.addr().String(), h3ClientTLS, &quic.Config{})
+			} else {
+				s, lerr := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+				if lerr != nil {
+					t.Fatal(lerr)
+				}
+				tr := &quic.Transport{Conn: s, ConnectionIDLength: c.cidLen}
+				t.Cleanup(func() { tr.Close(); s.Close() })
+				qc, err = tr.Dial(ctx, relay.addr(), h3ClientTLS, &quic.Config{})
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer qc.CloseWithError(0, "")
+			cc := (&http3.Transport{}).NewClientConn(qc)
+			if _, err := h3Get(ctx, cc, 5*time.Second); err != nil {
+				t.Fatal(err)
+			}
+			moved := func(within time.Duration) bool {
+				port := relay.rebind()
+				for end := time.Now().Add(within); time.Now().Before(end); time.Sleep(50 * time.Millisecond) {
+					if got, err := h3Get(ctx, cc, time.Second); err == nil && got == port.String() {
+						return true
+					}
+				}
+				return false
+			}
+			for i := range c.moves {
+				if !moved(8 * time.Second) {
+					t.Fatalf("move %d of %d failed", i+1, c.moves)
+				}
+			}
+			if c.cidLen != 0 && moved(4*time.Second) {
+				t.Fatalf("move %d worked: quic-go no longer runs out of the client's IDs; lift the limit (spec §5)", c.moves+1)
+			}
+		})
+	}
+}
