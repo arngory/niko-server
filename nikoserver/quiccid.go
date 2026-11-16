@@ -1,15 +1,14 @@
 package nikoserver
 
 import (
-	"crypto/hmac"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"math/bits"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 )
@@ -24,10 +23,11 @@ import (
 //	label (16 bits) | 0 (8 bits) | counter (40 bits)
 //
 // under the label's key, HMAC-SHA256(node secret, "quic-cid-route-v1" ||
-// BE16(label)), 16 bytes. A backend has only its own label's key; the front
-// has the secret, and so every label's. To anyone without the key the IDs
-// are random and distinct, the label included; the zero byte and the label
-// make a random 8 bytes pass for one of k labels in about k·2^-24.
+// BE16(label)), 16 bytes, which raycontrol derives. A backend has only its
+// own label's key, the front those of its backends' labels; the secret
+// stays with raycontrol. To anyone without the key the IDs are random and
+// distinct, the label included; the zero byte and the label make a random
+// 8 bytes pass for one of k labels in about k·2^-24.
 
 const (
 	// cidLen is the length of a routable connection ID.
@@ -53,21 +53,6 @@ const (
 // cidCodec is Speck64/128 with the round keys of a node's secret.
 type cidCodec struct {
 	rk [cidRounds]uint32
-}
-
-// cidLabelKey is a label's Speck key: HMAC-SHA256(secret,
-// "quic-cid-route-v1" || BE16(label)), its first 16 bytes.
-func cidLabelKey(secret []byte, label uint16) []byte {
-	mac := hmac.New(sha256.New, secret)
-	mac.Write([]byte(cidKeyContext))
-	mac.Write([]byte{byte(label >> 8), byte(label)})
-	return mac.Sum(nil)[:16]
-}
-
-// labelCodec is the codec of a label under the node's 32-byte secret: the
-// label's key read as the paper's key words l2 l1 l0 k0 (big-endian).
-func labelCodec(secret []byte, label uint16) *cidCodec {
-	return newSpeck(cidLabelKey(secret, label))
 }
 
 // newSpeck expands a Speck64/128 key given as the paper prints it: the
@@ -217,14 +202,45 @@ func (g *cidGenerator) dropAhead(p []byte) bool {
 	return len(p) >= minCIDPacket && p[0]&0xc0 == 0x40 && g.ahead(p[1:1+cidLen])
 }
 
-// readCIDSecret reads the node's secret of routable connection IDs (the
-// front's): 32 bytes in hex, as the other keys.
-func readCIDSecret(path string) ([]byte, error) {
-	return readHexKey(path, 32)
+// maxCIDKeys bounds the keys of the front's file: a node has a few QUIC
+// backends.
+const maxCIDKeys = 256
+
+// readCIDKeys reads the front's keys of its backends' labels: a line
+// "<label> <16 bytes in hex>" each, a label once. Its errors say what is
+// wrong with the file, never what it holds.
+func readCIDKeys(path string) (map[uint16]*cidCodec, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	keys := map[uint16]*cidCodec{}
+	for i, line := range strings.Split(string(b), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		label, err := strconv.ParseUint(fields[0], 10, 16)
+		if len(fields) != 2 || err != nil || label == 0 {
+			return nil, fmt.Errorf("line %d: want a label (1-%d) and its key", i+1, MaxCIDLabel)
+		}
+		key, err := hex.DecodeString(fields[1])
+		if err != nil || len(key) != 16 {
+			return nil, fmt.Errorf("line %d: want a key of 16 bytes in hex", i+1)
+		}
+		if keys[uint16(label)] != nil {
+			return nil, fmt.Errorf("line %d: label %d twice", i+1, label)
+		}
+		if len(keys) == maxCIDKeys {
+			return nil, fmt.Errorf("more than %d keys", maxCIDKeys)
+		}
+		keys[uint16(label)] = newSpeck(key)
+	}
+	return keys, nil
 }
 
-// readCIDLabelKey reads a backend's key of its label (16 bytes in hex,
-// cidLabelKey): a backend has its own label's key, not the node's secret.
+// readCIDLabelKey reads a backend's key of its label (16 bytes in hex):
+// a backend has its own label's key and no other.
 func readCIDLabelKey(path string) (*cidCodec, error) {
 	key, err := readHexKey(path, 16)
 	if err != nil {

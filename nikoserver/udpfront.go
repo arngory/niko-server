@@ -23,7 +23,7 @@ import (
 // ahead of the real packets cannot capture the flow. A flow lives until it
 // is idle for the configured time.
 //
-// With routable connection IDs (udp.cid_key_file, quic-cid-route-v1) a
+// With routable connection IDs (udp.cid_keys_file, quic-cid-route-v1) a
 // flow is also pinned by a client's packet of a connection that is under
 // way, from an address the front does not know yet: its server connection
 // ID names the backend by a label only the node can read (the client's NAT
@@ -113,24 +113,37 @@ func newUDPFront(c *FrontUDP, backends map[string]BackendRef, log *Logger) (*udp
 		f.links[name] = l
 		return l
 	}
-	var secret []byte
-	if c.CIDKeyFile != "" {
-		// Without the key the front serves UDP 443 as before: only the
+	var keys map[uint16]*cidCodec
+	if c.CIDKeysFile != "" {
+		// Without the keys the front serves UDP 443 as before: only the
 		// clients whose address changes lose their connections.
 		var err error
-		if secret, err = readCIDSecret(c.CIDKeyFile); err != nil {
-			log.Warnf("udp.cid_key_file %s: %v; no routing by connection ID", c.CIDKeyFile, err)
+		if keys, err = readCIDKeys(c.CIDKeysFile); err != nil {
+			log.Warnf("udp.cid_keys_file %s: %v; no routing by connection ID", c.CIDKeysFile, err)
 		}
+	}
+	// key is a backend's label's key, nil without one: a label the file
+	// does not have is routed by name only.
+	key := func(name string) (uint16, *cidCodec) {
+		label := uint16(backends[name].CIDLabel)
+		if keys == nil || label == 0 {
+			return 0, nil
+		}
+		if keys[label] == nil {
+			log.Warnf("udp.cid_keys_file has no key of label %d (backend %s): no routing by connection ID to it", label, name)
+		}
+		return label, keys[label]
 	}
 	labelled := map[string]bool{}
 	for _, r := range c.Routes {
-		label := uint16(backends[r.Backend].CIDLabel)
 		for _, name := range r.SNI {
 			f.byName[normalName(name)] = link(r.Backend)
 		}
-		if secret != nil && label != 0 && len(r.SNI) > 0 && !labelled[r.Backend] {
+		if len(r.SNI) > 0 && !labelled[r.Backend] {
 			labelled[r.Backend] = true
-			f.byLabel = append(f.byLabel, labelRoute{label: label, codec: labelCodec(secret, label), link: link(r.Backend)})
+			if label, codec := key(r.Backend); codec != nil {
+				f.byLabel = append(f.byLabel, labelRoute{label: label, codec: codec, link: link(r.Backend)})
+			}
 		}
 		if r.SalamanderPasswordFile != "" {
 			b, err := os.ReadFile(r.SalamanderPasswordFile)
@@ -142,13 +155,11 @@ func newUDPFront(c *FrontUDP, backends map[string]BackendRef, log *Logger) (*udp
 				return nil, envError("salamander password %s is empty", r.SalamanderPasswordFile)
 			}
 			route := salamanderRoute{password: password, link: link(r.Backend)}
-			if secret != nil && label != 0 {
-				route.label, route.codec = label, labelCodec(secret, label)
-			}
+			route.label, route.codec = key(r.Backend)
 			f.salamander = append(f.salamander, route)
 		}
 	}
-	if secret != nil {
+	if keys != nil {
 		labels := len(f.byLabel)
 		for _, r := range f.salamander {
 			if r.codec != nil {

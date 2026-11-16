@@ -554,18 +554,18 @@ func TestNekoServerConfigCIDRoute(t *testing.T) {
 		"dns":{"listen":["0.0.0.0:53"],"zones":[{"zone":"t.example.com","backend":"d"}],"stats_socket":"/run/niko/front/stats.sock"},
 		"udp":{"listen":["0.0.0.0:443"],"routes":[{"sni":["h.example.com"],"backend":"h"},
 			{"salamander_password_file":"/r/front/o.salamander","backend":"o"},{"sni":["n.example.com"],"backend":"n/quic"}]KEY}}`
-	key := `,"cid_key_file":"/r/front/quic-cid.key"`
+	key := `,"cid_keys_file":"/r/front/quic-cid.keys"`
 	if errs := checkConfig(t, strings.Replace(front, "KEY", key, 1)); len(errs) > 0 {
 		t.Fatal(errs)
 	}
 	for name, c := range map[string]struct{ from, to, path string }{
 		"labels without the key":  {"KEY", "", "backends.h.cid_label"},
-		"a relative key file":     {"KEY", `,"cid_key_file":"quic-cid.key"`, "udp.cid_key_file"},
+		"a relative key file":     {"KEY", `,"cid_keys_file":"quic-cid.keys"`, "udp.cid_keys_file"},
 		"label 0x10000":           {`"cid_label":65535`, `"cid_label":65536`, "backends.n/quic.cid_label"},
 		"a negative label":        {`"cid_label":3`, `"cid_label":-1`, "backends.h.cid_label"},
 		"one label twice":         {`"cid_label":4`, `"cid_label":3`, "backends.o.cid_label"},
 		"a DNS backend's label":   {`"uid":9104}`, `"uid":9104,"cid_label":9}`, "backends.d.cid_label"},
-		"the stats socket's path": {"KEY", `,"cid_key_file":"/run/niko/front/stats.sock"`, "dns.stats_socket"},
+		"the stats socket's path": {"KEY", `,"cid_keys_file":"/run/niko/front/stats.sock"`, "dns.stats_socket"},
 	} {
 		errs := checkConfig(t, strings.Replace(strings.Replace(front, c.from, c.to, 1), "KEY", key, 1))
 		// Without the key every label is in error: the first names it.

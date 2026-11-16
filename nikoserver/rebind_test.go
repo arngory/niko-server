@@ -138,7 +138,7 @@ func hysteriaFront(t *testing.T, ctx context.Context, withCID, frontCID bool, li
 	salamander := "c2FsYW1hbmRlci1wYXNzd29yZA"
 	pwFile := filepath.Join(dir, "salamander")
 	os.WriteFile(pwFile, []byte(salamander+"\n"), 0o600)
-	secretPath := writeCIDKey(t, dir, cidSecret)
+	frontKeys := writeCIDKeys(t, dir, cidSecret, 31, 32)
 	var direct net.Dialer
 	backends := map[string]BackendRef{}
 	for i, kind := range []string{"hy2-masq", "hy2-obfs"} {
@@ -150,7 +150,7 @@ func hysteriaFront(t *testing.T, ctx context.Context, withCID, frontCID bool, li
 		}
 		ref := BackendRef{Socket: sock, Mode: "packet", UID: uid}
 		if withCID {
-			// The backend has its own label's key, the front the secret.
+			// The backend has its own label's key, the front its backends'.
 			c.Options.CIDKeyFile, c.Options.CIDLabel = writeCIDLabelKey(t, dir, cidSecret, uint16(31+i)), 31+i
 			if frontCID {
 				ref.CIDLabel = 31 + i
@@ -169,7 +169,7 @@ func hysteriaFront(t *testing.T, ctx context.Context, withCID, frontCID bool, li
 		{SalamanderPasswordFile: pwFile, Backend: "hy2-obfs"},
 	}}
 	if withCID && frontCID {
-		fc.CIDKeyFile = secretPath
+		fc.CIDKeysFile = frontKeys
 	}
 	return runUDPFront(t, fc, backends), salamander
 }
@@ -295,7 +295,7 @@ func h3Node(t *testing.T, withCID bool) *net.UDPAddr {
 		}
 		tr.ConnectionIDGenerator = quicgoCIDs{g}
 		ref.CIDLabel = 41
-		fc.CIDKeyFile = writeCIDKey(t, dir, cidSecret)
+		fc.CIDKeysFile = writeCIDKeys(t, dir, cidSecret, 41)
 	}
 	cert := selfSigned(t, "h3.example.com")
 	ln, err := tr.ListenEarly(http3.ConfigureTLSConfig(&tls.Config{Certificates: []tls.Certificate{cert}}), &quic.Config{MaxIdleTimeout: 30 * time.Second})

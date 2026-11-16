@@ -14,6 +14,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -42,10 +43,15 @@ func writeCIDLabelKey(t testing.TB, dir string, secret []byte, label uint16) str
 	return p
 }
 
-func writeCIDKey(t testing.TB, dir string, secret []byte) string {
+// writeCIDKeys writes the front's keys of labels under a node's secret.
+func writeCIDKeys(t testing.TB, dir string, secret []byte, labels ...uint16) string {
 	t.Helper()
-	p := filepath.Join(dir, "quic-cid.key")
-	if err := os.WriteFile(p, []byte(hex.EncodeToString(secret)+"\n"), 0o600); err != nil {
+	var b strings.Builder
+	for _, l := range labels {
+		fmt.Fprintf(&b, "%d %s\n", l, hex.EncodeToString(cidLabelKey(secret, l)))
+	}
+	p := filepath.Join(dir, "quic-cid.keys")
+	if err := os.WriteFile(p, []byte(b.String()), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return p
@@ -100,7 +106,7 @@ func cidFront(t testing.TB, withKey bool) (*udpFront, string) {
 		{SalamanderPasswordFile: pwFile, Backend: "s"},
 	}}
 	if withKey {
-		c.CIDKeyFile = writeCIDKey(t, dir, cidSecret)
+		c.CIDKeysFile = writeCIDKeys(t, dir, cidSecret, 1, 2, 3)
 	}
 	backends := map[string]BackendRef{}
 	for name, label := range map[string]int{"a": 1, "b": 2, "s": 3, "n": 0} {
@@ -176,6 +182,39 @@ func TestUDPFrontCIDClassify(t *testing.T) {
 	plain, _ := cidFront(t, false)
 	if link, _ := plain.classify(key(), shortPacket(id(1), 1200), now); link != nil {
 		t.Fatal("routed by ID without a key")
+	}
+}
+
+// The front has its backends' labels' keys, never the node's secret: a
+// label whose key its file lacks is routed by name only, the others by
+// their keys; a file that does not read routes none by ID.
+func TestUDPFrontCIDKeys(t *testing.T) {
+	dir := t.TempDir()
+	backends := map[string]BackendRef{}
+	for name, label := range map[string]int{"a": 1, "b": 2} {
+		backends[name] = BackendRef{Socket: filepath.Join(dir, name+".sock"), Mode: "packet", UID: os.Getuid(), CIDLabel: label}
+	}
+	c := &FrontUDP{Listen: []string{"127.0.0.1:0"}, CIDKeysFile: writeCIDKeys(t, dir, cidSecret, 1, 7), Routes: []UDPRoute{
+		{SNI: []string{"a.example.com"}, Backend: "a"},
+		{SNI: []string{"b.example.com"}, Backend: "b"},
+	}}
+	f, err := newUDPFront(c, backends, NewLogger("warn", io.Discard))
+	if err != nil {
+		t.Fatal(err)
+	}
+	k := flowKey{netip.MustParseAddrPort("192.0.2.1:5000"), netip.MustParseAddrPort("127.0.0.1:443")}
+	if link, _ := f.classify(k, shortPacket(cidID(cidSecret, 1, 1), 100), time.Now()); link == nil || link.name != "a" {
+		t.Fatalf("label 1, whose key the front has: %v", link)
+	}
+	if link, _ := f.classify(k, shortPacket(cidID(cidSecret, 2, 1), 100), time.Now()); link != nil {
+		t.Fatal("label 2, whose key the front lacks, routed")
+	}
+	if len(f.byLabel) != 1 {
+		t.Fatalf("%d labels routed", len(f.byLabel))
+	}
+	os.WriteFile(c.CIDKeysFile, []byte("1 "+hex.EncodeToString(cidSecret)+"\n"), 0o600) // the secret: not a key
+	if f, err = newUDPFront(c, backends, NewLogger("warn", io.Discard)); err != nil || len(f.byLabel) != 0 {
+		t.Fatalf("a file that does not read: %d labels routed, %v", len(f.byLabel), err)
 	}
 }
 
@@ -333,7 +372,7 @@ func TestUDPFrontCIDNewAddress(t *testing.T) {
 	password := "c2FsYW1hbmRlci1wYXNzd29yZA"
 	pwFile := filepath.Join(dir, "salamander")
 	os.WriteFile(pwFile, []byte(password+"\n"), 0o600)
-	c := &FrontUDP{Listen: []string{"127.0.0.1:0"}, CIDKeyFile: writeCIDKey(t, dir, cidSecret), Routes: []UDPRoute{
+	c := &FrontUDP{Listen: []string{"127.0.0.1:0"}, CIDKeysFile: writeCIDKeys(t, dir, cidSecret, 11, 12), Routes: []UDPRoute{
 		{SNI: []string{"h.example.com"}, Backend: "hy2-masq"},
 		{SalamanderPasswordFile: pwFile, Backend: "hy2-obfs"},
 	}}

@@ -55,7 +55,7 @@ type BackendRef struct {
 	Devices bool `json:"devices,omitempty"`
 	// CIDLabel (v0.18.0): the label of a QUIC backend's connection IDs
 	// (raycontrol docs/spec/quic-cid-route-v1.md), 1-65535, one per
-	// backend. With udp.cid_key_file the front takes a client's packet from
+	// backend. With udp.cid_keys_file the front takes a client's packet from
 	// an address it does not know to the backend its ID names: the client's
 	// NAT gave it another port, or it moved to a new socket. A backend of a
 	// UDP route only.
@@ -132,12 +132,13 @@ type FrontUDP struct {
 	Listen []string   `json:"listen"`
 	Idle   string     `json:"idle,omitempty"`
 	Routes []UDPRoute `json:"routes"`
-	// CIDKeyFile (v0.18.0): the node's secret of routable connection IDs
-	// (quic-cid-route-v1), 32 bytes in hex. Each label's key comes from it;
-	// a QUIC backend has only its own label's. A file that does not read
-	// leaves the routing by ID off, and only it: the front serves UDP 443
-	// as before.
-	CIDKeyFile string `json:"cid_key_file,omitempty"`
+	// CIDKeysFile (v0.18.0): the keys of the labels of routable connection
+	// IDs (quic-cid-route-v1), a line "<label> <16 bytes in hex>" each, as
+	// raycontrol derives them from the node's secret, which the front never
+	// has. A file that does not read leaves the routing by ID off, and only
+	// it: the front serves UDP 443 as before; a label without a key is
+	// routed by name only.
+	CIDKeysFile string `json:"cid_keys_file,omitempty"`
 }
 
 type FrontConfig struct {
@@ -462,8 +463,8 @@ func (c *FrontConfig) validate() []ConfigError {
 			switch {
 			case !routed:
 				e.add(path+".cid_label", "a QUIC backend's: no udp route names %q", name)
-			case c.UDP.CIDKeyFile == "":
-				e.add(path+".cid_label", "needs udp.cid_key_file")
+			case c.UDP.CIDKeysFile == "":
+				e.add(path+".cid_label", "needs udp.cid_keys_file")
 			}
 			for other, o := range c.Backends {
 				if other < name && o.CIDLabel == b.CIDLabel {
@@ -535,8 +536,8 @@ func (c *FrontConfig) validate() []ConfigError {
 		if samePath(c.DNS.StatsSocket, c.DNS.ProbeKeyFile) {
 			e.add("dns.stats_socket", "the probe key file")
 		}
-		if c.UDP != nil && samePath(c.DNS.StatsSocket, c.UDP.CIDKeyFile) {
-			e.add("dns.stats_socket", "udp.cid_key_file")
+		if c.UDP != nil && samePath(c.DNS.StatsSocket, c.UDP.CIDKeysFile) {
+			e.add("dns.stats_socket", "udp.cid_keys_file")
 		}
 		if c.UDP != nil {
 			for i, r := range c.UDP.Routes {
@@ -977,8 +978,8 @@ func (u *FrontUDP) validate(e *configErrors, backends map[string]BackendRef) {
 	if len(u.Routes) == 0 {
 		e.add("udp.routes", "no routes")
 	}
-	if u.CIDKeyFile != "" {
-		checkSocket(e, "udp.cid_key_file", u.CIDKeyFile)
+	if u.CIDKeysFile != "" {
+		checkSocket(e, "udp.cid_keys_file", u.CIDKeysFile)
 	}
 	names := map[string]bool{}
 	for i, r := range u.Routes {

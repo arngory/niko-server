@@ -2,8 +2,11 @@ package nikoserver
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -24,6 +27,22 @@ func TestSpeckVector(t *testing.T) {
 	if x, y = c.decrypt(x, y); x != 0x3b726574 || y != 0x7475432d {
 		t.Fatalf("decrypt: %08x %08x", x, y)
 	}
+}
+
+// cidLabelKey is a label's Speck key, as raycontrol derives it from the
+// node's secret (quic-cid-route-v1 §2): HMAC-SHA256(secret,
+// "quic-cid-route-v1" || BE16(label)), its first 16 bytes. niko-server
+// never has the secret: the tests derive the keys they give it.
+func cidLabelKey(secret []byte, label uint16) []byte {
+	mac := hmac.New(sha256.New, secret)
+	mac.Write([]byte("quic-cid-route-v1"))
+	mac.Write([]byte{byte(label >> 8), byte(label)})
+	return mac.Sum(nil)[:16]
+}
+
+// labelCodec is the codec of a label's key under a node's secret.
+func labelCodec(secret []byte, label uint16) *cidCodec {
+	return newSpeck(cidLabelKey(secret, label))
 }
 
 // The spec's example (quic-cid-route-v1 §8): raycontrol's codec checks the
@@ -219,42 +238,68 @@ func TestClientCID(t *testing.T) {
 	}
 }
 
-// The front reads the node's secret (32 bytes), a backend its label's key
-// (16 bytes); neither takes the other's, and errors tell nothing of either.
+// The front reads its backends' labels' keys (a line "<label> <key>"
+// each), a backend its own label's key (16 bytes); neither takes the
+// other's, nor the node's secret, and errors tell nothing of the keys.
 func TestReadCIDKeys(t *testing.T) {
 	dir := t.TempDir()
 	secret := bytes.Repeat([]byte{3}, 32)
-	sf, kf := filepath.Join(dir, "secret"), filepath.Join(dir, "label")
-	os.WriteFile(sf, []byte(hex.EncodeToString(secret)+"\n"), 0o600)
-	os.WriteFile(kf, []byte(hex.EncodeToString(cidLabelKey(secret, 4))+"\n"), 0o600)
-	if got, err := readCIDSecret(sf); err != nil || !bytes.Equal(got, secret) {
-		t.Fatalf("secret: %v", err)
-	}
-	if c, err := readCIDLabelKey(kf); err != nil || c.rk != labelCodec(secret, 4).rk {
-		t.Fatalf("label key: %v", err)
-	}
-	if _, err := readCIDSecret(kf); err == nil {
-		t.Fatal("a label's key read as the secret")
-	}
-	if _, err := readCIDLabelKey(sf); err == nil {
-		t.Fatal("the secret read as a label's key")
-	}
-	for name, content := range map[string]string{"short": "0102", "not hex": "zz", "empty": ""} {
+	k4, k9 := hex.EncodeToString(cidLabelKey(secret, 4)), hex.EncodeToString(cidLabelKey(secret, 9))
+	write := func(name, content string) string {
 		p := filepath.Join(dir, name)
 		os.WriteFile(p, []byte(content), 0o600)
-		if _, err := readCIDSecret(p); err == nil {
+		return p
+	}
+	front := write("front", "4 "+k4+"\n\n9 "+k9+"\n")
+	keys, err := readCIDKeys(front)
+	if err != nil || len(keys) != 2 || keys[4].rk != labelCodec(secret, 4).rk || keys[9].rk != labelCodec(secret, 9).rk {
+		t.Fatalf("front's keys: %d, %v", len(keys), err)
+	}
+	backend := write("backend", k4+"\n")
+	if c, err := readCIDLabelKey(backend); err != nil || c.rk != labelCodec(secret, 4).rk {
+		t.Fatalf("backend's key: %v", err)
+	}
+	if _, err := readCIDLabelKey(front); err == nil {
+		t.Fatal("the front's file read as a backend's key")
+	}
+	if _, err := readCIDKeys(backend); err == nil {
+		t.Fatal("a backend's key read as the front's file")
+	}
+	for name, content := range map[string]string{
+		"the secret":     "4 " + hex.EncodeToString(secret),
+		"short key":      "4 0102",
+		"not hex":        "4 zz" + k4[4:],
+		"label 0":        "0 " + k4,
+		"label 65536":    "65536 " + k4,
+		"no label":       k4,
+		"three fields":   "4 " + k4 + " 5",
+		"a label twice":  "4 " + k4 + "\n4 " + k9,
+		"a signed label": "+4 " + k4,
+	} {
+		_, err := readCIDKeys(write("bad", content))
+		if err == nil {
 			t.Errorf("%s: read", name)
-		}
-		if _, err := readCIDLabelKey(p); err == nil {
-			t.Errorf("%s: read", name)
+		} else if strings.Contains(err.Error(), k4[:8]) || strings.Contains(err.Error(), k9[:8]) {
+			t.Errorf("%s: the error tells a key: %v", name, err)
 		}
 	}
-	if _, err := readCIDSecret(filepath.Join(dir, "missing")); err == nil {
+	var many strings.Builder
+	for l := range maxCIDKeys + 1 {
+		fmt.Fprintf(&many, "%d %s\n", l+1, k4)
+	}
+	if _, err := readCIDKeys(write("many", many.String())); err == nil {
+		t.Error("more than maxCIDKeys keys")
+	}
+	if keys, err := readCIDKeys(write("empty", "")); err != nil || len(keys) != 0 {
+		t.Errorf("an empty file: %v %v", keys, err)
+	}
+	if _, err := readCIDKeys(filepath.Join(dir, "missing")); err == nil {
 		t.Error("missing file")
 	}
-	_, err := readCIDSecret(kf)
-	if strings.Contains(err.Error(), hex.EncodeToString(cidLabelKey(secret, 4))[:8]) {
-		t.Fatalf("the error tells the key: %v", err)
+	for name, content := range map[string]string{"short": "0102", "not hex": "zz", "empty": "", "the secret": hex.EncodeToString(secret)} {
+		if _, err := readCIDLabelKey(write("bad", content)); err == nil {
+			t.Errorf("backend, %s: read", name)
+		}
 	}
 }
 
