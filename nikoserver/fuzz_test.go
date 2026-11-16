@@ -151,15 +151,14 @@ func FuzzQUICInitial(f *testing.F) {
 // only by a label of that backend's, read under its own obfuscation.
 func FuzzCIDRoute(f *testing.F) {
 	front, password := cidFront(f, true)
-	codec := newCIDCodec(cidSecret)
 	for _, label := range []uint16{1, 2, 3, 9} {
-		id := codec.encode(label, uint64(label)<<20)
+		id := cidID(cidSecret, label, uint64(label)<<20)
 		f.Add(shortPacket(id, 64))
 		f.Add(handshakePacket(id, 64))
 		f.Add(obfuscate(password, shortPacket(id, 64)))
 		f.Add(obfuscate(password, handshakePacket(id, 64)))
 	}
-	f.Add(shortPacket(codec.encode(1, 0), minCIDPacket))
+	f.Add(shortPacket(cidID(cidSecret, 1, 0), minCIDPacket))
 	f.Add([]byte{0x40, 1, 2, 3})
 	labelOf := map[string]uint16{"a": 1, "b": 2, "s": 3}
 	var n uint32
@@ -178,13 +177,13 @@ func FuzzCIDRoute(f *testing.F) {
 		if link.name == "s" {
 			head, ok := salamanderHead([]byte(password), d)
 			id := clientCID(head[:min(len(d)-8, cidHead)], len(d)-8)
-			if label, lok := codec.label(id); !ok || !isQUICInitial(head[:7]) && (id == nil || !lok || label != labelOf["s"]) {
+			if label, lok := labelCodec(cidSecret, labelOf["s"]).label(id); !ok || !isQUICInitial(head[:7]) && (id == nil || !lok || label != labelOf["s"]) {
 				t.Fatalf("to s without its Initial or label: %x", d[:min(len(d), 24)])
 			}
 			return
 		}
 		id := clientCID(d[:min(len(d), cidHead)], len(d))
-		if label, ok := codec.label(id); id == nil || !ok || label != labelOf[link.name] {
+		if label, ok := labelCodec(cidSecret, labelOf[link.name]).label(id); id == nil || !ok || label != labelOf[link.name] {
 			t.Fatalf("to %s by label %d %v: %x", link.name, label, ok, d[:min(len(d), 24)])
 		}
 	})
@@ -195,7 +194,7 @@ func FuzzCIDRoute(f *testing.F) {
 func FuzzCIDCodec(f *testing.F) {
 	f.Add(uint16(1), uint64(0), uint32(0), uint32(0))
 	f.Add(uint16(MaxCIDLabel), uint64(1<<40-1), uint32(0xffffffff), uint32(1))
-	codec := newCIDCodec(cidSecret)
+	codec := labelCodec(cidSecret, 1)
 	f.Fuzz(func(t *testing.T, label uint16, counter uint64, x, y uint32) {
 		id := codec.encode(label, counter)
 		got, ok := codec.label(id[:])

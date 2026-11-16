@@ -5,6 +5,7 @@ package nikoserver
 import (
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -242,5 +243,71 @@ func TestNekoServerHysteriaSpoofedSource(t *testing.T) {
 				t.Fatalf("the download stopped after the forged packet: %d bytes in 1.5 s", after-before)
 			}
 		})
+	}
+}
+
+// Whoever has a label's key reads the counter in its IDs, and so knows the
+// IDs to come; a stateless reset's token is a function of the ID, and a
+// packet for an ID not issued yet used to get one: its token, collected
+// now, ended that connection later (review of quic-cid-route-v1, F2). Now
+// hy2-masq (the Hysteria2 backend with stateless resets) drops a packet
+// for an ID of its own it will issue, and answers one it never will (a
+// process before it) with a reset, as before.
+func TestNekoServerHysteriaNoResetAhead(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	echo, _ := echoPair(t)
+	server, _ := hysteriaNode(t, ctx, true, true)
+	relay := newNATRelay(t, server)
+	codec := labelCodec(cidSecret, 31) // hy2-masq's label
+	var mu sync.Mutex
+	var counter uint64
+	seen := false
+	relay.mu.Lock()
+	relay.up = func(d []byte) {
+		if len(d) < minCIDPacket || d[0]&0xc0 != 0x40 {
+			return
+		}
+		x, y := codec.decrypt(binary.BigEndian.Uint32(d[1:5]), binary.BigEndian.Uint32(d[5:9]))
+		mu.Lock()
+		defer mu.Unlock()
+		if c := uint64(x&0xff)<<32 | uint64(y); uint16(x>>16) == 31 && (!seen || c > counter) {
+			counter, seen = c, true
+		}
+	}
+	relay.mu.Unlock()
+	client := hysteriaClient(t, ctx, "h.example.com", "", hysteria2.ClientOptions{ServerAddress: M.SocksaddrFromNet(relay.addr())})
+	conn, err := client.DialConn(ctx, M.SocksaddrFromNet(echo.Addr()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.Write([]byte("x"))
+	io.ReadFull(conn, make([]byte, 1))
+	mu.Lock()
+	last, ok := counter, seen
+	mu.Unlock()
+	if !ok {
+		t.Fatal("no short header of the client's")
+	}
+	// The server has issued a few IDs past the one the client uses.
+	answered := func(c uint64) bool {
+		s, err := net.DialUDP("udp4", nil, server)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		s.Write(shortPacket(codec.encode(31, c&(1<<cidCounterBits-1)), 100))
+		s.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		_, err = s.Read(make([]byte, 200))
+		return err == nil
+	}
+	for k := uint64(8); k < 24; k++ {
+		if answered(last + k) {
+			t.Fatalf("a stateless reset for counter +%d, an ID the server will issue", k)
+		}
+	}
+	if !answered(last - 1000) {
+		t.Fatal("no stateless reset for an ID the server never issued: resets are off, the test proves nothing")
 	}
 }

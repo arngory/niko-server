@@ -37,11 +37,10 @@ type udpFront struct {
 	salamander []salamanderRoute
 	links      map[string]*backendLink
 	sockets    map[netip.AddrPort]*net.UDPConn
-	// cid reads the labels of connection IDs; nil: no routing by ID.
-	cid *cidCodec
-	// byLabel are the backends of plain QUIC by label; a salamander
-	// backend's label is its route's.
-	byLabel map[uint16]*backendLink
+	// byLabel are the backends of plain QUIC with a label, each with its
+	// label's key; a salamander backend's is its route's. None: no routing
+	// by connection ID.
+	byLabel []labelRoute
 
 	access  sync.Mutex
 	flows   map[flowKey]*udpFlow
@@ -53,7 +52,15 @@ type udpFront struct {
 type salamanderRoute struct {
 	password []byte
 	link     *backendLink
-	label    uint16 // its backend's label, 0 none
+	label    uint16    // its backend's label, 0 none
+	codec    *cidCodec // the label's key; nil: no routing by ID
+}
+
+// labelRoute is a plain QUIC backend's label and its key.
+type labelRoute struct {
+	label uint16
+	codec *cidCodec
+	link  *backendLink
 }
 
 type flowKey struct{ client, local netip.AddrPort }
@@ -106,23 +113,24 @@ func newUDPFront(c *FrontUDP, backends map[string]BackendRef, log *Logger) (*udp
 		f.links[name] = l
 		return l
 	}
+	var secret []byte
 	if c.CIDKeyFile != "" {
 		// Without the key the front serves UDP 443 as before: only the
 		// clients whose address changes lose their connections.
-		cid, err := readCIDKey(c.CIDKeyFile)
-		if err != nil {
+		var err error
+		if secret, err = readCIDSecret(c.CIDKeyFile); err != nil {
 			log.Warnf("udp.cid_key_file %s: %v; no routing by connection ID", c.CIDKeyFile, err)
-		} else {
-			f.cid, f.byLabel = cid, map[uint16]*backendLink{}
 		}
 	}
+	labelled := map[string]bool{}
 	for _, r := range c.Routes {
 		label := uint16(backends[r.Backend].CIDLabel)
 		for _, name := range r.SNI {
 			f.byName[normalName(name)] = link(r.Backend)
 		}
-		if f.cid != nil && label != 0 && len(r.SNI) > 0 {
-			f.byLabel[label] = link(r.Backend)
+		if secret != nil && label != 0 && len(r.SNI) > 0 && !labelled[r.Backend] {
+			labelled[r.Backend] = true
+			f.byLabel = append(f.byLabel, labelRoute{label: label, codec: labelCodec(secret, label), link: link(r.Backend)})
 		}
 		if r.SalamanderPasswordFile != "" {
 			b, err := os.ReadFile(r.SalamanderPasswordFile)
@@ -133,13 +141,17 @@ func newUDPFront(c *FrontUDP, backends map[string]BackendRef, log *Logger) (*udp
 			if len(password) == 0 {
 				return nil, envError("salamander password %s is empty", r.SalamanderPasswordFile)
 			}
-			f.salamander = append(f.salamander, salamanderRoute{password: password, link: link(r.Backend), label: label})
+			route := salamanderRoute{password: password, link: link(r.Backend)}
+			if secret != nil && label != 0 {
+				route.label, route.codec = label, labelCodec(secret, label)
+			}
+			f.salamander = append(f.salamander, route)
 		}
 	}
-	if f.cid != nil {
+	if secret != nil {
 		labels := len(f.byLabel)
 		for _, r := range f.salamander {
-			if r.label != 0 {
+			if r.codec != nil {
 				labels++
 			}
 		}
@@ -271,11 +283,15 @@ func (f *udpFront) classify(key flowKey, d []byte, now time.Time) (*backendLink,
 	// A packet of a connection under way, by its connection ID's label:
 	// plain QUIC's backends here, a salamander backend's below, each only
 	// under its own obfuscation.
-	if f.cid != nil {
+	// Each label has its own key: one decryption per label.
+	if len(f.byLabel) > 0 {
 		if id := clientCID(d[:min(len(d), cidHead)], len(d)); id != nil {
-			if label, ok := f.cid.label(id); ok {
-				if link := f.byLabel[label]; link != nil && f.cidAllow(key.client, now) {
-					return link, [][]byte{append([]byte(nil), d...)}
+			for _, r := range f.byLabel {
+				if label, ok := r.codec.label(id); ok && label == r.label {
+					if !f.cidAllow(key.client, now) {
+						return nil, nil
+					}
+					return r.link, [][]byte{append([]byte(nil), d...)}
 				}
 			}
 		}
@@ -288,11 +304,11 @@ func (f *udpFront) classify(key flowKey, d []byte, now time.Time) (*backendLink,
 		if isQUICInitial(head[:7]) {
 			return r.link, [][]byte{append([]byte(nil), d...)}
 		}
-		if f.cid == nil || r.label == 0 {
+		if r.codec == nil {
 			continue
 		}
 		if id := clientCID(head[:min(len(d)-8, cidHead)], len(d)-8); id != nil {
-			if label, ok := f.cid.label(id); ok && label == r.label && f.cidAllow(key.client, now) {
+			if label, ok := r.codec.label(id); ok && label == r.label && f.cidAllow(key.client, now) {
 				return r.link, [][]byte{append([]byte(nil), d...)}
 			}
 		}

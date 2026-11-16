@@ -7,6 +7,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -29,7 +30,10 @@ func TestSpeckVector(t *testing.T) {
 // same numbers.
 func TestCIDExample(t *testing.T) {
 	secret, _ := hex.DecodeString("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
-	c := newCIDCodec(secret)
+	if got := hex.EncodeToString(cidLabelKey(secret, 0x0102)); got != "167e64ae0e81012cf5f8667f5525e7ee" {
+		t.Fatalf("label key %s", got)
+	}
+	c := labelCodec(secret, 0x0102)
 	id := c.encode(0x0102, 0x030405060708) // the counter's low 40 bits: 0405060708
 	if got := hex.EncodeToString(id[:]); got != cidExample {
 		t.Fatalf("ID %s, want %s", got, cidExample)
@@ -43,12 +47,20 @@ func TestCIDExample(t *testing.T) {
 	}
 }
 
-const cidExample = "61224892a4254ad8"
+const cidExample = "0243e188ccdc1084"
 
+// Each label has its own key: an ID reads as its label under that key
+// only, not under another label's of the same node, nor another node's.
 func TestCIDLabels(t *testing.T) {
-	c := newCIDCodec(bytes.Repeat([]byte{7}, 32))
-	other := newCIDCodec(bytes.Repeat([]byte{8}, 32))
-	for _, label := range []uint16{1, 2, 300, MaxCIDLabel} {
+	secret := bytes.Repeat([]byte{7}, 32)
+	labels := []uint16{1, 2, 300, MaxCIDLabel}
+	for i, label := range labels {
+		c := labelCodec(secret, label)
+		neighbour := labelCodec(secret, labels[(i+1)%len(labels)])
+		other := labelCodec(bytes.Repeat([]byte{8}, 32), label)
+		if c.rk == neighbour.rk || c.rk == other.rk {
+			t.Fatal("two labels, or two nodes, share a key")
+		}
 		g, err := newCIDGenerator(c, label)
 		if err != nil {
 			t.Fatal(err)
@@ -63,16 +75,19 @@ func TestCIDLabels(t *testing.T) {
 			if got, ok := c.label(id[:]); !ok || got != label {
 				t.Fatalf("label %d read as %d %v", label, got, ok)
 			}
-			// Another node's key reads no label in it, but by chance.
-			if got, ok := other.label(id[:]); ok && got == label {
-				t.Fatalf("another key reads label %d", got)
+			// Another key reads no label in it, but by chance.
+			for _, k := range []*cidCodec{neighbour, other} {
+				if got, ok := k.label(id[:]); ok && (got == label || got == labels[(i+1)%len(labels)]) {
+					t.Fatalf("another key reads label %d", got)
+				}
 			}
 		}
 	}
-	if _, err := newCIDGenerator(c, 0); err == nil {
+	if _, err := newCIDGenerator(labelCodec(secret, 1), 0); err == nil {
 		t.Fatal("label 0")
 	}
 	// The counter wraps within its 40 bits.
+	c := labelCodec(secret, 9)
 	g, _ := newCIDGenerator(c, 9)
 	g.next.Store(1<<cidCounterBits - 2)
 	a, b := g.generate(), g.generate()
@@ -81,10 +96,51 @@ func TestCIDLabels(t *testing.T) {
 	}
 }
 
-// Random IDs read as one of a few labels about labels·2^-24 of the time:
-// none in a million for one label, by a wide margin.
+// An ID the generator has not issued yet, within its window, is ahead;
+// one it issued, one of another label or another key, or garbage is not.
+func TestCIDAhead(t *testing.T) {
+	secret := bytes.Repeat([]byte{6}, 32)
+	c := labelCodec(secret, 5)
+	g, _ := newCIDGenerator(c, 5)
+	g.next.Store(1<<cidCounterBits - 3) // the window wraps past 2^40
+	issued := [][cidLen]byte{g.generate(), g.generate(), g.generate()}
+	last := g.next.Load()
+	for _, id := range issued {
+		if g.ahead(id[:]) {
+			t.Fatalf("%x issued, read as ahead", id)
+		}
+	}
+	const mask = 1<<cidCounterBits - 1
+	for _, d := range []uint64{1, 2, 64, cidAheadWindow} {
+		id := c.encode(5, (last+d)&mask)
+		if !g.ahead(id[:]) {
+			t.Fatalf("counter +%d not ahead", d)
+		}
+	}
+	for _, d := range []uint64{0, cidAheadWindow + 1, 1 << 39} {
+		id := c.encode(5, (last+d)&mask)
+		if g.ahead(id[:]) {
+			t.Fatalf("counter +%d ahead", d)
+		}
+	}
+	next := c.encode(5, (last+1)&mask)
+	if g.generate() != next || g.ahead(next[:]) {
+		t.Fatal("the next ID, once issued, is still ahead")
+	}
+	for _, id := range [][cidLen]byte{labelCodec(secret, 6).encode(6, last+2), labelCodec(bytes.Repeat([]byte{1}, 32), 5).encode(5, last+2), {1, 2, 3}} {
+		if g.ahead(id[:]) {
+			t.Fatalf("%x: ahead", id)
+		}
+	}
+	if g.ahead([]byte{1, 2, 3}) {
+		t.Fatal("3 bytes")
+	}
+}
+
+// Random IDs read as a label under its key about 2^-24 of the time: none
+// in a million, by a wide margin.
 func TestCIDRandomMiss(t *testing.T) {
-	c := newCIDCodec(bytes.Repeat([]byte{1}, 32))
+	c := labelCodec(bytes.Repeat([]byte{1}, 32), 5)
 	r := rand.New(rand.NewPCG(1, 2))
 	var id [cidLen]byte
 	hits := 0
@@ -137,30 +193,49 @@ func TestClientCID(t *testing.T) {
 	}
 }
 
-func TestReadCIDKey(t *testing.T) {
+// The front reads the node's secret (32 bytes), a backend its label's key
+// (16 bytes); neither takes the other's, and errors tell nothing of either.
+func TestReadCIDKeys(t *testing.T) {
 	dir := t.TempDir()
-	good := filepath.Join(dir, "good")
-	os.WriteFile(good, []byte(hex.EncodeToString(bytes.Repeat([]byte{3}, 32))+"\n"), 0o600)
-	c, err := readCIDKey(good)
-	if err != nil || c.rk != newCIDCodec(bytes.Repeat([]byte{3}, 32)).rk {
-		t.Fatalf("good key: %v", err)
+	secret := bytes.Repeat([]byte{3}, 32)
+	sf, kf := filepath.Join(dir, "secret"), filepath.Join(dir, "label")
+	os.WriteFile(sf, []byte(hex.EncodeToString(secret)+"\n"), 0o600)
+	os.WriteFile(kf, []byte(hex.EncodeToString(cidLabelKey(secret, 4))+"\n"), 0o600)
+	if got, err := readCIDSecret(sf); err != nil || !bytes.Equal(got, secret) {
+		t.Fatalf("secret: %v", err)
+	}
+	if c, err := readCIDLabelKey(kf); err != nil || c.rk != labelCodec(secret, 4).rk {
+		t.Fatalf("label key: %v", err)
+	}
+	if _, err := readCIDSecret(kf); err == nil {
+		t.Fatal("a label's key read as the secret")
+	}
+	if _, err := readCIDLabelKey(sf); err == nil {
+		t.Fatal("the secret read as a label's key")
 	}
 	for name, content := range map[string]string{"short": "0102", "not hex": "zz", "empty": ""} {
 		p := filepath.Join(dir, name)
 		os.WriteFile(p, []byte(content), 0o600)
-		if _, err := readCIDKey(p); err == nil {
+		if _, err := readCIDSecret(p); err == nil {
+			t.Errorf("%s: read", name)
+		}
+		if _, err := readCIDLabelKey(p); err == nil {
 			t.Errorf("%s: read", name)
 		}
 	}
-	if _, err := readCIDKey(filepath.Join(dir, "missing")); err == nil {
+	if _, err := readCIDSecret(filepath.Join(dir, "missing")); err == nil {
 		t.Error("missing file")
+	}
+	_, err := readCIDSecret(kf)
+	if strings.Contains(err.Error(), hex.EncodeToString(cidLabelKey(secret, 4))[:8]) {
+		t.Fatalf("the error tells the key: %v", err)
 	}
 }
 
 // The decode path costs no allocation: a flood of short headers that are
 // not ours costs the front no garbage.
 func TestCIDNoAllocations(t *testing.T) {
-	c := newCIDCodec(bytes.Repeat([]byte{4}, 32))
+	c := labelCodec(bytes.Repeat([]byte{4}, 32), 1)
 	d := make([]byte, 1200)
 	d[0] = 0x45
 	if n := testing.AllocsPerRun(1000, func() {

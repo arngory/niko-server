@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"math/bits"
 	"os"
 	"strings"
@@ -22,10 +23,11 @@ import (
 //
 //	label (16 bits) | 0 (8 bits) | counter (40 bits)
 //
-// under a key the front and the backends share. To anyone without the key
-// the IDs are random and distinct, the label included; the zero byte and
-// the few labels in use make a random 8 bytes pass for one in about
-// labels·2^-24.
+// under the label's key, HMAC-SHA256(node secret, "quic-cid-route-v1" ||
+// BE16(label)), 16 bytes. A backend has only its own label's key; the front
+// has the secret, and so every label's. To anyone without the key the IDs
+// are random and distinct, the label included; the zero byte and the label
+// make a random 8 bytes pass for one of k labels in about k·2^-24.
 
 const (
 	// cidLen is the length of a routable connection ID.
@@ -53,13 +55,19 @@ type cidCodec struct {
 	rk [cidRounds]uint32
 }
 
-// newCIDCodec derives the Speck key from the node's 32-byte secret:
-// HMAC-SHA256(secret, "quic-cid-route-v1"), its first 16 bytes, read as
-// the paper's key words l2 l1 l0 k0 (big-endian).
-func newCIDCodec(secret []byte) *cidCodec {
+// cidLabelKey is a label's Speck key: HMAC-SHA256(secret,
+// "quic-cid-route-v1" || BE16(label)), its first 16 bytes.
+func cidLabelKey(secret []byte, label uint16) []byte {
 	mac := hmac.New(sha256.New, secret)
 	mac.Write([]byte(cidKeyContext))
-	return newSpeck(mac.Sum(nil)[:16])
+	mac.Write([]byte{byte(label >> 8), byte(label)})
+	return mac.Sum(nil)[:16]
+}
+
+// labelCodec is the codec of a label under the node's 32-byte secret: the
+// label's key read as the paper's key words l2 l1 l0 k0 (big-endian).
+func labelCodec(secret []byte, label uint16) *cidCodec {
+	return newSpeck(cidLabelKey(secret, label))
 }
 
 // newSpeck expands a Speck64/128 key given as the paper prints it: the
@@ -175,16 +183,56 @@ func (g *cidGenerator) generate() [cidLen]byte {
 	return g.codec.encode(g.label, g.next.Add(1)&(1<<cidCounterBits-1))
 }
 
-// readCIDKey reads the node's secret of routable connection IDs: 32 bytes
-// in hex, as the other keys.
-func readCIDKey(path string) (*cidCodec, error) {
+// cidAheadWindow is how far past the last ID issued an ID of the
+// generator's own counts as one it will issue: 2^32 IDs, years at any rate
+// a node issues them.
+const cidAheadWindow = 1 << 32
+
+// ahead reports whether id is one of the generator's own, its label under
+// its key, that it has not issued yet and will within cidAheadWindow. A
+// server must not answer a packet for such an ID with a stateless reset:
+// its token is a function of the ID, and whoever has the label's key
+// could collect the tokens of IDs to come and end those connections later
+// (review of quic-cid-route-v1, F2). An ID of a process before this one
+// falls in the window by chance only, cidAheadWindow/2^40 of the time.
+func (g *cidGenerator) ahead(id []byte) bool {
+	if len(id) < cidLen {
+		return false
+	}
+	x, y := g.codec.decrypt(binary.BigEndian.Uint32(id[0:4]), binary.BigEndian.Uint32(id[4:8]))
+	if uint16(x>>16) != g.label || x&0xff00 != 0 {
+		return false
+	}
+	const mask = 1<<cidCounterBits - 1
+	counter := uint64(x&0xff)<<32 | uint64(y)
+	d := (counter - g.next.Load()) & mask
+	return d >= 1 && d <= cidAheadWindow
+}
+
+// readCIDSecret reads the node's secret of routable connection IDs (the
+// front's): 32 bytes in hex, as the other keys.
+func readCIDSecret(path string) ([]byte, error) {
+	return readHexKey(path, 32)
+}
+
+// readCIDLabelKey reads a backend's key of its label (16 bytes in hex,
+// cidLabelKey): a backend has its own label's key, not the node's secret.
+func readCIDLabelKey(path string) (*cidCodec, error) {
+	key, err := readHexKey(path, 16)
+	if err != nil {
+		return nil, err
+	}
+	return newSpeck(key), nil
+}
+
+func readHexKey(path string, size int) ([]byte, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	secret, err := hex.DecodeString(strings.TrimSpace(string(b)))
-	if err != nil || len(secret) != 32 {
-		return nil, errors.New("want 32 bytes in hex")
+	key, err := hex.DecodeString(strings.TrimSpace(string(b)))
+	if err != nil || len(key) != size {
+		return nil, fmt.Errorf("want %d bytes in hex", size)
 	}
-	return newCIDCodec(secret), nil
+	return key, nil
 }

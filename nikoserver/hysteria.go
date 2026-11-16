@@ -160,9 +160,20 @@ func runHysteriaWith(ctx context.Context, c *BackendConfig, conn *packetConn, lo
 	if salamander != "" {
 		quicOptions.InitialPacketSize = 1280 - 8
 	}
+	// Connection IDs with the backend's label, if it has one. Without
+	// salamander the server sends stateless resets: a packet for an ID of
+	// its own it has not issued yet gets none (aheadFilter).
+	var connIDs squic.ConnectionIDGenerator
+	var serveConn net.PacketConn = conn
+	if gen := hysteriaCIDs(c.Options, log); gen != nil {
+		connIDs = sagernetCIDs{gen}
+		if salamander == "" {
+			serveConn = aheadFilter{conn, gen}
+		}
+	}
 	service, err := hysteria2.NewService[*hy2User](hysteria2.ServiceOptions{
 		QUICOptions:           quicOptions,
-		ConnectionIDGenerator: hysteriaConnIDs(c.Options, log),
+		ConnectionIDGenerator: connIDs,
 		// A client's new address gets the send stream only once it answered
 		// a PATH_CHALLENGE there: without that one packet of a user's own
 		// connection from a spoofed source aimed its download at anyone
@@ -203,24 +214,23 @@ func runHysteriaWith(ctx context.Context, c *BackendConfig, conn *packetConn, lo
 		return envError("users: %v", err)
 	}
 	go watchUsers(ctx, c.UsersFile, reload, func() { users.check(); connLimit() }, log)
-	if err := service.Start(conn); err != nil {
+	if err := service.Start(serveConn); err != nil {
 		return err
 	}
 	<-ctx.Done()
 	return service.Close()
 }
 
-// hysteriaConnIDs is the generator of the server's connection IDs: with
-// the node's key and the backend's label, IDs the front routes a client
-// by when its address changes (quic-cid-route-v1); nil, quic-go's random
-// ones of 4 bytes, without them or when the key does not read. The server
-// sends to a client's new address once the client answered there
-// (PathValidation).
-func hysteriaConnIDs(o BackendOptions, log *Logger) squic.ConnectionIDGenerator {
+// hysteriaCIDs is the generator of the server's connection IDs: with the
+// key of the backend's label, IDs the front routes a client by when its
+// address changes (quic-cid-route-v1); nil, quic-go's random ones of 4
+// bytes, without them or when the key does not read. The server sends to a
+// client's new address once the client answered there (PathValidation).
+func hysteriaCIDs(o BackendOptions, log *Logger) *cidGenerator {
 	if o.CIDKeyFile == "" {
 		return nil
 	}
-	codec, err := readCIDKey(o.CIDKeyFile)
+	codec, err := readCIDLabelKey(o.CIDKeyFile)
 	if err != nil {
 		log.Warnf("cid_key_file %s: %v; connection IDs without a label", o.CIDKeyFile, err)
 		return nil
@@ -231,7 +241,26 @@ func hysteriaConnIDs(o BackendOptions, log *Logger) squic.ConnectionIDGenerator 
 		return nil
 	}
 	log.Infof("connection IDs with label %d (quic-cid-route-v1)", o.CIDLabel)
-	return sagernetCIDs{g}
+	return g
+}
+
+// aheadFilter drops a client's short-header packet for an ID of the
+// generator's own that it has not issued yet (cidGenerator.ahead): quic-go
+// would answer it with a stateless reset, whose token then ends that
+// connection when the ID is in use. The packet socket's other methods are
+// its own.
+type aheadFilter struct {
+	*packetConn
+	gen *cidGenerator
+}
+
+func (f aheadFilter) ReadFrom(b []byte) (int, net.Addr, error) {
+	for {
+		n, addr, err := f.packetConn.ReadFrom(b)
+		if err != nil || n < minCIDPacket || b[0]&0xc0 != 0x40 || !f.gen.ahead(b[1:1+cidLen]) {
+			return n, addr, err
+		}
+	}
 }
 
 // sagernetCIDs gives a generator's IDs to sagernet's quic-go.

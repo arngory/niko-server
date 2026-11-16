@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -19,8 +20,27 @@ import (
 	"golang.org/x/crypto/blake2b"
 )
 
-// cidSecret is the tests' node secret of routable connection IDs.
-var cidSecret = bytes.Repeat([]byte{0x5a}, 32)
+// cidSecret is the tests' node secret of routable connection IDs;
+// otherSecret another node's.
+var (
+	cidSecret   = bytes.Repeat([]byte{0x5a}, 32)
+	otherSecret = bytes.Repeat([]byte{0x5b}, 32)
+)
+
+// cidID is the ID of a label and a counter under a node's secret.
+func cidID(secret []byte, label uint16, counter uint64) [cidLen]byte {
+	return labelCodec(secret, label).encode(label, counter)
+}
+
+// writeCIDLabelKey writes a backend's key of its label.
+func writeCIDLabelKey(t testing.TB, dir string, secret []byte, label uint16) string {
+	t.Helper()
+	p := filepath.Join(dir, fmt.Sprintf("quic-cid-%d.key", label))
+	if err := os.WriteFile(p, []byte(hex.EncodeToString(cidLabelKey(secret, label))+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
 
 func writeCIDKey(t testing.TB, dir string, secret []byte) string {
 	t.Helper()
@@ -102,15 +122,13 @@ func cidFront(t testing.TB, withKey bool) (*udpFront, string) {
 
 func TestUDPFrontCIDClassify(t *testing.T) {
 	f, password := cidFront(t, true)
-	codec := newCIDCodec(cidSecret)
-	other := newCIDCodec(bytes.Repeat([]byte{0x5b}, 32))
 	now := time.Now()
 	n := 0
 	key := func() flowKey { // a new client port each time
 		n++
 		return flowKey{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), uint16(10000+n)), netip.MustParseAddrPort("127.0.0.1:443")}
 	}
-	id := func(label uint16) [cidLen]byte { return codec.encode(label, uint64(n)) }
+	id := func(label uint16) [cidLen]byte { return cidID(cidSecret, label, uint64(n)) }
 	for _, c := range []struct {
 		name string
 		d    []byte
@@ -127,7 +145,7 @@ func TestUDPFrontCIDClassify(t *testing.T) {
 		{"label 1 under salamander", obfuscate(password, shortPacket(id(1), 1200)), ""},
 		{"label 3 under another password", obfuscate("another", shortPacket(id(3), 1200)), ""},
 		{"a label no backend has", shortPacket(id(9), 1200), ""},
-		{"another node's key", shortPacket(other.encode(1, 7), 1200), ""},
+		{"another node's key", shortPacket(cidID(otherSecret, 1, 7), 1200), ""},
 		{"too short to be a packet", shortPacket(id(1), minCIDPacket-1), ""},
 		{"too short under salamander", obfuscate(password, shortPacket(id(3), minCIDPacket-1)), ""},
 		{"long header of another type", func() []byte { d := handshakePacket(id(1), 1200); d[0] = 0xd0; return d }(), ""},
@@ -165,13 +183,12 @@ func TestUDPFrontCIDClassify(t *testing.T) {
 // second; another source has its own share.
 func TestUDPFrontCIDSourceLimit(t *testing.T) {
 	f, _ := cidFront(t, true)
-	codec := newCIDCodec(cidSecret)
 	now := time.Now()
 	from := func(addr string, port int) flowKey {
 		return flowKey{netip.AddrPortFrom(netip.MustParseAddr(addr), uint16(port)), netip.MustParseAddrPort("127.0.0.1:443")}
 	}
 	pinned := func(k flowKey, at time.Time) bool {
-		link, _ := f.classify(k, shortPacket(codec.encode(1, uint64(k.client.Port())), 100), at)
+		link, _ := f.classify(k, shortPacket(cidID(cidSecret, 1, uint64(k.client.Port())), 100), at)
 		return link != nil
 	}
 	for i := range cidFlowBurst {
@@ -208,16 +225,15 @@ func TestUDPFrontCIDSourceLimit(t *testing.T) {
 // look-alikes and garbage.
 func TestUDPFrontCIDMissNoAllocations(t *testing.T) {
 	f, password := cidFront(t, true)
-	other := newCIDCodec(bytes.Repeat([]byte{0x5b}, 32))
 	k := flowKey{netip.MustParseAddrPort("192.0.2.1:5000"), netip.MustParseAddrPort("127.0.0.1:443")}
 	junk := make([]byte, 1200)
 	rand.Read(junk)
 	junk[0] = 0x01
 	now := time.Now()
 	for _, d := range [][]byte{
-		shortPacket(other.encode(1, 1), 1200),
-		handshakePacket(other.encode(1, 2), 1200),
-		obfuscate(password, shortPacket(other.encode(3, 3), 1200)),
+		shortPacket(cidID(otherSecret, 1, 1), 1200),
+		handshakePacket(cidID(otherSecret, 1, 2), 1200),
+		obfuscate(password, shortPacket(cidID(otherSecret, 3, 3), 1200)),
 		junk,
 	} {
 		if n := testing.AllocsPerRun(200, func() {
@@ -250,7 +266,6 @@ func TestUDPFrontCIDNewAddress(t *testing.T) {
 		"hy2-obfs": {Socket: filepath.Join(dir, "obfs.sock"), Mode: "packet", UID: uid, CIDLabel: 12},
 	}
 	addr := startUDPFront(t, c, backends)
-	codec := newCIDCodec(cidSecret)
 	client := func() *net.UDPConn {
 		c, err := net.DialUDP("udp", nil, addr)
 		if err != nil {
@@ -278,7 +293,7 @@ func TestUDPFrontCIDNewAddress(t *testing.T) {
 		{"salamander", obfs, 12, func(p []byte) []byte { return obfuscate(password, p) }},
 	} {
 		moved := client()
-		p := tc.wrap(shortPacket(codec.encode(tc.label, 1), 300))
+		p := tc.wrap(shortPacket(cidID(cidSecret, tc.label, 1), 300))
 		moved.Write(p)
 		got, from, ok := receive(tc.backend, 2*time.Second)
 		if !ok || !bytes.Equal(got, p) || from.String() != moved.LocalAddr().String() {
@@ -298,8 +313,8 @@ func TestUDPFrontCIDNewAddress(t *testing.T) {
 	}
 	// A label of the other backend's, or of another key, goes nowhere.
 	stray := client()
-	stray.Write(shortPacket(codec.encode(12, 2), 300))
-	stray.Write(shortPacket(newCIDCodec(bytes.Repeat([]byte{1}, 32)).encode(11, 3), 300))
+	stray.Write(shortPacket(cidID(cidSecret, 12, 2), 300))
+	stray.Write(shortPacket(cidID(bytes.Repeat([]byte{1}, 32), 11, 3), 300))
 	if _, _, ok := receive(masq, 200*time.Millisecond); ok {
 		t.Fatal("hy2-masq got a stray packet")
 	}
@@ -359,15 +374,14 @@ func runUDPFront(t *testing.T, c *FrontUDP, backends map[string]BackendRef) *udp
 // garbage that is neither.
 func BenchmarkUDPFrontCIDMiss(b *testing.B) {
 	f, password := cidFront(b, true)
-	other := newCIDCodec(bytes.Repeat([]byte{0x5b}, 32))
 	k := flowKey{netip.MustParseAddrPort("192.0.2.1:5000"), netip.MustParseAddrPort("127.0.0.1:443")}
 	junk := make([]byte, 1200)
 	rand.Read(junk)
 	junk[0] = 0x01
 	now := time.Now()
 	for name, d := range map[string][]byte{
-		"short":      shortPacket(other.encode(1, 1), 1200),
-		"salamander": obfuscate(password, shortPacket(other.encode(3, 3), 1200)),
+		"short":      shortPacket(cidID(otherSecret, 1, 1), 1200),
+		"salamander": obfuscate(password, shortPacket(cidID(otherSecret, 3, 3), 1200)),
 		"garbage":    junk,
 	} {
 		b.Run(name, func(b *testing.B) {

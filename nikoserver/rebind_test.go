@@ -38,6 +38,9 @@ type natRelay struct {
 	mu     sync.Mutex
 	out    *net.UDPConn
 	client *net.UDPAddr
+	// up, when set before the client sends, sees each datagram of the
+	// client's.
+	up func([]byte)
 }
 
 func newNATRelay(t *testing.T, server *net.UDPAddr) *natRelay {
@@ -63,8 +66,11 @@ func newNATRelay(t *testing.T, server *net.UDPAddr) *natRelay {
 			}
 			r.mu.Lock()
 			r.client = from
-			out := r.out
+			out, up := r.out, r.up
 			r.mu.Unlock()
+			if up != nil {
+				up(buf[:n])
+			}
 			out.Write(buf[:n])
 		}
 	}()
@@ -132,7 +138,7 @@ func hysteriaFront(t *testing.T, ctx context.Context, withCID, frontCID bool, li
 	salamander := "c2FsYW1hbmRlci1wYXNzd29yZA"
 	pwFile := filepath.Join(dir, "salamander")
 	os.WriteFile(pwFile, []byte(salamander+"\n"), 0o600)
-	keyPath := writeCIDKey(t, dir, cidSecret)
+	secretPath := writeCIDKey(t, dir, cidSecret)
 	var direct net.Dialer
 	backends := map[string]BackendRef{}
 	for i, kind := range []string{"hy2-masq", "hy2-obfs"} {
@@ -144,7 +150,8 @@ func hysteriaFront(t *testing.T, ctx context.Context, withCID, frontCID bool, li
 		}
 		ref := BackendRef{Socket: sock, Mode: "packet", UID: uid}
 		if withCID {
-			c.Options.CIDKeyFile, c.Options.CIDLabel = keyPath, 31+i
+			// The backend has its own label's key, the front the secret.
+			c.Options.CIDKeyFile, c.Options.CIDLabel = writeCIDLabelKey(t, dir, cidSecret, uint16(31+i)), 31+i
 			if frontCID {
 				ref.CIDLabel = 31 + i
 			}
@@ -162,7 +169,7 @@ func hysteriaFront(t *testing.T, ctx context.Context, withCID, frontCID bool, li
 		{SalamanderPasswordFile: pwFile, Backend: "hy2-obfs"},
 	}}
 	if withCID && frontCID {
-		fc.CIDKeyFile = keyPath
+		fc.CIDKeyFile = secretPath
 	}
 	return runUDPFront(t, fc, backends), salamander
 }
@@ -282,7 +289,7 @@ func h3Node(t *testing.T, withCID bool) *net.UDPAddr {
 	ref := BackendRef{Socket: sock, Mode: "packet", UID: os.Getuid()}
 	fc := &FrontUDP{Listen: []string{"127.0.0.1:0"}, Routes: []UDPRoute{{SNI: []string{"h3.example.com"}, Backend: "h3"}}}
 	if withCID {
-		g, err := newCIDGenerator(newCIDCodec(cidSecret), 41)
+		g, err := newCIDGenerator(labelCodec(cidSecret, 41), 41)
 		if err != nil {
 			t.Fatal(err)
 		}

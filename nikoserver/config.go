@@ -133,9 +133,10 @@ type FrontUDP struct {
 	Idle   string     `json:"idle,omitempty"`
 	Routes []UDPRoute `json:"routes"`
 	// CIDKeyFile (v0.18.0): the node's secret of routable connection IDs
-	// (quic-cid-route-v1), 32 bytes in hex, which the QUIC backends with a
-	// cid_label share. A file that does not read leaves the routing by ID
-	// off, and only it: the front serves UDP 443 as before.
+	// (quic-cid-route-v1), 32 bytes in hex. Each label's key comes from it;
+	// a QUIC backend has only its own label's. A file that does not read
+	// leaves the routing by ID off, and only it: the front serves UDP 443
+	// as before.
 	CIDKeyFile string `json:"cid_key_file,omitempty"`
 }
 
@@ -210,12 +211,13 @@ type BackendOptions struct {
 	// or something that is no regular file, is on. With conn_limit "off"
 	// the limits are off whatever it says.
 	ConnLimitFile string `json:"conn_limit_file,omitempty"`
-	// CIDKeyFile and CIDLabel (hy2-*, v0.18.0; both or neither): the
-	// node's secret of routable connection IDs and this backend's label, as
-	// the front has them (quic-cid-route-v1): the server's connection IDs
-	// carry the label, 8 bytes, so the front finds the backend of a client
-	// whose address changed. A key file that does not read leaves the IDs
-	// as they were, random, 4 bytes.
+	// CIDKeyFile and CIDLabel (hy2-*, v0.18.0; both or neither): the key
+	// of this backend's label (16 bytes in hex, HMAC-SHA256(node secret,
+	// "quic-cid-route-v1" || BE16(label)), not the node's secret) and the
+	// label, as the front has it (quic-cid-route-v1): the server's
+	// connection IDs carry the label, 8 bytes, so the front finds the
+	// backend of a client whose address changed. A key file that does not
+	// read leaves the IDs as they were, random, 4 bytes.
 	CIDKeyFile string `json:"cid_key_file,omitempty"`
 	CIDLabel   int    `json:"cid_label,omitempty"`
 }
