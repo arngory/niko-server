@@ -220,6 +220,68 @@ func TestUDPFrontCIDSourceLimit(t *testing.T) {
 	}
 }
 
+// Flows pinned by a label under salamander take the same per-source share
+// as plain ones: one source pins cidFlowBurst of them, then no more.
+func TestUDPFrontCIDSourceLimitSalamander(t *testing.T) {
+	f, password := cidFront(t, true)
+	now := time.Now()
+	from := func(port int) flowKey {
+		return flowKey{netip.AddrPortFrom(netip.MustParseAddr("198.51.100.9"), uint16(port)), netip.MustParseAddrPort("127.0.0.1:443")}
+	}
+	for i := range cidFlowBurst {
+		if link, _ := f.classify(from(1000+i), obfuscate(password, shortPacket(cidID(cidSecret, 3, uint64(i)), 100)), now); link == nil || link.name != "s" {
+			t.Fatalf("flow %d refused within the burst", i)
+		}
+	}
+	if link, _ := f.classify(from(9999), obfuscate(password, shortPacket(cidID(cidSecret, 3, 9999), 100)), now); link != nil {
+		t.Fatal("a salamander flow by label past the burst")
+	}
+	// The share is the source's, plain and salamander together.
+	if link, _ := f.classify(from(9998), shortPacket(cidID(cidSecret, 1, 9998), 100), now); link != nil {
+		t.Fatal("a plain flow by label past the source's burst")
+	}
+}
+
+// The limiter's memory is bounded: two generations of cidSourcesMax
+// sources at most, however many come. A source drained in the generation
+// before stays drained in the next (its bucket is carried over); after two
+// generations' worth of other sources it is forgotten and its share is
+// whole again: the bound is on memory, not on the flow table (a source
+// that cycles 2·cidSourcesMax addresses, an IPv6 /48, gets a share each).
+func TestUDPFrontCIDSourceMemory(t *testing.T) {
+	var s sourceLimits
+	now := time.Now()
+	a := netip.MustParseAddr("203.0.113.1")
+	for range cidFlowBurst {
+		s.allow(a, now)
+	}
+	if s.allow(a, now) {
+		t.Fatal("past the burst")
+	}
+	addr := func(i int) netip.Addr {
+		return netip.AddrFrom16([16]byte{0x20, 0x01, 0x0d, 0xb8, byte(i >> 16), byte(i >> 8), byte(i), 0, 8: 1})
+	}
+	// One generation fills: a is carried over, still drained.
+	for i := range cidSourcesMax {
+		s.allow(addr(i), now)
+		if len(s.sources) > cidSourcesMax || len(s.older) > cidSourcesMax {
+			t.Fatalf("%d and %d sources remembered", len(s.sources), len(s.older))
+		}
+	}
+	if s.allow(a, now) {
+		t.Fatal("a source drained in the generation before has its share again")
+	}
+	for i := cidSourcesMax; i < 3*cidSourcesMax; i++ {
+		s.allow(addr(i), now)
+		if len(s.sources) > cidSourcesMax || len(s.older) > cidSourcesMax {
+			t.Fatalf("%d and %d sources remembered", len(s.sources), len(s.older))
+		}
+	}
+	if !s.allow(a, now) {
+		t.Fatal("a source two generations away is still remembered")
+	}
+}
+
 // A datagram no flow explains and that is no packet of ours costs the
 // front no allocation: a flood of short headers, Handshakes, salamander
 // look-alikes and garbage.
