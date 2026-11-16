@@ -17,8 +17,9 @@ import (
 // Fuzz targets for what the front reads off the internet: the DNS query
 // path (name, zone, apex, probe), the IPC header between front and
 // backends, ClientHello over TCP, QUIC Initial and its CRYPTO frames, and
-// salamander. No input may panic, and what is sent back must stay a valid
-// answer within its bounds. Run one with
+// salamander, and the labels of connection IDs. No input may panic, and
+// what is sent back must stay a valid answer within its bounds. Run one
+// with
 //
 //	go test ./nikoserver -run '^$' -fuzz '^FuzzDNSQuery$' -fuzztime 60s
 //
@@ -139,6 +140,69 @@ func FuzzQUICInitial(f *testing.F) {
 			if len(a.buf) > maxQUICHello {
 				t.Fatalf("assembler grew to %d", len(a.buf))
 			}
+		}
+	})
+}
+
+// FuzzCIDRoute is the front's path for a datagram no flow explains, with
+// routing by connection ID (quic-cid-route-v1): the short header or
+// Handshake, salamander's start, the ID's label and the backend it names.
+// Nothing panics, and a datagram goes to a backend only as it came and
+// only by a label of that backend's, read under its own obfuscation.
+func FuzzCIDRoute(f *testing.F) {
+	front, password := cidFront(f, true)
+	for _, label := range []uint16{1, 2, 3, 9} {
+		id := cidID(cidSecret, label, uint64(label)<<20)
+		f.Add(shortPacket(id, 64))
+		f.Add(handshakePacket(id, 64))
+		f.Add(obfuscate(password, shortPacket(id, 64)))
+		f.Add(obfuscate(password, handshakePacket(id, 64)))
+	}
+	f.Add(shortPacket(cidID(cidSecret, 1, 0), minCIDPacket))
+	f.Add([]byte{0x40, 1, 2, 3})
+	labelOf := map[string]uint16{"a": 1, "b": 2, "s": 3}
+	var n uint32
+	now := time.Now()
+	f.Fuzz(func(t *testing.T, d []byte) {
+		// A source of its own each time: the per-source bound aside.
+		n++
+		src := netip.AddrFrom4([4]byte{10, byte(n >> 16), byte(n >> 8), byte(n)})
+		link, packets := front.classify(flowKey{netip.AddrPortFrom(src, 1), netip.MustParseAddrPort("127.0.0.1:443")}, d, now)
+		if link == nil || isQUICInitial(d) { // an Initial goes by its name (FuzzQUICInitial)
+			return
+		}
+		if len(packets) != 1 || !bytes.Equal(packets[0], d) {
+			t.Fatalf("to %s: %d packets, not the datagram as it came", link.name, len(packets))
+		}
+		if link.name == "s" {
+			head, ok := salamanderHead([]byte(password), d)
+			id := clientCID(head[:min(len(d)-8, cidHead)], len(d)-8)
+			if label, lok := labelCodec(cidSecret, labelOf["s"]).label(id); !ok || !isQUICInitial(head[:7]) && (id == nil || !lok || label != labelOf["s"]) {
+				t.Fatalf("to s without its Initial or label: %x", d[:min(len(d), 24)])
+			}
+			return
+		}
+		id := clientCID(d[:min(len(d), cidHead)], len(d))
+		if label, ok := labelCodec(cidSecret, labelOf[link.name]).label(id); id == nil || !ok || label != labelOf[link.name] {
+			t.Fatalf("to %s by label %d %v: %x", link.name, label, ok, d[:min(len(d), 24)])
+		}
+	})
+}
+
+// FuzzCIDCodec: an ID reads back as its label, and Speck's two ways undo
+// each other.
+func FuzzCIDCodec(f *testing.F) {
+	f.Add(uint16(1), uint64(0), uint32(0), uint32(0))
+	f.Add(uint16(MaxCIDLabel), uint64(1<<40-1), uint32(0xffffffff), uint32(1))
+	codec := labelCodec(cidSecret, 1)
+	f.Fuzz(func(t *testing.T, label uint16, counter uint64, x, y uint32) {
+		id := codec.encode(label, counter)
+		got, ok := codec.label(id[:])
+		if got != label || ok != (label != 0) {
+			t.Fatalf("label %d read as %d %v", label, got, ok)
+		}
+		if a, b := codec.decrypt(codec.encrypt(x, y)); a != x || b != y {
+			t.Fatalf("%08x %08x came back %08x %08x", x, y, a, b)
 		}
 	})
 }

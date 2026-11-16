@@ -12,6 +12,7 @@ import (
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/http3"
 	"github.com/sagernet/sing/common"
+	E "github.com/sagernet/sing/common/exceptions"
 	N "github.com/sagernet/sing/common/network"
 	aTLS "github.com/sagernet/sing/common/tls"
 )
@@ -247,6 +248,10 @@ func CreatePacketTransport(conn net.PacketConn, remoteAddr net.Addr, quicConnPtr
 type ListenOptions struct {
 	DisableVersionNegotiationPackets bool
 	StatelessReset                   bool
+	// ConnectionIDGenerator makes the server's connection IDs (neko: IDs
+	// that carry a label the UDP front routes by); nil: quic-go's random
+	// ones. A TLS config that brings its own listener refuses one.
+	ConnectionIDGenerator quic.ConnectionIDGenerator
 }
 
 func Listen(conn net.PacketConn, config aTLS.ServerConfig, quicConfig *quic.Config) (Listener, error) {
@@ -256,6 +261,11 @@ func Listen(conn net.PacketConn, config aTLS.ServerConfig, quicConfig *quic.Conf
 func ListenWithOptions(conn net.PacketConn, config aTLS.ServerConfig, quicConfig *quic.Config, options ListenOptions) (Listener, error) {
 	quicConfig = quicConfigWithHandshakeTimeout(quicConfig, config.HandshakeTimeout())
 	if quicTLSConfig, isQUICConfig := config.(ServerConfig); isQUICConfig {
+		if options.ConnectionIDGenerator != nil {
+			// neko: such a listener makes its own connection IDs; a
+			// generator it would drop silently is an error.
+			return nil, E.New("a TLS config with its own QUIC listener takes no connection ID generator")
+		}
 		listener, err := quicTLSConfig.Listen(conn, quicConfig)
 		return listener, WrapError(err)
 	}
@@ -263,7 +273,8 @@ func ListenWithOptions(conn net.PacketConn, config aTLS.ServerConfig, quicConfig
 	if err != nil {
 		return nil, err
 	}
-	transport := quic.Transport{Conn: conn, DisableVersionNegotiationPackets: options.DisableVersionNegotiationPackets}
+	transport := quic.Transport{Conn: conn, DisableVersionNegotiationPackets: options.DisableVersionNegotiationPackets,
+		ConnectionIDGenerator: options.ConnectionIDGenerator}
 	transport.SetSingleUse(true)
 	if options.StatelessReset {
 		transport.StatelessResetKey = new(quic.StatelessResetKey)
@@ -283,6 +294,11 @@ func ListenEarly(conn net.PacketConn, config aTLS.ServerConfig, quicConfig *quic
 func ListenEarlyWithOptions(conn net.PacketConn, config aTLS.ServerConfig, quicConfig *quic.Config, options ListenOptions) (EarlyListener, error) {
 	quicConfig = quicConfigWithHandshakeTimeout(quicConfig, config.HandshakeTimeout())
 	if quicTLSConfig, isQUICConfig := config.(ServerConfig); isQUICConfig {
+		if options.ConnectionIDGenerator != nil {
+			// neko: such a listener makes its own connection IDs; a
+			// generator it would drop silently is an error.
+			return nil, E.New("a TLS config with its own QUIC listener takes no connection ID generator")
+		}
 		listener, err := quicTLSConfig.ListenEarly(conn, quicConfig)
 		return listener, WrapError(err)
 	}
@@ -290,7 +306,8 @@ func ListenEarlyWithOptions(conn net.PacketConn, config aTLS.ServerConfig, quicC
 	if err != nil {
 		return nil, err
 	}
-	transport := quic.Transport{Conn: conn, DisableVersionNegotiationPackets: options.DisableVersionNegotiationPackets}
+	transport := quic.Transport{Conn: conn, DisableVersionNegotiationPackets: options.DisableVersionNegotiationPackets,
+		ConnectionIDGenerator: options.ConnectionIDGenerator}
 	transport.SetSingleUse(true)
 	if options.StatelessReset {
 		transport.StatelessResetKey = new(quic.StatelessResetKey)

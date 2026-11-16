@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v0.1.2). Created on the selected branch's head if it does not exist yet."
+        description: "Release tag (e.g. v0.1.2). Created on the selected branch's head (a commit on main) if it does not exist yet."
         required: true
 
 permissions:
@@ -24,6 +24,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Resolve tag
         id: tag
         env:
@@ -38,6 +39,11 @@ jobs:
               echo "::error::tag $TAG already exists on $existing, not on $GITHUB_SHA"; exit 1
             fi
           fi
+          # raycontrol pins what a release publishes: only a commit main
+          # holds is released, not one on another branch by mistake
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_SHA is not on main"; exit 1
+          fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
   test:
@@ -51,6 +57,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod

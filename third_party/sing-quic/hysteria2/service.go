@@ -59,6 +59,18 @@ type ServiceOptions struct {
 	// read the table UpdateUsers has just replaced: a caller closing the
 	// connections of users it took out must refuse those here as well.
 	ConnectionHook func(remote net.Addr, user any, stats func() ConnectionStats, closeConnection func(), done <-chan struct{})
+	// ConnectionIDGenerator, if set, makes the server's connection IDs
+	// (neko: IDs whose label the UDP front routes a client by when its
+	// address changes); nil: quic-go's random ones.
+	ConnectionIDGenerator quic.ConnectionIDGenerator
+	// PathValidation (neko): the server sends to a client's new address
+	// only once the client has answered a PATH_CHALLENGE there (quic-go's
+	// path manager, RFC 9000 §9). Without it (upstream) the server moves
+	// its whole send stream to any address one of the connection's packets
+	// came from, at once: a client that spoofs a victim's source address
+	// aims its download at the victim. Port hopping works either way; with
+	// it a hop costs one round trip.
+	PathValidation bool
 }
 
 // errClosedByHook is how a connection ends when its ConnectionHook closes it
@@ -102,6 +114,7 @@ type Service[U comparable] struct {
 	quicListener          io.Closer
 	bbrProfile            congestion_meta2.Profile
 	realmServer           *realm.Server
+	connIDGenerator       quic.ConnectionIDGenerator
 }
 
 func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
@@ -115,7 +128,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		MaxConnectionReceiveWindow:     hysteria.DefaultConnReceiveWindow,
 		MaxIdleTimeout:                 hysteria.DefaultMaxIdleTimeout,
 		KeepAlivePeriod:                hysteria.DefaultKeepAlivePeriod,
-		DisablePathManager:             true,
+		DisablePathManager:             !options.PathValidation,
 	}
 	qtls.ApplyQUICOptions(quicConfig, options.QUICOptions)
 	bbrProfile := congestion_meta2.ProfileStandard
@@ -171,6 +184,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		masqueradeHandler:     options.MasqueradeHandler,
 		bbrProfile:            bbrProfile,
 		realmServer:           realmServer,
+		connIDGenerator:       options.ConnectionIDGenerator,
 	}
 	service.users.Store(&map[string]U{})
 	return service, nil
@@ -201,6 +215,7 @@ func (s *Service[U]) Start(conn net.PacketConn) error {
 	listener, err := qtls.ListenWithOptions(conn, s.tlsConfig, s.quicConfig, qtls.ListenOptions{
 		DisableVersionNegotiationPackets: obfsEnabled,
 		StatelessReset:                   !obfsEnabled,
+		ConnectionIDGenerator:            s.connIDGenerator,
 	})
 	if err != nil {
 		return err
@@ -229,6 +244,7 @@ func (s *Service[U]) startWithRealm(conn net.PacketConn) error {
 	listener, err := qtls.ListenWithOptions(quicConn, s.tlsConfig, s.quicConfig, qtls.ListenOptions{
 		DisableVersionNegotiationPackets: obfsEnabled,
 		StatelessReset:                   !obfsEnabled,
+		ConnectionIDGenerator:            s.connIDGenerator,
 	})
 	if err != nil {
 		return E.Errors(err, s.realmServer.Close())

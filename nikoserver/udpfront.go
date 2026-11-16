@@ -22,6 +22,14 @@ import (
 // known password. Anything else is dropped without pinning, so fakes sent
 // ahead of the real packets cannot capture the flow. A flow lives until it
 // is idle for the configured time.
+//
+// With routable connection IDs (udp.cid_keys_file, quic-cid-route-v1) a
+// flow is also pinned by a client's packet of a connection that is under
+// way, from an address the front does not know yet: its server connection
+// ID names the backend by a label only the node can read (the client's NAT
+// gave it another port, or the client moved to a new socket). The labels
+// are read only of what no flow explains, with no allocation on the way to
+// a miss; flows they pin are bounded per source (cidFlowRate).
 type udpFront struct {
 	log        *Logger
 	idle       time.Duration
@@ -29,15 +37,30 @@ type udpFront struct {
 	salamander []salamanderRoute
 	links      map[string]*backendLink
 	sockets    map[netip.AddrPort]*net.UDPConn
+	// byLabel are the backends of plain QUIC with a label, each with its
+	// label's key; a salamander backend's is its route's. None: no routing
+	// by connection ID.
+	byLabel []labelRoute
 
 	access  sync.Mutex
 	flows   map[flowKey]*udpFlow
 	pending map[flowKey]*pendingFlow
+	// cidSources bound the flows pinned by a label per source.
+	cidSources sourceLimits
 }
 
 type salamanderRoute struct {
 	password []byte
 	link     *backendLink
+	label    uint16    // its backend's label, 0 none
+	codec    *cidCodec // the label's key; nil: no routing by ID
+}
+
+// labelRoute is a plain QUIC backend's label and its key.
+type labelRoute struct {
+	label uint16
+	codec *cidCodec
+	link  *backendLink
 }
 
 type flowKey struct{ client, local netip.AddrPort }
@@ -65,6 +88,15 @@ const (
 	maxPendingIDs     = 4
 	pendingFor        = 3 * time.Second
 	maxUDPFlows       = 1 << 18
+	// cidFlowRate and cidFlowBurst bound the flows a source (an IPv4
+	// address, an IPv6 /64) pins by a label: a client whose address
+	// changes pins one per connection, a CGNAT address a few for all its
+	// users. More come only of copies of packets seen on the way, each
+	// from an address of its own.
+	cidFlowRate  = 32
+	cidFlowBurst = 128
+	// cidSourcesMax: the sources remembered in a generation (a minute).
+	cidSourcesMax = 16384
 )
 
 func newUDPFront(c *FrontUDP, backends map[string]BackendRef, log *Logger) (*udpFront, error) {
@@ -81,9 +113,37 @@ func newUDPFront(c *FrontUDP, backends map[string]BackendRef, log *Logger) (*udp
 		f.links[name] = l
 		return l
 	}
+	var keys map[uint16]*cidCodec
+	if c.CIDKeysFile != "" {
+		// Without the keys the front serves UDP 443 as before: only the
+		// clients whose address changes lose their connections.
+		var err error
+		if keys, err = readCIDKeys(c.CIDKeysFile); err != nil {
+			log.Warnf("udp.cid_keys_file %s: %v; no routing by connection ID", c.CIDKeysFile, err)
+		}
+	}
+	// key is a backend's label's key, nil without one: a label the file
+	// does not have is routed by name only.
+	key := func(name string) (uint16, *cidCodec) {
+		label := uint16(backends[name].CIDLabel)
+		if keys == nil || label == 0 {
+			return 0, nil
+		}
+		if keys[label] == nil {
+			log.Warnf("udp.cid_keys_file has no key of label %d (backend %s): no routing by connection ID to it", label, name)
+		}
+		return label, keys[label]
+	}
+	labelled := map[string]bool{}
 	for _, r := range c.Routes {
 		for _, name := range r.SNI {
 			f.byName[normalName(name)] = link(r.Backend)
+		}
+		if len(r.SNI) > 0 && !labelled[r.Backend] {
+			labelled[r.Backend] = true
+			if label, codec := key(r.Backend); codec != nil {
+				f.byLabel = append(f.byLabel, labelRoute{label: label, codec: codec, link: link(r.Backend)})
+			}
 		}
 		if r.SalamanderPasswordFile != "" {
 			b, err := os.ReadFile(r.SalamanderPasswordFile)
@@ -94,8 +154,19 @@ func newUDPFront(c *FrontUDP, backends map[string]BackendRef, log *Logger) (*udp
 			if len(password) == 0 {
 				return nil, envError("salamander password %s is empty", r.SalamanderPasswordFile)
 			}
-			f.salamander = append(f.salamander, salamanderRoute{password: password, link: link(r.Backend)})
+			route := salamanderRoute{password: password, link: link(r.Backend)}
+			route.label, route.codec = key(r.Backend)
+			f.salamander = append(f.salamander, route)
 		}
+	}
+	if keys != nil {
+		labels := len(f.byLabel)
+		for _, r := range f.salamander {
+			if r.codec != nil {
+				labels++
+			}
+		}
+		log.Infof("routing by connection ID for %d backends", labels)
 	}
 	return f, nil
 }
@@ -163,6 +234,7 @@ func (f *udpFront) expire(now time.Time) {
 			delete(f.pending, k)
 		}
 	}
+	f.cidSources.age(now)
 }
 
 func (f *udpFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
@@ -219,12 +291,82 @@ func (f *udpFront) classify(key flowKey, d []byte, now time.Time) (*backendLink,
 		}
 		return nil, nil
 	}
+	// A packet of a connection under way, by its connection ID's label:
+	// plain QUIC's backends here, a salamander backend's below, each only
+	// under its own obfuscation.
+	// Each label has its own key: one decryption per label.
+	if len(f.byLabel) > 0 {
+		if id := clientCID(d[:min(len(d), cidHead)], len(d)); id != nil {
+			for _, r := range f.byLabel {
+				if label, ok := r.codec.label(id); ok && label == r.label {
+					if !f.cidAllow(key.client, now) {
+						return nil, nil
+					}
+					return r.link, [][]byte{append([]byte(nil), d...)}
+				}
+			}
+		}
+	}
 	for _, r := range f.salamander {
-		if salamanderInitial(r.password, d) {
+		head, ok := salamanderHead(r.password, d)
+		if !ok {
+			continue
+		}
+		if isQUICInitial(head[:7]) {
 			return r.link, [][]byte{append([]byte(nil), d...)}
+		}
+		if r.codec == nil {
+			continue
+		}
+		if id := clientCID(head[:min(len(d)-8, cidHead)], len(d)-8); id != nil {
+			if label, ok := r.codec.label(id); ok && label == r.label && f.cidAllow(key.client, now) {
+				return r.link, [][]byte{append([]byte(nil), d...)}
+			}
 		}
 	}
 	return nil, nil
+}
+
+// cidAllow takes a flow pinned by a label from its source's share.
+func (f *udpFront) cidAllow(client netip.AddrPort, now time.Time) bool {
+	f.access.Lock()
+	defer f.access.Unlock()
+	return f.cidSources.allow(client.Addr(), now)
+}
+
+// sourceLimits are token buckets by source: an IPv4 address, an IPv6 /64,
+// in two generations so that a source not seen for a minute or two is
+// forgotten and many cannot crowd out the rest (as dnsprobe's).
+type sourceLimits struct {
+	sources, older map[netip.Prefix]*tokenBucket
+	swapped        time.Time
+}
+
+func (s *sourceLimits) allow(src netip.Addr, now time.Time) bool {
+	src = src.Unmap()
+	bits := 64
+	if src.Is4() {
+		bits = 32
+	}
+	prefix, _ := src.Prefix(bits)
+	if s.sources == nil || len(s.sources) >= cidSourcesMax {
+		s.older, s.sources, s.swapped = s.sources, map[netip.Prefix]*tokenBucket{}, now
+	}
+	b := s.sources[prefix]
+	if b == nil {
+		if b = s.older[prefix]; b == nil {
+			b = &tokenBucket{}
+		}
+		s.sources[prefix] = b
+	}
+	return b.take(1, cidFlowRate, cidFlowBurst, now)
+}
+
+// age starts a new generation once a minute.
+func (s *sourceLimits) age(now time.Time) {
+	if s.sources != nil && now.Sub(s.swapped) > time.Minute {
+		s.older, s.sources, s.swapped = s.sources, map[netip.Prefix]*tokenBucket{}, now
+	}
 }
 
 func (f *udpFront) pendingHello(key flowKey, p quicInitial, d []byte, now time.Time) (*backendLink, [][]byte) {
