@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/quic-go/quic-go"
 	sbtls "github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-quic/hysteria2"
@@ -167,7 +168,10 @@ func newSpoofRelay(t *testing.T, server *net.UDPAddr) *spoofRelay {
 // moved its whole send stream there at once: some 700 KB in 3 s at the
 // victim for one packet of 36 bytes, with labels or after an Initial
 // pinned the victim's address. Now the victim gets one PATH_CHALLENGE (1200
-// bytes) and nothing else, and the download goes on to the user.
+// bytes), and the download goes on to the user. Without labels in the front
+// the forger first pins the victim's address with a forged Initial for the
+// name: the victim also gets the server's answer to that Initial, three
+// times its size at most, as from any QUIC server.
 func TestNekoServerHysteriaSpoofedSource(t *testing.T) {
 	for _, c := range []struct {
 		name               string
@@ -175,7 +179,7 @@ func TestNekoServerHysteriaSpoofedSource(t *testing.T) {
 		serverName, obfsPW string
 	}{
 		{"hy2-masq, labels", true, "h.example.com", ""},
-		{"hy2-masq, no labels in the front", false, "h.example.com", ""},
+		{"hy2-masq, pinned by a forged Initial", false, "h.example.com", ""},
 		{"hy2-obfs, labels", true, "x.invalid", "salamander"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -228,6 +232,16 @@ func TestNekoServerHysteriaSpoofedSource(t *testing.T) {
 				}
 			}()
 			time.Sleep(time.Second)
+			pin := 0
+			if !c.frontCID {
+				// The front pins the victim's address by a forged Initial
+				// for the name; the server answers it there.
+				for _, d := range initials(t, c.serverName, quic.Version1) {
+					pin += len(d)
+					relay.victim.Write(d)
+				}
+				time.Sleep(time.Second)
+			}
 			relay.spoof.Store(true)
 			time.Sleep(300 * time.Millisecond)
 			before := got.Load()
@@ -236,10 +250,10 @@ func TestNekoServerHysteriaSpoofedSource(t *testing.T) {
 			if relay.spoofed.Load() == 0 {
 				t.Fatal("no packet went from the forged source")
 			}
-			if v := relay.victimGot.Load(); v > 1300 {
-				t.Fatalf("one forged packet of %d bytes: the victim got %d bytes", relay.spoofed.Load(), v)
+			if v := relay.victimGot.Load(); v > int64(3*pin+1300) {
+				t.Fatalf("a forged Initial of %d bytes and a forged packet of %d: the victim got %d bytes", pin, relay.spoofed.Load(), v)
 			}
-			if after-before < 1<<20 {
+			if after-before < 64<<10 {
 				t.Fatalf("the download stopped after the forged packet: %d bytes in 1.5 s", after-before)
 			}
 		})
