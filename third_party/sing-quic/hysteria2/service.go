@@ -63,6 +63,14 @@ type ServiceOptions struct {
 	// (neko: IDs whose label the UDP front routes a client by when its
 	// address changes); nil: quic-go's random ones.
 	ConnectionIDGenerator quic.ConnectionIDGenerator
+	// PathValidation (neko): the server sends to a client's new address
+	// only once the client has answered a PATH_CHALLENGE there (quic-go's
+	// path manager, RFC 9000 §9). Without it (upstream) the server moves
+	// its whole send stream to any address one of the connection's packets
+	// came from, at once: a client that spoofs a victim's source address
+	// aims its download at the victim. Port hopping works either way; with
+	// it a hop costs one round trip.
+	PathValidation bool
 }
 
 // errClosedByHook is how a connection ends when its ConnectionHook closes it
@@ -120,7 +128,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		MaxConnectionReceiveWindow:     hysteria.DefaultConnReceiveWindow,
 		MaxIdleTimeout:                 hysteria.DefaultMaxIdleTimeout,
 		KeepAlivePeriod:                hysteria.DefaultKeepAlivePeriod,
-		DisablePathManager:             true,
+		DisablePathManager:             !options.PathValidation,
 	}
 	qtls.ApplyQUICOptions(quicConfig, options.QUICOptions)
 	bbrProfile := congestion_meta2.ProfileStandard
