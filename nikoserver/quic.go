@@ -274,18 +274,26 @@ func salamanderOpen(password, datagram []byte) ([]byte, bool) {
 }
 
 // salamanderInitial reports whether a datagram is a QUIC Initial under
-// salamander with this password: only the 7 bytes that tell are opened, on
-// the stack, so a garbage datagram costs one key and no copy.
+// salamander with this password.
 func salamanderInitial(password, datagram []byte) bool {
+	head, ok := salamanderHead(password, datagram)
+	return ok && isQUICInitial(head[:7])
+}
+
+// salamanderHead opens the start of a datagram under salamander with this
+// password: the bytes of a QUIC header that tell what it is (cidHead, those
+// there are; the rest zero). Only they are opened, on the stack, so a
+// garbage datagram costs one key and no copy. false: too short for an
+// Initial's 7 bytes.
+func salamanderHead(password, datagram []byte) (head [cidHead]byte, ok bool) {
 	if len(datagram) < 8+7 {
-		return false
+		return head, false
 	}
 	key := salamanderKey(password, datagram[:8])
-	var head [7]byte
-	for i := range head {
+	for i := range min(len(head), len(datagram)-8) {
 		head[i] = datagram[8+i] ^ key[i]
 	}
-	return isQUICInitial(head[:])
+	return head, true
 }
 
 // salamanderKey is BLAKE2b-256(password || salt), without an allocation for

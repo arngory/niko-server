@@ -53,6 +53,13 @@ type BackendRef struct {
 	// backend (IPC version 2), the device whose tag it checked: a tagged
 	// zone's backend only (slipstream-server --max-connections-per-device).
 	Devices bool `json:"devices,omitempty"`
+	// CIDLabel (v0.18.0): the label of a QUIC backend's connection IDs
+	// (raycontrol docs/spec/quic-cid-route-v1.md), 1-65535, one per
+	// backend. With udp.cid_key_file the front takes a client's packet from
+	// an address it does not know to the backend its ID names: the client's
+	// NAT gave it another port, or it moved to a new socket. A backend of a
+	// UDP route only.
+	CIDLabel int `json:"cid_label,omitempty"`
 }
 
 type DNSZone struct {
@@ -125,6 +132,11 @@ type FrontUDP struct {
 	Listen []string   `json:"listen"`
 	Idle   string     `json:"idle,omitempty"`
 	Routes []UDPRoute `json:"routes"`
+	// CIDKeyFile (v0.18.0): the node's secret of routable connection IDs
+	// (quic-cid-route-v1), 32 bytes in hex, which the QUIC backends with a
+	// cid_label share. A file that does not read leaves the routing by ID
+	// off, and only it: the front serves UDP 443 as before.
+	CIDKeyFile string `json:"cid_key_file,omitempty"`
 }
 
 type FrontConfig struct {
@@ -198,6 +210,14 @@ type BackendOptions struct {
 	// or something that is no regular file, is on. With conn_limit "off"
 	// the limits are off whatever it says.
 	ConnLimitFile string `json:"conn_limit_file,omitempty"`
+	// CIDKeyFile and CIDLabel (hy2-*, v0.18.0; both or neither): the
+	// node's secret of routable connection IDs and this backend's label, as
+	// the front has them (quic-cid-route-v1): the server's connection IDs
+	// carry the label, 8 bytes, so the front finds the backend of a client
+	// whose address changed. A key file that does not read leaves the IDs
+	// as they were, random, 4 bytes.
+	CIDKeyFile string `json:"cid_key_file,omitempty"`
+	CIDLabel   int    `json:"cid_label,omitempty"`
 }
 
 // connLimitFileMax bounds what is read of conn_limit_file: "off" with some
@@ -428,6 +448,27 @@ func (c *FrontConfig) validate() []ConfigError {
 		if b.UID < 0 {
 			e.add(path+".uid", "must be the backend's UID")
 		}
+		if b.CIDLabel != 0 {
+			checkCIDLabel(&e, path+".cid_label", b.CIDLabel)
+			// A QUIC backend's: one a UDP route names (it is mode packet).
+			routed := false
+			if c.UDP != nil {
+				for _, r := range c.UDP.Routes {
+					routed = routed || r.Backend == name
+				}
+			}
+			switch {
+			case !routed:
+				e.add(path+".cid_label", "a QUIC backend's: no udp route names %q", name)
+			case c.UDP.CIDKeyFile == "":
+				e.add(path+".cid_label", "needs udp.cid_key_file")
+			}
+			for other, o := range c.Backends {
+				if other < name && o.CIDLabel == b.CIDLabel {
+					e.add(path+".cid_label", "%d is the label of backends.%s too", b.CIDLabel, other)
+				}
+			}
+		}
 		if b.Devices {
 			// The device comes from a zone's tag: every zone of the
 			// backend tagged, and no other traffic to it.
@@ -491,6 +532,9 @@ func (c *FrontConfig) validate() []ConfigError {
 		}
 		if samePath(c.DNS.StatsSocket, c.DNS.ProbeKeyFile) {
 			e.add("dns.stats_socket", "the probe key file")
+		}
+		if c.UDP != nil && samePath(c.DNS.StatsSocket, c.UDP.CIDKeyFile) {
+			e.add("dns.stats_socket", "udp.cid_key_file")
 		}
 		if c.UDP != nil {
 			for i, r := range c.UDP.Routes {
@@ -686,6 +730,13 @@ func (c *BackendConfig) validate() []ConfigError {
 		if c.Options.ConnLimitFile != "" {
 			checkSocket(&e, "options.conn_limit_file", c.Options.ConnLimitFile)
 		}
+		switch {
+		case (c.Options.CIDKeyFile == "") != (c.Options.CIDLabel == 0):
+			e.add("options", "cid_key_file and cid_label go together")
+		case c.Options.CIDKeyFile != "":
+			checkSocket(&e, "options.cid_key_file", c.Options.CIDKeyFile)
+			checkCIDLabel(&e, "options.cid_label", c.Options.CIDLabel)
+		}
 		if pr := c.Options.Probe; pr != nil {
 			if !dnsName.MatchString(pr.Name) {
 				e.add("options.probe.name", "not a DNS name: %q", pr.Name)
@@ -739,6 +790,7 @@ func (c *BackendConfig) validate() []ConfigError {
 			{c.Options.PrivateKeyFile, "options.private_key_file"}, {c.Options.AuthKeysFile, "options.auth_keys_file"},
 			{c.Options.SealKeyFile, "options.seal_key_file"}, {c.Options.EncryptionKeyFile, "options.encryption_key_file"},
 			{c.Options.ObfsPasswordFile, "options.obfs_password_file"}, {c.Options.ConnLimitFile, "options.conn_limit_file"},
+			{c.Options.CIDKeyFile, "options.cid_key_file"},
 		}
 		if c.TLS != nil {
 			files = append(files, struct{ path, what string }{c.TLS.CertificateFile, "tls.certificate_file"},
@@ -755,6 +807,9 @@ func (c *BackendConfig) validate() []ConfigError {
 	}
 	if (c.Options.ConnLimit != "" || c.Options.ConnLimitFile != "") && c.Kind != "hy2-masq" && c.Kind != "hy2-obfs" {
 		e.add("options", "conn_limit and conn_limit_file are options of the Hysteria2 backends")
+	}
+	if (c.Options.CIDKeyFile != "" || c.Options.CIDLabel != 0) && c.Kind != "hy2-masq" && c.Kind != "hy2-obfs" {
+		e.add("options", "cid_key_file and cid_label are options of the Hysteria2 backends")
 	}
 	if c.Kind != "yggdrasil" && (len(c.Options.ExitPorts) > 0 || len(c.Options.Peers) > 0) {
 		e.add("options", "exit_ports and peers are Yggdrasil options")
@@ -783,6 +838,14 @@ func (c *BackendConfig) validate() []ConfigError {
 		}
 	}
 	return e
+}
+
+// checkCIDLabel checks a label of routable connection IDs: 16 bits, 0 is
+// none (quic-cid-route-v1).
+func checkCIDLabel(e *configErrors, path string, label int) {
+	if label < 1 || label > MaxCIDLabel {
+		e.add(path, "want 1-%d, got %d", MaxCIDLabel, label)
+	}
 }
 
 func checkBackendTLS(e *configErrors, t *BackendTLS, missing string) {
@@ -911,6 +974,9 @@ func (u *FrontUDP) validate(e *configErrors, backends map[string]BackendRef) {
 	}
 	if len(u.Routes) == 0 {
 		e.add("udp.routes", "no routes")
+	}
+	if u.CIDKeyFile != "" {
+		checkSocket(e, "udp.cid_key_file", u.CIDKeyFile)
 	}
 	names := map[string]bool{}
 	for i, r := range u.Routes {

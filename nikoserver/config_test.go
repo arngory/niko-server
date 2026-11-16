@@ -542,3 +542,66 @@ func TestConnLimitFileKinds(t *testing.T) {
 		}
 	}
 }
+
+// Routable connection IDs (v0.18.0, quic-cid-route-v1): the front's key
+// and its QUIC backends' labels; a Hysteria2 backend's key and label.
+func TestNekoServerConfigCIDRoute(t *testing.T) {
+	front := `{"schema":1,"role":"front","backends":{
+		"h":{"socket":"/run/niko/h-in/packet.sock","mode":"packet","uid":9101,"cid_label":3},
+		"o":{"socket":"/run/niko/o-in/packet.sock","mode":"packet","uid":9102,"cid_label":4},
+		"n/quic":{"socket":"/run/niko/n-in/quic.sock","mode":"packet","uid":9103,"cid_label":65535},
+		"d":{"socket":"/run/niko/d-in/packet.sock","mode":"packet","uid":9104}},
+		"dns":{"listen":["0.0.0.0:53"],"zones":[{"zone":"t.example.com","backend":"d"}],"stats_socket":"/run/niko/front/stats.sock"},
+		"udp":{"listen":["0.0.0.0:443"],"routes":[{"sni":["h.example.com"],"backend":"h"},
+			{"salamander_password_file":"/r/front/o.salamander","backend":"o"},{"sni":["n.example.com"],"backend":"n/quic"}]KEY}}`
+	key := `,"cid_key_file":"/r/front/quic-cid.key"`
+	if errs := checkConfig(t, strings.Replace(front, "KEY", key, 1)); len(errs) > 0 {
+		t.Fatal(errs)
+	}
+	for name, c := range map[string]struct{ from, to, path string }{
+		"labels without the key":  {"KEY", "", "backends.h.cid_label"},
+		"a relative key file":     {"KEY", `,"cid_key_file":"quic-cid.key"`, "udp.cid_key_file"},
+		"label 0x10000":           {`"cid_label":65535`, `"cid_label":65536`, "backends.n/quic.cid_label"},
+		"a negative label":        {`"cid_label":3`, `"cid_label":-1`, "backends.h.cid_label"},
+		"one label twice":         {`"cid_label":4`, `"cid_label":3`, "backends.o.cid_label"},
+		"a DNS backend's label":   {`"uid":9104}`, `"uid":9104,"cid_label":9}`, "backends.d.cid_label"},
+		"the stats socket's path": {"KEY", `,"cid_key_file":"/run/niko/front/stats.sock"`, "dns.stats_socket"},
+	} {
+		errs := checkConfig(t, strings.Replace(strings.Replace(front, c.from, c.to, 1), "KEY", key, 1))
+		// Without the key every label is in error: the first names it.
+		if name == "labels without the key" {
+			if len(errs) != 3 || errs[0].Path != c.path && errs[1].Path != c.path && errs[2].Path != c.path {
+				t.Errorf("%s: %v", name, errs)
+			}
+			continue
+		}
+		if len(errs) != 1 || errs[0].Path != c.path {
+			t.Errorf("%s: %v, want one error at %q", name, errs, c.path)
+		}
+	}
+	hy2 := `{"schema":1,"role":"backend","kind":"hy2-masq","socket":"/run/niko/h/packet.sock","front_uid":9100,
+		"users_file":"/r/h/users.json","tls":{"certificate_file":"/r/h/chain.pem","key_file":"/run/niko/h/key.pem"},
+		"stats_socket":"/run/niko/h/stats.sock","options":{"up_mbps":0EXTRA}}`
+	if errs := checkConfig(t, strings.Replace(hy2, "EXTRA", `,"cid_key_file":"/r/h/quic-cid.key","cid_label":3`, 1)); len(errs) > 0 {
+		t.Fatal(errs)
+	}
+	for extra, path := range map[string]string{
+		`,"cid_key_file":"/r/h/quic-cid.key"`:                          "options",
+		`,"cid_label":3`:                                               "options",
+		`,"cid_key_file":"quic-cid.key","cid_label":3`:                 "options.cid_key_file",
+		`,"cid_key_file":"/r/h/quic-cid.key","cid_label":70000`:        "options.cid_label",
+		`,"cid_key_file":"/run/niko/h/stats.sock","cid_label":3`:       "stats_socket",
+		`,"cid_key_file":"/r/h/quic-cid.key","cid_label":"3"`:          "",
+		`,"cid_key_file":"/r/h/quic-cid.key","cid_label":3,"cid":true`: "",
+	} {
+		errs := checkConfig(t, strings.Replace(hy2, "EXTRA", extra, 1))
+		if len(errs) != 1 || errs[0].Path != path {
+			t.Errorf("hy2 %s: %v, want one error at %q", extra, errs, path)
+		}
+	}
+	dnstt := `{"schema":1,"role":"backend","kind":"dnstt","socket":"/run/niko/dns/packet.sock","inner":"/run/niko/inner/vless.sock",
+		"options":{"zone":"t.example.com","private_key_file":"/r/dnstt.key","cid_key_file":"/r/k","cid_label":3}}`
+	if errs := checkConfig(t, dnstt); len(errs) != 1 || errs[0].Path != "options" {
+		t.Errorf("dnstt with a label: %v", errs)
+	}
+}

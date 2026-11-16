@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	squic "github.com/sagernet/quic-go"
 	sbtls "github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -160,16 +161,17 @@ func runHysteriaWith(ctx context.Context, c *BackendConfig, conn *packetConn, lo
 		quicOptions.InitialPacketSize = 1280 - 8
 	}
 	service, err := hysteria2.NewService[*hy2User](hysteria2.ServiceOptions{
-		QUICOptions:        quicOptions,
-		ConnectionHook:     connectionHook(users, &live),
-		Context:            ctx,
-		Logger:             nopLogger(),
-		SendBPS:            uint64(c.Options.UpMbps * hysteria.MbpsToBps),
-		ReceiveBPS:         uint64(c.Options.DownMbps * hysteria.MbpsToBps),
-		SalamanderPassword: salamander,
-		TLSConfig:          tlsConfig,
-		UDPTimeout:         2 * time.Minute,
-		Handler:            &outbound{dial: dial, log: log, probe: c.Options.Probe, lim: lim},
+		QUICOptions:           quicOptions,
+		ConnectionIDGenerator: hysteriaConnIDs(c.Options, log),
+		ConnectionHook:        connectionHook(users, &live),
+		Context:               ctx,
+		Logger:                nopLogger(),
+		SendBPS:               uint64(c.Options.UpMbps * hysteria.MbpsToBps),
+		ReceiveBPS:            uint64(c.Options.DownMbps * hysteria.MbpsToBps),
+		SalamanderPassword:    salamander,
+		TLSConfig:             tlsConfig,
+		UDPTimeout:            2 * time.Minute,
+		Handler:               &outbound{dial: dial, log: log, probe: c.Options.Probe, lim: lim},
 		MasqueradeHandler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Length", "0")
 			w.WriteHeader(http.StatusNotFound)
@@ -202,6 +204,40 @@ func runHysteriaWith(ctx context.Context, c *BackendConfig, conn *packetConn, lo
 	<-ctx.Done()
 	return service.Close()
 }
+
+// hysteriaConnIDs is the generator of the server's connection IDs: with
+// the node's key and the backend's label, IDs the front routes a client
+// by when its address changes (quic-cid-route-v1); nil, quic-go's random
+// ones of 4 bytes, without them or when the key does not read. The server
+// switches to a client's new address at its first packet from there
+// (sing-quic's DisablePathManager, which Hysteria2's port hopping needs).
+func hysteriaConnIDs(o BackendOptions, log *Logger) squic.ConnectionIDGenerator {
+	if o.CIDKeyFile == "" {
+		return nil
+	}
+	codec, err := readCIDKey(o.CIDKeyFile)
+	if err != nil {
+		log.Warnf("cid_key_file %s: %v; connection IDs without a label", o.CIDKeyFile, err)
+		return nil
+	}
+	g, err := newCIDGenerator(codec, uint16(o.CIDLabel))
+	if err != nil {
+		log.Warnf("cid_label %d: %v; connection IDs without a label", o.CIDLabel, err)
+		return nil
+	}
+	log.Infof("connection IDs with label %d (quic-cid-route-v1)", o.CIDLabel)
+	return sagernetCIDs{g}
+}
+
+// sagernetCIDs gives a generator's IDs to sagernet's quic-go.
+type sagernetCIDs struct{ *cidGenerator }
+
+func (g sagernetCIDs) GenerateConnectionID() (squic.ConnectionID, error) {
+	id := g.generate()
+	return squic.ConnectionIDFromBytes(id[:]), nil
+}
+
+func (sagernetCIDs) ConnectionIDLen() int { return cidLen }
 
 // watchUsers reloads the users file on SIGHUP and when it changes; check
 // runs at each look, every 5 s and on SIGHUP, whether it changed or not.
