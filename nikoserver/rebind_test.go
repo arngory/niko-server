@@ -109,6 +109,16 @@ func (r *natRelay) addr() *net.UDPAddr { return r.in.LocalAddr().(*net.UDPAddr) 
 // reads the key only when frontCID.
 func hysteriaNode(t *testing.T, ctx context.Context, withCID, frontCID bool) (*net.UDPAddr, string) {
 	t.Helper()
+	front, salamander := hysteriaFront(t, ctx, withCID, frontCID, "127.0.0.1:0")
+	for _, s := range front.sockets {
+		return s.LocalAddr().(*net.UDPAddr), salamander
+	}
+	return nil, ""
+}
+
+// hysteriaFront is hysteriaNode with the front on the addresses listen.
+func hysteriaFront(t *testing.T, ctx context.Context, withCID, frontCID bool, listen ...string) (*udpFront, string) {
+	t.Helper()
 	dir := t.TempDir()
 	uid := os.Getuid()
 	log := NewLogger("warn", io.Discard)
@@ -147,14 +157,14 @@ func hysteriaNode(t *testing.T, ctx context.Context, withCID, frontCID bool) (*n
 		go runHysteria(ctx, c, conn, log, direct.DialContext)
 		backends[kind] = ref
 	}
-	fc := &FrontUDP{Listen: []string{"127.0.0.1:0"}, Routes: []UDPRoute{
+	fc := &FrontUDP{Listen: listen, Routes: []UDPRoute{
 		{SNI: []string{"h.example.com"}, Backend: "hy2-masq"},
 		{SalamanderPasswordFile: pwFile, Backend: "hy2-obfs"},
 	}}
 	if withCID && frontCID {
 		fc.CIDKeyFile = keyPath
 	}
-	return startUDPFront(t, fc, backends), salamander
+	return runUDPFront(t, fc, backends), salamander
 }
 
 // A Hysteria2 client whose NAT gives it a new port mid-connection: its

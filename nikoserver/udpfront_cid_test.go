@@ -309,8 +309,19 @@ func TestUDPFrontCIDNewAddress(t *testing.T) {
 }
 
 // startUDPFront runs a UDP front on loopback until the test ends, its
-// links up, and returns its address.
+// links up, and returns its address (one of them, with several).
 func startUDPFront(t *testing.T, c *FrontUDP, backends map[string]BackendRef) *net.UDPAddr {
+	t.Helper()
+	front := runUDPFront(t, c, backends)
+	for _, s := range front.sockets {
+		return s.LocalAddr().(*net.UDPAddr)
+	}
+	return nil
+}
+
+// runUDPFront runs a UDP front on loopback until the test ends, its links
+// up.
+func runUDPFront(t *testing.T, c *FrontUDP, backends map[string]BackendRef) *udpFront {
 	t.Helper()
 	fc := &FrontConfig{Schema: 1, Role: "front", UDP: c, Backends: backends}
 	if errs := fc.validate(); len(errs) > 0 {
@@ -322,10 +333,6 @@ func startUDPFront(t *testing.T, c *FrontUDP, backends map[string]BackendRef) *n
 	}
 	if err := front.listen(c.Listen); err != nil {
 		t.Fatal(err)
-	}
-	var addr *net.UDPAddr
-	for _, s := range front.sockets {
-		addr = s.LocalAddr().(*net.UDPAddr)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -344,7 +351,7 @@ func startUDPFront(t *testing.T, c *FrontUDP, backends map[string]BackendRef) *n
 			time.Sleep(20 * time.Millisecond)
 		}
 	}
-	return addr
+	return front
 }
 
 // What a datagram no flow explains costs the front, by what it is: a

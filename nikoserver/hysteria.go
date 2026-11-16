@@ -163,15 +163,20 @@ func runHysteriaWith(ctx context.Context, c *BackendConfig, conn *packetConn, lo
 	service, err := hysteria2.NewService[*hy2User](hysteria2.ServiceOptions{
 		QUICOptions:           quicOptions,
 		ConnectionIDGenerator: hysteriaConnIDs(c.Options, log),
-		ConnectionHook:        connectionHook(users, &live),
-		Context:               ctx,
-		Logger:                nopLogger(),
-		SendBPS:               uint64(c.Options.UpMbps * hysteria.MbpsToBps),
-		ReceiveBPS:            uint64(c.Options.DownMbps * hysteria.MbpsToBps),
-		SalamanderPassword:    salamander,
-		TLSConfig:             tlsConfig,
-		UDPTimeout:            2 * time.Minute,
-		Handler:               &outbound{dial: dial, log: log, probe: c.Options.Probe, lim: lim},
+		// A client's new address gets the send stream only once it answered
+		// a PATH_CHALLENGE there: without that one packet of a user's own
+		// connection from a spoofed source aimed its download at anyone
+		// (the front pins a new address by the label, or by an Initial).
+		PathValidation:     true,
+		ConnectionHook:     connectionHook(users, &live),
+		Context:            ctx,
+		Logger:             nopLogger(),
+		SendBPS:            uint64(c.Options.UpMbps * hysteria.MbpsToBps),
+		ReceiveBPS:         uint64(c.Options.DownMbps * hysteria.MbpsToBps),
+		SalamanderPassword: salamander,
+		TLSConfig:          tlsConfig,
+		UDPTimeout:         2 * time.Minute,
+		Handler:            &outbound{dial: dial, log: log, probe: c.Options.Probe, lim: lim},
 		MasqueradeHandler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Length", "0")
 			w.WriteHeader(http.StatusNotFound)
@@ -209,8 +214,8 @@ func runHysteriaWith(ctx context.Context, c *BackendConfig, conn *packetConn, lo
 // the node's key and the backend's label, IDs the front routes a client
 // by when its address changes (quic-cid-route-v1); nil, quic-go's random
 // ones of 4 bytes, without them or when the key does not read. The server
-// switches to a client's new address at its first packet from there
-// (sing-quic's DisablePathManager, which Hysteria2's port hopping needs).
+// sends to a client's new address once the client answered there
+// (PathValidation).
 func hysteriaConnIDs(o BackendOptions, log *Logger) squic.ConnectionIDGenerator {
 	if o.CIDKeyFile == "" {
 		return nil
