@@ -247,6 +247,10 @@ func CreatePacketTransport(conn net.PacketConn, remoteAddr net.Addr, quicConnPtr
 type ListenOptions struct {
 	DisableVersionNegotiationPackets bool
 	StatelessReset                   bool
+	// ConnectionIDGenerator makes the server's connection IDs (neko: IDs
+	// that carry a label the UDP front routes by); nil: quic-go's random
+	// ones. Only where the listener is quic-go's own Transport.
+	ConnectionIDGenerator quic.ConnectionIDGenerator
 }
 
 func Listen(conn net.PacketConn, config aTLS.ServerConfig, quicConfig *quic.Config) (Listener, error) {
@@ -263,7 +267,8 @@ func ListenWithOptions(conn net.PacketConn, config aTLS.ServerConfig, quicConfig
 	if err != nil {
 		return nil, err
 	}
-	transport := quic.Transport{Conn: conn, DisableVersionNegotiationPackets: options.DisableVersionNegotiationPackets}
+	transport := quic.Transport{Conn: conn, DisableVersionNegotiationPackets: options.DisableVersionNegotiationPackets,
+		ConnectionIDGenerator: options.ConnectionIDGenerator}
 	transport.SetSingleUse(true)
 	if options.StatelessReset {
 		transport.StatelessResetKey = new(quic.StatelessResetKey)
@@ -290,7 +295,8 @@ func ListenEarlyWithOptions(conn net.PacketConn, config aTLS.ServerConfig, quicC
 	if err != nil {
 		return nil, err
 	}
-	transport := quic.Transport{Conn: conn, DisableVersionNegotiationPackets: options.DisableVersionNegotiationPackets}
+	transport := quic.Transport{Conn: conn, DisableVersionNegotiationPackets: options.DisableVersionNegotiationPackets,
+		ConnectionIDGenerator: options.ConnectionIDGenerator}
 	transport.SetSingleUse(true)
 	if options.StatelessReset {
 		transport.StatelessResetKey = new(quic.StatelessResetKey)

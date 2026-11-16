@@ -59,6 +59,10 @@ type ServiceOptions struct {
 	// read the table UpdateUsers has just replaced: a caller closing the
 	// connections of users it took out must refuse those here as well.
 	ConnectionHook func(remote net.Addr, user any, stats func() ConnectionStats, closeConnection func(), done <-chan struct{})
+	// ConnectionIDGenerator, if set, makes the server's connection IDs
+	// (neko: IDs whose label the UDP front routes a client by when its
+	// address changes); nil: quic-go's random ones.
+	ConnectionIDGenerator quic.ConnectionIDGenerator
 }
 
 // errClosedByHook is how a connection ends when its ConnectionHook closes it
@@ -102,6 +106,7 @@ type Service[U comparable] struct {
 	quicListener          io.Closer
 	bbrProfile            congestion_meta2.Profile
 	realmServer           *realm.Server
+	connIDGenerator       quic.ConnectionIDGenerator
 }
 
 func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
@@ -171,6 +176,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		masqueradeHandler:     options.MasqueradeHandler,
 		bbrProfile:            bbrProfile,
 		realmServer:           realmServer,
+		connIDGenerator:       options.ConnectionIDGenerator,
 	}
 	service.users.Store(&map[string]U{})
 	return service, nil
@@ -201,6 +207,7 @@ func (s *Service[U]) Start(conn net.PacketConn) error {
 	listener, err := qtls.ListenWithOptions(conn, s.tlsConfig, s.quicConfig, qtls.ListenOptions{
 		DisableVersionNegotiationPackets: obfsEnabled,
 		StatelessReset:                   !obfsEnabled,
+		ConnectionIDGenerator:            s.connIDGenerator,
 	})
 	if err != nil {
 		return err
@@ -229,6 +236,7 @@ func (s *Service[U]) startWithRealm(conn net.PacketConn) error {
 	listener, err := qtls.ListenWithOptions(quicConn, s.tlsConfig, s.quicConfig, qtls.ListenOptions{
 		DisableVersionNegotiationPackets: obfsEnabled,
 		StatelessReset:                   !obfsEnabled,
+		ConnectionIDGenerator:            s.connIDGenerator,
 	})
 	if err != nil {
 		return E.Errors(err, s.realmServer.Close())
