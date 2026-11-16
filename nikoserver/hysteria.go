@@ -257,7 +257,7 @@ type aheadFilter struct {
 func (f aheadFilter) ReadFrom(b []byte) (int, net.Addr, error) {
 	for {
 		n, addr, err := f.packetConn.ReadFrom(b)
-		if err != nil || n < minCIDPacket || b[0]&0xc0 != 0x40 || !f.gen.ahead(b[1:1+cidLen]) {
+		if err != nil || !f.gen.dropAhead(b[:n]) {
 			return n, addr, err
 		}
 	}

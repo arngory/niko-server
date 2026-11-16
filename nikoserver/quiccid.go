@@ -209,6 +209,14 @@ func (g *cidGenerator) ahead(id []byte) bool {
 	return d >= 1 && d <= cidAheadWindow
 }
 
+// dropAhead reports whether a server drops a client's packet: a short
+// header whose destination ID is one the generator will issue (ahead).
+// Long headers are not read: their ID is elsewhere, and a client's
+// Initial carries its own.
+func (g *cidGenerator) dropAhead(p []byte) bool {
+	return len(p) >= minCIDPacket && p[0]&0xc0 == 0x40 && g.ahead(p[1:1+cidLen])
+}
+
 // readCIDSecret reads the node's secret of routable connection IDs (the
 // front's): 32 bytes in hex, as the other keys.
 func readCIDSecret(path string) ([]byte, error) {

@@ -135,6 +135,32 @@ func TestCIDAhead(t *testing.T) {
 	if g.ahead([]byte{1, 2, 3}) {
 		t.Fatal("3 bytes")
 	}
+	// The label and a counter in the window, but not the zero byte: no ID
+	// of the generator's.
+	x, y := c.encrypt(5<<16|0x0100|uint32((last+2)>>32&0xff), uint32(last+2))
+	var odd [cidLen]byte
+	binary.BigEndian.PutUint32(odd[0:4], x)
+	binary.BigEndian.PutUint32(odd[4:8], y)
+	if g.ahead(odd[:]) {
+		t.Fatal("an ID without its zero byte read as ahead")
+	}
+	// What the server drops: a short header for an ID ahead, of a packet
+	// QUIC could open; the same bytes in a long header, or too short, pass.
+	ahead := c.encode(5, (last+3)&mask)
+	p := shortPacket(ahead, 100)
+	if !g.dropAhead(p) {
+		t.Fatal("a short header for an ID ahead passes")
+	}
+	for name, q := range map[string][]byte{
+		"long header":  append([]byte{0xc0 | p[0]&0x0f}, p[1:]...),
+		"no fixed bit": append([]byte{p[0] & 0x3f}, p[1:]...),
+		"too short":    p[:minCIDPacket-1],
+		"issued":       shortPacket(c.encode(5, last&mask), 100),
+	} {
+		if g.dropAhead(q) {
+			t.Errorf("%s: dropped", name)
+		}
+	}
 }
 
 // Random IDs read as a label under its key about 2^-24 of the time: none

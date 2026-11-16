@@ -280,6 +280,20 @@ func TestUDPFrontCIDSourceMemory(t *testing.T) {
 	if !s.allow(a, now) {
 		t.Fatal("a source two generations away is still remembered")
 	}
+	// A minute starts a new generation (the front's sweep), and a second
+	// one forgets the first: a source quiet for two minutes costs nothing.
+	s.age(now.Add(30 * time.Second))
+	if len(s.sources) == 0 {
+		t.Fatal("a generation ended before its minute")
+	}
+	s.age(now.Add(61 * time.Second))
+	if len(s.sources) != 0 || len(s.older) == 0 {
+		t.Fatalf("after a minute: %d and %d sources", len(s.sources), len(s.older))
+	}
+	s.age(now.Add(123 * time.Second))
+	if len(s.sources) != 0 || len(s.older) != 0 {
+		t.Fatalf("after two minutes: %d and %d sources", len(s.sources), len(s.older))
+	}
 }
 
 // A datagram no flow explains and that is no packet of ours costs the
