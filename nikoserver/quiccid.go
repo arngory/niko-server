@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 )
 
 // Routable connection IDs (raycontrol docs/spec/quic-cid-route-v1.md): a
@@ -142,8 +143,9 @@ func clientCID(head []byte, size int) []byte {
 }
 
 // cidGenerator makes a backend's connection IDs: its label and a counter
-// that starts at random, one step per ID. IDs of one generator never
-// repeat before 2^40 of them; those of two labels never meet.
+// that starts from the clock (cidStart), one step per ID. IDs of one
+// generator never repeat before 2^40 of them; those of two labels never
+// meet.
 type cidGenerator struct {
 	codec *cidCodec
 	label uint16
@@ -151,16 +153,35 @@ type cidGenerator struct {
 }
 
 func newCIDGenerator(codec *cidCodec, label uint16) (*cidGenerator, error) {
+	return newCIDGeneratorAt(codec, label, time.Now())
+}
+
+// newCIDGeneratorAt is newCIDGenerator started at now.
+func newCIDGeneratorAt(codec *cidCodec, label uint16, now time.Time) (*cidGenerator, error) {
 	if label == 0 {
 		return nil, errors.New("label 0 is none")
 	}
-	var b [8]byte
+	var b [2]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return nil, err
 	}
 	g := &cidGenerator{codec: codec, label: label}
-	g.next.Store(binary.BigEndian.Uint64(b[:]))
+	g.next.Store(cidStart(now, binary.BigEndian.Uint16(b[:])))
 	return g, nil
+}
+
+// cidStart is a generator's counter at its start: 4096 a second of the
+// clock since 1970, and a random offset within the second, modulo 2^40
+// (the counter wraps every 2^28 s, 8.5 years). A process after another
+// starts past the IDs the one before issued, as long as that one issued
+// fewer than 4096 a second on average since its own start: its IDs are
+// behind the new window of ahead, and the new IDs are not the old ones.
+// Without the label's key the counter is not seen: the IDs stay random. A
+// clock set back by more than the old process lived puts the old IDs in
+// the window: their clients wait out their idle time instead of a reset,
+// and nothing else.
+func cidStart(now time.Time, random uint16) uint64 {
+	return (uint64(now.Unix())<<12 + uint64(random&0xfff)) & (1<<cidCounterBits - 1) //nolint:gosec // G115: the seconds since 1970
 }
 
 // generate returns the next ID.
@@ -178,8 +199,8 @@ const cidAheadWindow = 1 << 32
 // server must not answer a packet for such an ID with a stateless reset:
 // its token is a function of the ID, and whoever has the label's key
 // could collect the tokens of IDs to come and end those connections later
-// (review of quic-cid-route-v1, F2). An ID of a process before this one
-// falls in the window by chance only, cidAheadWindow/2^40 of the time.
+// (review of quic-cid-route-v1, F2). The IDs of a process before this one
+// are behind the window (cidStart): they still get their resets.
 func (g *cidGenerator) ahead(id []byte) bool {
 	if len(id) < cidLen {
 		return false

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Speck64/128's vector from the paper (Beaulieu et al., "The SIMON and
@@ -300,6 +301,56 @@ func TestReadCIDKeys(t *testing.T) {
 		if _, err := readCIDLabelKey(write("bad", content)); err == nil {
 			t.Errorf("backend, %s: read", name)
 		}
+	}
+}
+
+// The counter starts from the clock (cidStart): 4096 a second, a random
+// offset within the second, modulo 2^40. A process after another starts
+// past the IDs the one before issued below 4096 a second, so they are
+// neither ahead of it nor issued again.
+func TestCIDStart(t *testing.T) {
+	const mask = 1<<cidCounterBits - 1
+	c := labelCodec(bytes.Repeat([]byte{2}, 32), 7)
+	t0 := time.Unix(1794844800, 0) // 2026-11-16
+	for range 100 {
+		g, _ := newCIDGeneratorAt(c, 7, t0)
+		if d := (g.next.Load() - uint64(t0.Unix())<<12) & mask; d > 4095 {
+			t.Fatalf("start %d past the clock's second", d)
+		}
+	}
+	if cidStart(t0, 0xffff) != (uint64(t0.Unix())<<12+0xfff)&mask {
+		t.Fatal("the random offset past 4095")
+	}
+	// Started two seconds apart, the first 4096 IDs of each are apart.
+	a, _ := newCIDGeneratorAt(c, 7, t0)
+	b, _ := newCIDGeneratorAt(c, 7, t0.Add(2*time.Second))
+	seen := map[[cidLen]byte]bool{}
+	for range 4096 {
+		seen[a.generate()] = true
+	}
+	for range 4096 {
+		if id := b.generate(); seen[id] {
+			t.Fatalf("%x: issued by both", id)
+		}
+	}
+	// A process that ran 1000 s and issued 1000 IDs a second: none of its
+	// IDs is ahead of the one started after it, which therefore answers
+	// their packets with resets.
+	old, _ := newCIDGeneratorAt(c, 7, t0)
+	first := old.next.Load()
+	old.next.Store((first + 1000*1000) & mask)
+	fresh, _ := newCIDGeneratorAt(c, 7, t0.Add(1000*time.Second))
+	for _, d := range []uint64{1, 2, 500000, 1000*1000 - 1, 1000 * 1000} {
+		if id := c.encode(7, (first+d)&mask); fresh.ahead(id[:]) {
+			t.Fatalf("the old process's ID +%d is ahead of the new one", d)
+		}
+	}
+	// The counter wraps: a start near 2^40 counts on past 0.
+	late := time.Unix(int64(mask>>12), 0)
+	g, _ := newCIDGeneratorAt(c, 7, late)
+	g.next.Store(mask)
+	if id := g.generate(); id != c.encode(7, 0) {
+		t.Fatal("no wrap at 2^40")
 	}
 }
 
