@@ -137,7 +137,7 @@ func TestHelloAssembler(t *testing.T) {
 	for i := 0; err == nil && i < maxHelloFrames/maxPacketFrames+1; i++ {
 		var p []cryptoFrame
 		for j := range maxPacketFrames {
-			k := 1 + i*maxPacketFrames + j
+			k := 1 + 2*(i*maxPacketFrames+j) // a gap after each: they do not join
 			p = append(p, frame(raw, k, k+1))
 		}
 		_, _, err = b.add(p)
@@ -165,6 +165,29 @@ func TestHelloAssembler(t *testing.T) {
 	if _, _, err := c.add(over); err == nil {
 		t.Fatal("a packet of 505 parts was taken")
 	}
+	// Pieces that touch join: 256 frames of a byte, then 32 over them all,
+	// meet one piece.
+	var d helloAssembler
+	for i := range 8 {
+		var p []cryptoFrame
+		for j := range maxPacketFrames {
+			k := 1 + i*maxPacketFrames + j
+			p = append(p, frame(raw, k, k+1))
+		}
+		if _, _, err := d.add(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(d.frames) != 1 || d.size != 8*maxPacketFrames {
+		t.Fatalf("%d pieces of %d bytes for 256 that touch", len(d.frames), d.size)
+	}
+	var all []cryptoFrame
+	for range maxPacketFrames {
+		all = append(all, frame(raw, 1, 1+8*maxPacketFrames))
+	}
+	if _, _, err := d.add(all); err != nil || len(d.frames) != 1 {
+		t.Fatalf("%d pieces, err %v", len(d.frames), err)
+	}
 }
 
 // BenchmarkHelloAssemblerWorst: held pieces at every other byte, then a
@@ -187,5 +210,30 @@ func BenchmarkHelloAssemblerWorst(b *testing.B) {
 			p = append(p, cryptoFrame{offset: uint64(8 * j), data: raw[8*j : 8*j+8]})
 		}
 		a.add(p)
+	}
+}
+
+// BenchmarkHelloAssemblerTouching: 256 one-byte frames that touch, then a
+// packet of 32 frames over all of them (review 5: 38 us a packet, the 256
+// pieces apart).
+func BenchmarkHelloAssemblerTouching(b *testing.B) {
+	raw := rawHello(b)
+	for b.Loop() {
+		var a helloAssembler
+		for i := range 8 {
+			var p []cryptoFrame
+			for j := range maxPacketFrames {
+				k := i*maxPacketFrames + j
+				p = append(p, cryptoFrame{offset: uint64(k), data: raw[k : k+1]})
+			}
+			a.add(p)
+		}
+		var p []cryptoFrame
+		for range maxPacketFrames {
+			p = append(p, cryptoFrame{offset: 0, data: raw[:8*maxPacketFrames]})
+		}
+		for range 8 {
+			a.add(p)
+		}
 	}
 }

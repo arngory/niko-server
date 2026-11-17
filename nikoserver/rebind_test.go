@@ -175,10 +175,14 @@ func hysteriaFront(t *testing.T, ctx context.Context, withCID, frontCID bool, li
 }
 
 // A Hysteria2 client whose NAT gives it a new port mid-connection: its
-// stream goes on, and new streams open on the same connection. The front
-// pins the new port by the label of the server's connection ID, the server
-// moves to it at its first packet (DisablePathManager). Plain and under
-// salamander. Without the labels the connection is lost, as before.
+// stream goes on within a second, and new streams open on the same
+// connection. The front pins the new port by the label of the server's
+// connection ID, and the server moves to it once the client answered its
+// PATH_CHALLENGE there (PathValidation): the front lets that probe through
+// at once although the client sent less than a third of it there
+// (pathProbeFree; sagernet's quic-go sends the next one only when it holds
+// the first lost, a second or two later). Plain and under salamander.
+// Without the labels the connection is lost, as before.
 func TestNekoServerHysteriaRebind(t *testing.T) {
 	echo, _ := echoPair(t)
 	for _, c := range []struct {
@@ -235,6 +239,7 @@ func TestNekoServerHysteriaRebind(t *testing.T) {
 				t.Fatalf("before the new port: %v", err)
 			}
 			relay.rebind()
+			start := time.Now()
 			err = round("after the new port", 5*time.Second)
 			if !c.survives {
 				if err == nil {
@@ -244,6 +249,9 @@ func TestNekoServerHysteriaRebind(t *testing.T) {
 			}
 			if err != nil {
 				t.Fatalf("the stream after the new port: %v", err)
+			}
+			if took := time.Since(start); took > time.Second {
+				t.Fatalf("the stream after the new port took %v", took)
 			}
 			// A new stream on the same connection, and another new port.
 			relay.rebind()

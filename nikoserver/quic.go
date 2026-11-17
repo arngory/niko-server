@@ -301,7 +301,7 @@ func (a *helloAssembler) add(frames []cryptoFrame) (clientHello, bool, error) {
 			buf = append(buf, added[i].data...)
 			added[i].data = buf[start:len(buf):len(buf)]
 		}
-		a.frames = mergePieces(a.frames, added)
+		a.frames = coalesce(mergePieces(a.frames, added))
 		a.size += total
 	}
 	have := a.prefix()
@@ -365,6 +365,31 @@ func mergePieces(a, b []cryptoFrame) []cryptoFrame {
 	}
 	out = append(out, a...)
 	return append(out, b...)
+}
+
+// coalesce joins pieces that touch into one, copied: pieces stay as few
+// as the gaps between them, however a client cut its frames, and a frame
+// over held bytes meets one piece, not hundreds.
+func coalesce(pieces []cryptoFrame) []cryptoFrame {
+	out := pieces[:0]
+	for i := 0; i < len(pieces); {
+		j, end, size := i+1, pieces[i].offset+uint64(len(pieces[i].data)), len(pieces[i].data)
+		for ; j < len(pieces) && pieces[j].offset == end; j++ {
+			end += uint64(len(pieces[j].data))
+			size += len(pieces[j].data)
+		}
+		p := pieces[i]
+		if j > i+1 {
+			data := make([]byte, 0, size)
+			for _, q := range pieces[i:j] {
+				data = append(data, q.data...)
+			}
+			p.data = data
+		}
+		out = append(out, p) // at i or before: pieces[i:j] is read first
+		i = j
+	}
+	return out
 }
 
 // prefix is how many bytes from offset 0 the pieces hold without a gap.

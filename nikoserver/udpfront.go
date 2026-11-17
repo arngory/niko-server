@@ -59,7 +59,20 @@ type udpFront struct {
 	// maxFlows: the table's bound (maxUDPFlows).
 	unconfirmed flowList
 	maxFlows    int
+	// confirmed: the confirmed flows by source, at most maxConfirmed
+	// (maxConfirmedPerSource) each.
+	confirmed    map[netip.Prefix]int32
+	maxConfirmed int32
+	// freeProbes and allFreeProbes bound the path probes that go past a
+	// flow's 3x (pathProbeFree).
+	freeProbes    sourceLimits
+	allFreeProbes tokenBucket
+	// epoch: the start of udpFlow.last's clock.
+	epoch time.Time
 }
+
+// clock is a time on udpFlow.last's clock.
+func (f *udpFront) clock(now time.Time) int64 { return int64(now.Sub(f.epoch)) }
 
 // flowRoute is what a pinned flow needs of its route to read the
 // server's connection ID: the salamander password its packets are under.
@@ -87,7 +100,7 @@ type flowKey struct{ client, local netip.AddrPort }
 
 type udpFlow struct {
 	link *backendLink
-	last time.Time
+	last int64 // the flow's last datagram, udpFront.clock
 	// A flow is pinned by what anyone may send from any address (an
 	// Initial, a labelled ID) and is listed in udpFront.unconfirmed until
 	// the client shows it got the server's answers: it sends to the
@@ -104,17 +117,22 @@ type udpFlow struct {
 	route      *flowRoute // nil: plain
 	listed     bool       // in udpFront.unconfirmed: not confirmed yet
 	answered   bool       // the backend's first answer was read
+	oneRTT     bool       // a short header came from the backend
+	freeProbe  bool       // a path probe went past the flow's 3x (pathProbeFree)
 	serverLen  uint8
 	checks     uint8 // datagrams checked against serverCID
 	serverCID  [maxCIDLen]byte
-	// initialID: a hash of the Destination Connection ID of the Initial
-	// that pinned the flow, the client's choice that anyone may name (0:
-	// none). An answer whose ID is that one names nothing secret, and the
-	// client's datagrams to it were on their way before the answer.
-	initialID uint64
-	// fromClient: the client's bytes while listed; probes: the path
-	// probes sent to it meanwhile (pathProbe).
-	fromClient, probes uint32
+	// initialID and otherID: hashes of the Destination Connection IDs the
+	// client chose before the first answer (0: none), those of the Initial
+	// that pinned the flow and one more. Anyone may name them: an answer
+	// whose ID is one of them (a refusal, quic-go's sendError) names
+	// nothing secret, and the client's datagrams to them were on their way
+	// before the answer. A third ID leaves the flow unconfirmed.
+	initialID, otherID uint32
+	// fromClient: the client's bytes; sent: the backend's path probes and
+	// its datagrams before its first short header (a handshake's, which
+	// a source gets whether or not it reads them).
+	fromClient, sent uint32
 }
 
 // addSat is a + n, at most the bound of a uint32.
@@ -161,13 +179,25 @@ func longDCID(h []byte, n int) ([]byte, bool) {
 	return h[6 : 6+dl], true
 }
 
-// hashInitialID is initialID for a flow pinned by d.
-func hashInitialID(password, d []byte) uint64 {
+// hashID is a connection ID's hash for initialID and otherID, never 0.
+func hashID(id []byte) uint32 {
+	return max(uint32(maphash.Bytes(cidSeed, id)), 1)
+}
+
+// clientID is the hash of d's Destination Connection ID, 0 if d does not
+// start with a long header that holds one.
+func clientID(password, d []byte) uint32 {
 	h, n := openHead(password, d, 6+maxCIDLen)
 	if id, ok := longDCID(h[:], n); ok && len(id) > 0 {
-		return maphash.Bytes(cidSeed, id)
+		return hashID(id)
 	}
 	return 0
+}
+
+// clientChose reports whether a connection ID's hash is one of those the
+// flow's client chose.
+func (fl *udpFlow) clientChose(h uint32) bool {
+	return h != 0 && (h == fl.initialID || h == fl.otherID)
 }
 
 // password is the salamander password of the flow's packets, nil if none.
@@ -280,6 +310,19 @@ const (
 	// answer checked against its connection ID (Chromium's next flight
 	// goes to it), those to the ID of its first Initial not counted.
 	maxServerCIDChecks = 16
+	// maxConfirmedPerSource: the confirmed flows of a source (an IPv4
+	// address, an IPv6 /48) at most; past it a flow stays listed. Without
+	// it a host's own /64 could confirm the whole table, a real handshake
+	// a flow, and keep every new flow out.
+	maxConfirmedPerSource = 1024
+	// pathProbeFree: a path probe past its flow's 3x goes all the same,
+	// once a flow, within freeProbeRate a second (freeProbeBurst) of a
+	// source (an IPv4 address, an IPv6 /64) and freeProbeTotalRate
+	// (freeProbeTotalBurst) of all: a client whose address changed gets
+	// its server's PATH_CHALLENGE at once. sagernet's quic-go sends the
+	// next one only when it holds the first lost, a second or two later.
+	freeProbeRate, freeProbeBurst           = 2, 8
+	freeProbeTotalRate, freeProbeTotalBurst = 256, 1024
 	// cidFlowRate and cidFlowBurst bound the flows a source (an IPv4
 	// address, an IPv6 /64) pins by a label: a client whose address
 	// changes pins one per connection, a CGNAT address a few for all its
@@ -294,7 +337,7 @@ const (
 func newUDPFront(c *FrontUDP, backends map[string]BackendRef, log *Logger) (*udpFront, error) {
 	f := &udpFront{log: log, idle: 60 * time.Second, byName: map[string]*backendLink{}, links: map[string]*backendLink{},
 		sockets: map[netip.AddrPort]*net.UDPConn{}, flows: map[flowKey]*udpFlow{}, pending: map[flowKey]*pendingFlow{},
-		maxFlows: maxUDPFlows}
+		maxFlows: maxUDPFlows, confirmed: map[netip.Prefix]int32{}, maxConfirmed: maxConfirmedPerSource, epoch: time.Now()}
 	if d, err := time.ParseDuration(c.Idle); err == nil && d > 0 {
 		f.idle = d
 	}
@@ -420,7 +463,7 @@ func (f *udpFront) expire(now time.Time) {
 	f.access.Lock()
 	defer f.access.Unlock()
 	for k, fl := range f.flows {
-		if now.Sub(fl.last) > f.idle {
+		if f.clock(now)-fl.last > int64(f.idle) {
 			f.unpin(k)
 		}
 	}
@@ -537,6 +580,11 @@ type sourceLimits struct {
 }
 
 func (s *sourceLimits) allow(src netip.Addr, now time.Time) bool {
+	return s.take(src, now, cidFlowRate, cidFlowBurst)
+}
+
+// take takes one from src's bucket of rate a second, burst at most.
+func (s *sourceLimits) take(src netip.Addr, now time.Time, rate, burst float64) bool {
 	src = src.Unmap()
 	bits := 64
 	if src.Is4() {
@@ -553,7 +601,17 @@ func (s *sourceLimits) allow(src netip.Addr, now time.Time) bool {
 		}
 		s.sources[prefix] = b
 	}
-	return b.take(1, cidFlowRate, cidFlowBurst, now)
+	return b.take(1, rate, burst, now)
+}
+
+// sourcePrefix is src's prefix of bits as IPv6, an IPv4 address whole.
+func sourcePrefix(src netip.Addr, bits int) netip.Prefix {
+	src = src.Unmap()
+	if src.Is4() {
+		bits = 32
+	}
+	p, _ := src.Prefix(bits)
+	return p
 }
 
 // age starts a new generation once a minute.
@@ -705,9 +763,10 @@ func (f *udpFront) answer(link *backendLink, client, local netip.AddrPort, paylo
 }
 
 // pinned is the backend of a pinned flow, nil if none: the datagram takes
-// the flow's time. A flow not confirmed yet is confirmed by it if it goes
-// to the connection ID the backend's first answer named, and moves to the
-// end of the list: a flow in use is not the oldest.
+// the flow's time and counts. A flow not confirmed yet notes the IDs its
+// client chose before the first answer, is confirmed by a datagram to the
+// connection ID that answer named, and moves to the end of the list: a
+// flow in use is not the oldest.
 func (f *udpFront) pinned(key flowKey, d []byte, now time.Time) *backendLink {
 	f.access.Lock()
 	defer f.access.Unlock()
@@ -715,22 +774,45 @@ func (f *udpFront) pinned(key flowKey, d []byte, now time.Time) *backendLink {
 	if fl == nil {
 		return nil
 	}
-	fl.last = now
+	fl.last = f.clock(now)
+	fl.fromClient = addSat(fl.fromClient, len(d))
 	if !fl.listed {
 		return fl.link
 	}
-	fl.fromClient = addSat(fl.fromClient, len(d))
+	if !fl.answered && fl.checks < maxServerCIDChecks {
+		switch h := clientID(fl.password(), d); {
+		case h == 0 || fl.clientChose(h):
+		case fl.otherID == 0:
+			fl.otherID = h
+		default:
+			fl.checks = maxServerCIDChecks // more IDs of its own than a client takes
+		}
+	}
 	if fl.serverLen > 0 && fl.checks < maxServerCIDChecks {
 		switch toServerCID(fl, d) {
 		case cidServer:
-			f.unconfirmed.remove(fl)
-			return fl.link
+			if f.confirm(fl) {
+				return fl.link
+			}
 		case cidOther:
 			fl.checks++
 		}
 	}
 	f.unconfirmed.moveToBack(fl)
 	return fl.link
+}
+
+// confirm takes a flow off the list, unless its source has maxConfirmed
+// confirmed flows: then it stays listed, unchecked. With f.access.
+func (f *udpFront) confirm(fl *udpFlow) bool {
+	p := sourcePrefix(fl.key.client.Addr(), 48)
+	if f.confirmed[p] >= f.maxConfirmed {
+		fl.checks = maxServerCIDChecks
+		return false
+	}
+	f.confirmed[p]++
+	f.unconfirmed.remove(fl)
+	return true
 }
 
 // pin pins a flow to link by d, the datagram that classified it. With the
@@ -749,11 +831,11 @@ func (f *udpFront) pin(key flowKey, link *backendLink, d []byte, now time.Time) 
 		}
 		f.unpin(f.unconfirmed.head.key)
 	}
-	fl := &udpFlow{link: link, last: now, key: key, fromClient: addSat(0, len(d))}
+	fl := &udpFlow{link: link, last: f.clock(now), key: key, fromClient: addSat(0, len(d))}
 	if r := f.salamanderFor(link, d); r != nil {
 		fl.route = r.flow
 	}
-	fl.initialID = hashInitialID(fl.password(), d)
+	fl.initialID = clientID(fl.password(), d)
 	f.unconfirmed.push(fl)
 	f.flows[key] = fl
 }
@@ -764,37 +846,52 @@ func (f *udpFront) unpin(key flowKey) {
 	if fl == nil {
 		return
 	}
-	f.unconfirmed.remove(fl)
+	if fl.listed {
+		f.unconfirmed.remove(fl)
+	} else if p := sourcePrefix(key.client.Addr(), 48); f.confirmed[p] > 1 {
+		f.confirmed[p]--
+	} else {
+		delete(f.confirmed, p)
+	}
 	delete(f.flows, key)
 }
 
 // answered takes the time of a backend's answer on a flow and reports
-// whether it goes to the client. A path probe (isPathProbe) goes to a flow
-// not confirmed yet within three times what its client sent, and to an
-// address with no flow not at all: the address may be anyone's. Of the
-// first answer to a flow not confirmed yet it reads the server's
-// connection ID, a long header's Source Connection ID, which the client
-// sends to once it has the answer: unless it is the ID the client chose
-// (a refusal names it, quic-go's sendError), which proves nothing.
+// whether it goes to the client. A path probe (isPathProbe) goes within
+// three times what the flow's client sent, the backend's datagrams before
+// its first short header (a handshake's) counted with the probes; once a
+// flow, it goes past that within pathProbeFree; to an address with no flow
+// it does not go at all: the address may be anyone's. Of the first answer
+// to a flow not confirmed yet it reads the server's connection ID, a long
+// header's Source Connection ID, which the client sends to once it has the
+// answer: unless it is one the client chose (a refusal names it, quic-go's
+// sendError), which proves nothing.
 func (f *udpFront) answered(link *backendLink, key flowKey, payload []byte, now time.Time) bool {
 	f.access.Lock()
 	defer f.access.Unlock()
 	fl := f.flows[key]
 	if fl == nil {
-		password := f.linkPassword(link)
-		return !isPathProbe(nil, payload) && (password == nil || !isPathProbe(password, payload))
+		return !f.linkProbe(link, payload)
 	}
-	fl.last = now
-	if !fl.listed {
-		return true
-	}
-	if isPathProbe(fl.password(), payload) {
-		if uint64(fl.probes)+uint64(len(payload)) > 3*uint64(fl.fromClient) {
-			return false
+	fl.last = f.clock(now)
+	switch n := len(payload); {
+	case isPathProbe(fl.password(), payload):
+		if uint64(fl.sent)+uint64(n) > 3*uint64(fl.fromClient) {
+			if fl.freeProbe || !f.freeProbes.take(key.client.Addr(), now, freeProbeRate, freeProbeBurst) ||
+				!f.allFreeProbes.take(1, freeProbeTotalRate, freeProbeTotalBurst, now) {
+				return false
+			}
+			fl.freeProbe = true
 		}
-		fl.probes = addSat(fl.probes, len(payload))
+		fl.sent = addSat(fl.sent, n)
+	case !fl.oneRTT:
+		if h, m := openHead(fl.password(), payload, 1); m == 1 && h[0]&0x80 == 0 {
+			fl.oneRTT = true
+		} else {
+			fl.sent = addSat(fl.sent, n)
+		}
 	}
-	if !fl.answered {
+	if fl.listed && !fl.answered {
 		f.serverID(fl, payload)
 	}
 	return true
@@ -820,28 +917,33 @@ func (f *udpFront) serverID(fl *udpFlow, payload []byte) {
 		return
 	}
 	id := h[7+dl : 7+dl+sl]
-	if fl.initialID != 0 && maphash.Bytes(cidSeed, id) == fl.initialID {
+	if fl.clientChose(hashID(id)) {
 		return
 	}
 	fl.serverLen = uint8(copy(fl.serverCID[:], id))
 }
 
-// linkPassword is the salamander password of a backend's route, nil if
-// it has none.
-func (f *udpFront) linkPassword(link *backendLink) []byte {
+// linkProbe reports whether d, a datagram of link's backend, may be a path
+// probe: under the salamander of each of the link's routes, or plain if it
+// has none.
+func (f *udpFront) linkProbe(link *backendLink, d []byte) bool {
+	obfuscated := false
 	for i := range f.salamander {
-		if f.salamander[i].link == link {
-			return f.salamander[i].password
+		if r := &f.salamander[i]; r.link == link {
+			obfuscated = true
+			if isPathProbe(r.password, d) {
+				return true
+			}
 		}
 	}
-	return nil
+	return !obfuscated && isPathProbe(nil, d)
 }
 
 // What a client's datagram goes to, for confirming its flow.
 const (
 	cidOther   = iota
 	cidServer  // the ID the server's first answer named
-	cidInitial // the ID of the client's first Initial, sent before the answer
+	cidInitial // an ID the client chose, sent to before the answer
 )
 
 // toServerCID tells where d, a client's datagram, goes by its first
@@ -859,7 +961,7 @@ func toServerCID(fl *udpFlow, d []byte) int {
 			return cidOther
 		case bytes.Equal(id, want):
 			return cidServer
-		case fl.initialID != 0 && len(id) > 0 && maphash.Bytes(cidSeed, id) == fl.initialID:
+		case len(id) > 0 && fl.clientChose(hashID(id)):
 			return cidInitial
 		}
 	case h[0]&0x40 != 0: // a short header
