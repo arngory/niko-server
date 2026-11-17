@@ -499,6 +499,16 @@ func TestUDPFrontPathProbes(t *testing.T) {
 	if f2.sent != 7200+(countedAnswers-3)*1300 || f2.budget.sent != uint64(f2.sent) {
 		t.Fatalf("%d counted of %d answers, %d for the source", f2.sent, countedAnswers+3, f2.budget.sent)
 	}
+	// A client's long header of an Initial's size (a handshake anew on the
+	// flow) has the backend's next answers counted again; a short one not.
+	was := f2.sent
+	front.pinned(key(2), shortPacket(id, 1300), now)
+	front.answered(a, key(2), handshakePacket(id, 1300), now)
+	front.pinned(key(2), handshakePacket(id, 1200), now)
+	front.answered(a, key(2), handshakePacket(id, 1300), now)
+	if f2.sent != was+1300 {
+		t.Fatalf("after the client's new handshake: %d counted, %d before", f2.sent, was)
+	}
 	// A new port of a source that sent much has its first probe within the
 	// source's 3x, none of the source's free ones taken (a port hop, a
 	// rebinding), and its second within its own.
@@ -713,8 +723,11 @@ func TestUDPFrontConfirmedPerSource(t *testing.T) {
 	if confirm("[2001:db8:1:1::1]:1").listed || confirm("[2001:db8:1:2::1]:1").listed || !confirm("[2001:db8:1:3::1]:1").listed {
 		t.Fatal("IPv6 /48 not one source")
 	}
-	front.unpin(flowKey{client: netip.MustParseAddrPort("192.0.2.60:1"), local: local})
 	refused := flowKey{client: netip.MustParseAddrPort("192.0.2.60:3"), local: local}
+	for range 2 * maxServerCIDChecks { // refused, not spent
+		front.pinned(refused, shortPacket(server, 1200), now)
+	}
+	front.unpin(flowKey{client: netip.MustParseAddrPort("192.0.2.60:1"), local: local})
 	front.pinned(refused, shortPacket(server, 1200), now)
 	if front.flows[refused].listed {
 		t.Fatal("a flow refused at the cap was not confirmed once a place was free")
@@ -784,16 +797,53 @@ func TestUDPFrontConfirmedSilent(t *testing.T) {
 	front.pinned(silentKey, shortPacket(server, 100), later)
 	front.pinned(answeredKey, shortPacket(server, 100), later)
 	front.answered(nil, answeredKey, shortPacket(server, 100), later)
+	busy := flowKey{client: netip.MustParseAddrPort("192.0.2.72:1"), local: netip.MustParseAddrPort("127.0.0.1:443")}
+	front.pin(busy, link, nil, 0, later) // listed, in use: after the silent one
 	front.expire(later)
 	if !silent.listed || answered.listed {
 		t.Fatalf("after idle/2: the silent backend's flow listed %v, the answered one's %v", silent.listed, answered.listed)
 	}
 	checkFlows(t, front)
-	// Its checks start again: one to another ID, then the server's.
+	if front.unconfirmed.head != silent {
+		t.Fatal("listed again, but not the first to go")
+	}
+	// Its client alone confirms nothing while the backend is silent.
+	front.pinned(silentKey, shortPacket(server, 100), later)
+	if !silent.listed {
+		t.Fatal("confirmed anew by its client alone")
+	}
+	// Once the backend answers, its checks start again: one to another
+	// ID, then the server's.
+	front.answered(nil, silentKey, shortPacket(server, 100), later)
 	front.pinned(silentKey, shortPacket(other, 100), later)
 	front.pinned(silentKey, shortPacket(server, 100), later)
 	if silent.listed {
 		t.Fatal("not confirmed anew")
+	}
+	checkFlows(t, front)
+}
+
+// TestUDPFrontClockBack: a flow stamped after the sweep's own time (a
+// datagram while the sweep waited for the lock, past a second's edge) is
+// not taken for one idle a whole wrap of the clock.
+func TestUDPFrontClockBack(t *testing.T) {
+	front, link := desyncFront(t)
+	now := time.Now()
+	key := flowKey{client: netip.MustParseAddrPort("192.0.2.80:1"), local: netip.MustParseAddrPort("127.0.0.1:443")}
+	front.pin(key, link, nil, 0, now)
+	front.pinned(key, shortPacket([cidLen]byte{}, 100), now.Add(time.Second))
+	front.answered(nil, key, shortPacket([cidLen]byte{}, 100), now.Add(time.Second))
+	front.unconfirmed.remove(front.flows[key])
+	front.confirmed[sourcePrefix(key.client.Addr(), 48)]++
+	front.expire(now)
+	if fl := front.flows[key]; fl == nil || fl.listed {
+		t.Fatal("a flow newer than the sweep went, or was listed again")
+	}
+	checkFlows(t, front)
+	// Its backend silent past idle/2, it is listed again, into an empty list.
+	front.expire(now.Add(front.idle/2 + 2*time.Second))
+	if fl := front.flows[key]; fl == nil || !fl.listed {
+		t.Fatal("not listed again")
 	}
 	checkFlows(t, front)
 }
@@ -814,4 +864,51 @@ func TestSourceKey(t *testing.T) {
 	case k("192.0.2.1") == k("0:0:c000:201::1") || k("192.0.2.1") == k("2001:db8::"):
 		t.Fatal("an IPv4 address an IPv6 /64's source")
 	}
+}
+
+// TestUDPFrontBusySource: probes within a busy source's bytes are
+// sourceProbeBurst at once, by labels or by Initials, then the free ones;
+// with the total share of free probes gone, a source's own is not taken.
+func TestUDPFrontBusySource(t *testing.T) {
+	front, _ := cidFront(t, true)
+	now := time.Now()
+	a := front.links["a"]
+	var id [cidLen]byte
+	probe := shortPacket(id, quicProbeSize)
+	from := func(port int) flowKey {
+		return flowKey{client: netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 0, 2, 90}), uint16(port)), local: netip.MustParseAddrPort("127.0.0.1:443")}
+	}
+	front.pin(from(1), a, shortPacket(cidID(cidSecret, 1, 1), 1200), 1200, now)
+	for range 1000 {
+		front.pinned(from(1), shortPacket(id, 1200), now) // 1.2 MB in
+	}
+	went := 0
+	for i := range 200 {
+		k := from(100 + i)
+		if i%2 == 0 {
+			front.pin(k, a, shortPacket(cidID(cidSecret, 1, uint64(2+i)), 50), 50, now)
+		} else {
+			front.pin(k, a, handshakePacket(id, 1200), 1200, now)
+			for range 3 {
+				front.answered(a, k, probe, now) // its own 3x
+			}
+		}
+		if front.answered(a, k, probe, now) {
+			went++
+		}
+	}
+	if went != sourceProbeBurst+freeProbeBurst {
+		t.Fatalf("%d probes past their flows' 3x went to a busy source, not %d", went, sourceProbeBurst+freeProbeBurst)
+	}
+	// The total share empty: a source's free probe neither goes nor is taken.
+	front.allFreeProbes = tokenBucket{tokens: 0, last: now}
+	k := flowKey{client: netip.MustParseAddrPort("192.0.2.91:1"), local: netip.MustParseAddrPort("127.0.0.1:443")}
+	front.pin(k, a, shortPacket(cidID(cidSecret, 1, 999), 50), 50, now)
+	if front.answered(a, k, probe, now) {
+		t.Fatal("a free probe went with the total share empty")
+	}
+	if b := front.freeProbes.bucket(k.client.Addr(), now); !b.take(freeProbeBurst, freeProbeRate, freeProbeBurst, now) {
+		t.Fatal("the source's free share was taken for a probe that did not go")
+	}
+	checkFlows(t, front)
 }

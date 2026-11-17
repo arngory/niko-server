@@ -69,6 +69,7 @@ type udpFront struct {
 	budgets       map[uint64]*sourceBudget // by sourceKey
 	freeProbes    sourceLimits
 	allFreeProbes tokenBucket
+	sourceProbes  sourceLimits // those within the source's bytes (sourceProbeRate)
 	// epoch: the start of udpFlow.last's clock.
 	epoch time.Time
 }
@@ -258,6 +259,18 @@ func (l *flowList) push(fl *udpFlow) {
 	l.n++
 }
 
+// pushFront lists a flow as the least recently used.
+func (l *flowList) pushFront(fl *udpFlow) {
+	fl.prev, fl.next, fl.listed = nil, l.head, true
+	if l.head != nil {
+		l.head.prev = fl
+	} else {
+		l.tail = fl
+	}
+	l.head = fl
+	l.n++
+}
+
 // moveToBack makes a listed flow the most recently used.
 func (l *flowList) moveToBack(fl *udpFlow) {
 	if !fl.listed || l.tail == fl {
@@ -356,6 +369,12 @@ const (
 	// when it holds the first lost, a second or two later.
 	freeProbeRate, freeProbeBurst           = 2, 8
 	freeProbeTotalRate, freeProbeTotalBurst = 256, 1024
+	// sourceProbeRate and sourceProbeBurst: the probes past their flows'
+	// 3x within their source's a second, a source: one who spoofs a busy
+	// address, pinning flows by labels or by Initials, draws that many at
+	// most to it. The users of one CGNAT address hopping ports every 30 s
+	// need a few.
+	sourceProbeRate, sourceProbeBurst = 32, 128
 	// countedAnswers: the backend's first datagrams to a flow, read for
 	// long headers: its handshake and the handshake's retransmissions,
 	// which count against the source's 3x with the probes.
@@ -504,9 +523,9 @@ func (f *udpFront) expire(now time.Time) {
 	idle := uint32(f.idle / time.Second)
 	for k, fl := range f.flows {
 		switch {
-		case t-fl.last > idle:
+		case int32(t-fl.last) > int32(idle): // signed: a flow may be newer than now
 			f.unpin(k)
-		case !fl.listed && t-fl.backendAt > idle/2:
+		case !fl.listed && int32(t-fl.backendAt) > int32(idle/2):
 			f.unconfirm(fl)
 		}
 	}
@@ -517,6 +536,7 @@ func (f *udpFront) expire(now time.Time) {
 	}
 	f.cidSources.age(now)
 	f.freeProbes.age(now)
+	f.sourceProbes.age(now)
 }
 
 func (f *udpFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
@@ -830,6 +850,11 @@ func (f *udpFront) pinned(key flowKey, d []byte, now time.Time) *backendLink {
 	fl.last = f.clock(now)
 	fl.fromClient = addSat(fl.fromClient, len(d))
 	fl.budget.fromClient += uint64(len(d))
+	if fl.answers >= countedAnswers && len(d) >= minInitialDatagram {
+		if h, m := openHead(fl.password(), d, 1); m == 1 && h[0]&0x80 != 0 {
+			fl.answers = 0 // a client's long header: a handshake anew, its answers count
+		}
+	}
 	if !fl.listed {
 		return fl.link
 	}
@@ -845,7 +870,9 @@ func (f *udpFront) pinned(key flowKey, d []byte, now time.Time) *backendLink {
 	if fl.serverLen > 0 && fl.checks < maxServerCIDChecks {
 		switch toServerCID(fl, d) {
 		case cidServer:
-			if f.confirm(fl) {
+			// Not while the backend is silent: only its answers show the
+			// client has a connection there, not merely its server's ID.
+			if int32(fl.last-fl.backendAt) <= int32(f.idle/time.Second/2) && f.confirm(fl) {
 				return fl.link
 			}
 		case cidOther:
@@ -857,11 +884,11 @@ func (f *udpFront) pinned(key flowKey, d []byte, now time.Time) *backendLink {
 }
 
 // confirm takes a flow off the list, unless its source has maxConfirmed
-// confirmed flows: then it stays listed, unchecked. With f.access.
+// confirmed flows: then it stays listed, its checks kept for when a place
+// is free. With f.access.
 func (f *udpFront) confirm(fl *udpFlow) bool {
 	p := sourcePrefix(fl.key.client.Addr(), 48)
 	if f.confirmed[p] >= f.maxConfirmed {
-		fl.checks++
 		return false
 	}
 	f.confirmed[p]++
@@ -869,12 +896,13 @@ func (f *udpFront) confirm(fl *udpFlow) bool {
 	return true
 }
 
-// unconfirm lists a confirmed flow again, to be confirmed anew. With
+// unconfirm lists a confirmed flow again, to be confirmed anew once its
+// backend answers, first in line to go: its backend has been silent. With
 // f.access.
 func (f *udpFront) unconfirm(fl *udpFlow) {
 	f.uncount(fl.key)
 	fl.checks = 0
-	f.unconfirmed.push(fl)
+	f.unconfirmed.pushFront(fl)
 }
 
 // uncount takes a confirmed flow off its source's count. With f.access.
@@ -980,14 +1008,17 @@ func (f *udpFront) answered(link *backendLink, key flowKey, payload []byte, now 
 }
 
 // freeProbe reports whether a flow's probe past its 3x goes (it takes it):
-// once a flow, within its source's 3x, or failing that within
-// freeProbeRate of the source and freeProbeTotalRate of all. With f.access.
+// once a flow, within its source's 3x and sourceProbeRate, or failing that
+// within freeProbeRate of the source and freeProbeTotalRate of all. With
+// f.access.
 func (f *udpFront) freeProbe(fl *udpFlow, now time.Time) bool {
 	if fl.freeProbe {
 		return false
 	}
-	if b := fl.budget; b.sent+quicProbeSize+salamanderSalt > 3*b.fromClient {
-		sb := f.freeProbes.bucket(fl.key.client.Addr(), now)
+	addr := fl.key.client.Addr()
+	if b := fl.budget; b.sent+quicProbeSize+salamanderSalt > 3*b.fromClient ||
+		!f.sourceProbes.take(addr, now, sourceProbeRate, sourceProbeBurst) {
+		sb := f.freeProbes.bucket(addr, now)
 		if !sb.ready(freeProbeRate, freeProbeBurst, now) || !f.allFreeProbes.ready(freeProbeTotalRate, freeProbeTotalBurst, now) {
 			return false
 		}
