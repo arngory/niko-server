@@ -63,12 +63,30 @@ func TestHelloAssembler(t *testing.T) {
 			f.data[0] ^= 1
 			return f
 		}()}}, false},
+		// A disagreeing frame below a held one, and one around it.
+		{"disagreeing, starting below a held frame", []packet{{frame(raw, 100, 200)}, {func() cryptoFrame {
+			f := frame(raw, 50, 150)
+			f.data[60] ^= 1 // offset 110, inside the held frame
+			return f
+		}()}}, false},
+		{"disagreeing, around a held frame", []packet{{frame(raw, 100, 200)}, {func() cryptoFrame {
+			f := frame(raw, 0, n)
+			f.data[150] ^= 1
+			return f
+		}()}}, false},
 		{"33 frames in a packet", []packet{func() (p packet) {
 			for i := range maxPacketFrames + 1 {
 				p = append(p, frame(raw, i, i+1))
 			}
 			return
 		}()}, false},
+		// Empty frames do not count against maxPacketFrames.
+		{"32 frames and empty ones in a packet", []packet{func() (p packet) {
+			for i := range maxPacketFrames - 1 {
+				p = append(p, frame(raw, i, i+1), cryptoFrame{offset: uint64(i)})
+			}
+			return append(p, frame(raw, maxPacketFrames-1, n))
+		}()}, true},
 		{"a frame past maxQUICHello", []packet{{{offset: maxQUICHello, data: []byte{1}}}}, false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -90,8 +108,8 @@ func TestHelloAssembler(t *testing.T) {
 			held := 0
 			for i, f := range a.frames {
 				held += len(f.data)
-				if i > 0 && a.frames[i-1].offset > f.offset {
-					t.Fatal("frames out of order")
+				if i > 0 && a.frames[i-1].offset+uint64(len(a.frames[i-1].data)) > f.offset {
+					t.Fatal("pieces out of order or overlapping")
 				}
 			}
 			if held != a.size {

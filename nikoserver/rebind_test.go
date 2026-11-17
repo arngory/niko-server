@@ -309,7 +309,13 @@ func h3NodeFront(t *testing.T, withCID bool) (*udpFront, *net.UDPAddr) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := &http3.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, r.RemoteAddr) })}
+	srv := &http3.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/big" {
+			w.Write(make([]byte, 256<<10))
+			return
+		}
+		io.WriteString(w, r.RemoteAddr)
+	})}
 	go srv.ServeListener(ln)
 	// The socket before the transport: its reader waits on the front's
 	// datagrams, which no deadline wakes.

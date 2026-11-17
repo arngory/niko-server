@@ -3,6 +3,8 @@ package nikoserver
 import (
 	"context"
 	"encoding/binary"
+	"io"
+	"net/http"
 	"net/netip"
 	"testing"
 	"time"
@@ -17,9 +19,13 @@ func ingest(f *udpFront, key flowKey, d []byte, now time.Time) *backendLink {
 	if link := f.pinned(key, d, now); link != nil {
 		return link
 	}
-	link, _ := f.classify(key, d, now)
+	link, packets := f.classify(key, d, now)
 	if link != nil {
-		f.pin(key, link, d, now)
+		sent := 0
+		for _, p := range packets {
+			sent += len(p)
+		}
+		f.pin(key, link, d, sent, now)
 	}
 	return link
 }
@@ -148,7 +154,8 @@ func TestUDPFrontConfirmedFlows(t *testing.T) {
 // TestUDPFrontConfirmedSalamander: a flow under salamander is confirmed
 // the same way, its answer and its datagram opened with its route's
 // password; a plain datagram to the same ID confirms nothing. A version
-// negotiation is not the answer whose ID counts.
+// negotiation is not the answer whose ID counts. The backend's answers
+// count without their salt.
 func TestUDPFrontConfirmedSalamander(t *testing.T) {
 	front, password := cidFront(t, true)
 	now := time.Now()
@@ -182,16 +189,161 @@ func TestUDPFrontConfirmedSalamander(t *testing.T) {
 	if fl.listed {
 		t.Fatal("the client's datagram under salamander did not confirm the flow")
 	}
+	// The backend's answers count without their salt, as its QUIC counts
+	// them: 720 of 100 bytes are 3 x 24000, not more.
+	big := flowKey{client: netip.MustParseAddrPort("192.0.2.21:40000"), local: netip.MustParseAddrPort("127.0.0.1:443")}
+	front.pin(big, front.links["s"], obfuscate(password, initial), 24000, now)
+	fl = front.flows[big]
+	if fl == nil || fl.route == nil {
+		t.Fatal("not pinned under salamander")
+	}
+	short := make([]byte, 100)
+	short[0] = 0x40
+	for range 720 {
+		front.answered(big, obfuscate(password, short), now)
+	}
+	if !fl.listed {
+		t.Fatalf("confirmed at %d to %d bytes, the salt counted", fl.toClient, fl.fromClient)
+	}
+	front.answered(big, obfuscate(password, short), now)
+	if fl.listed {
+		t.Fatalf("not confirmed at %d to %d bytes", fl.toClient, fl.fromClient)
+	}
 	checkFlows(t, front)
 }
 
+// TestUDPFrontConfirmedLabel: an ID with the flow's backend's label does
+// not confirm it: anyone gets one, in the server's answer to an Initial of
+// their own.
+func TestUDPFrontConfirmedLabel(t *testing.T) {
+	front, _ := cidFront(t, true)
+	now := time.Now()
+	key := flowKey{client: netip.MustParseAddrPort("192.0.2.30:40000"), local: netip.MustParseAddrPort("127.0.0.1:443")}
+	front.pin(key, front.links["a"], shortPacket(cidID(cidSecret, 1, 1), 1200), 1200, now)
+	fl := front.flows[key]
+	for i := range 64 {
+		front.pinned(key, handshakePacket(cidID(cidSecret, 1, uint64(7+i)), 1200), now)
+	}
+	if !fl.listed {
+		t.Fatal("packets to IDs with the flow's label confirmed it")
+	}
+	checkFlows(t, front)
+}
+
+// TestUDPFrontConfirmedBytes: the backend sending confirmBytes and more
+// than three times what the client sent confirms a flow; less, or not
+// more than three times, does not.
+func TestUDPFrontConfirmedBytes(t *testing.T) {
+	front, link := desyncFront(t)
+	now := time.Now()
+	key := flowKey{client: netip.MustParseAddrPort("192.0.2.31:40000"), local: netip.MustParseAddrPort("127.0.0.1:443")}
+	front.pin(key, link, nil, 2500, now)
+	fl := front.flows[key]
+	answer := make([]byte, 1200)
+	answer[0] = 0x40 // short headers
+	// Under confirmBytes: not confirmed, however far past 3x.
+	for range confirmBytes / 1200 { // 54 answers, 64800 bytes
+		front.answered(key, answer, now)
+	}
+	if !fl.listed {
+		t.Fatal("confirmed under confirmBytes")
+	}
+	// Past confirmBytes but not past 3x: the client sent 32500 bytes, and
+	// 81 answers are 97200.
+	front.pinned(key, make([]byte, 30000), now)
+	for range 81 - confirmBytes/1200 {
+		front.answered(key, answer, now)
+	}
+	if !fl.listed {
+		t.Fatalf("confirmed at %d to %d bytes", fl.toClient, fl.fromClient)
+	}
+	front.answered(key, answer, now) // 98400
+	if fl.listed {
+		t.Fatalf("not confirmed at %d to %d bytes", fl.toClient, fl.fromClient)
+	}
+	// What went to the backend with the classifying datagram counts too.
+	big := flowKey{client: netip.MustParseAddrPort("192.0.2.32:40000"), local: netip.MustParseAddrPort("127.0.0.1:443")}
+	front.pin(big, link, nil, 40000, now)
+	for range 100000 / 1200 { // past confirmBytes, under 3 x 40000
+		front.answered(big, answer, now)
+	}
+	if !front.flows[big].listed {
+		t.Fatal("the bytes sent at the pin were not counted")
+	}
+	checkFlows(t, front)
+}
+
+// TestUDPFrontFlowDetails: the first answer's ID is the one that counts,
+// not a later one's; a long header whose ID length differs, or a packet
+// without QUIC's fixed bit, confirms nothing; the ID is checked for
+// maxServerCIDChecks datagrams only; a key is pinned once; a flow in use
+// is not the oldest; listed flows idle go from the list.
+func TestUDPFrontFlowDetails(t *testing.T) {
+	front, link := desyncFront(t)
+	front.maxFlows = 4
+	now := time.Now()
+	key := func(i int) flowKey {
+		return flowKey{client: netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 0, 2, byte(i)}), 40000), local: netip.MustParseAddrPort("127.0.0.1:443")}
+	}
+	front.pin(key(1), link, nil, 2500, now)
+	front.pin(key(1), link, nil, 2500, now)
+	if len(front.flows) != 1 || front.unconfirmed.n != 1 {
+		t.Fatal("a key pinned twice")
+	}
+	fl := front.flows[key(1)]
+	first, later := []byte("firstid!"), []byte("laterid!")
+	front.answered(key(1), serverInitial(nil, first), now)
+	front.answered(key(1), serverInitial(nil, later), now)
+	var id [cidLen]byte
+	copy(id[:], later)
+	front.pinned(key(1), shortPacket(id, 1200), now)
+	if !fl.listed {
+		t.Fatal("a later answer's ID confirmed the flow")
+	}
+	// A long header with an ID of 9 bytes that starts with the first ID.
+	long := handshakePacket(id, 1200)
+	long[5] = 9
+	copy(long[6:], first)
+	front.pinned(key(1), long, now)
+	// A packet without the fixed bit that carries the first ID.
+	copy(id[:], first)
+	nofixed := shortPacket(id, 1200)
+	nofixed[0] &= 0x3f
+	front.pinned(key(1), nofixed, now)
+	if !fl.listed {
+		t.Fatal("a packet to another ID length, or without the fixed bit, confirmed the flow")
+	}
+	// Past maxServerCIDChecks the ID is not read any more.
+	for range maxServerCIDChecks {
+		front.pinned(key(1), nofixed, now)
+	}
+	front.pinned(key(1), shortPacket(id, 1200), now)
+	if !fl.listed {
+		t.Fatal("the ID was read past maxServerCIDChecks")
+	}
+	// In use, the oldest flow is not the one to go: 1 is used last.
+	for i := 2; i <= 4; i++ {
+		front.pin(key(i), link, nil, 2500, now)
+	}
+	front.pinned(key(1), nofixed, now)
+	front.pin(key(5), link, nil, 2500, now)
+	if front.flows[key(1)] == nil || front.flows[key(2)] != nil {
+		t.Fatal("a flow in use went before an idle one")
+	}
+	checkFlows(t, front)
+	// Idle, listed: gone from the table and the list.
+	front.expire(now.Add(front.idle + time.Second))
+	if len(front.flows) != 0 || front.unconfirmed.n != 0 || front.unconfirmed.head != nil {
+		t.Fatalf("after idle: %d flows, %d listed", len(front.flows), front.unconfirmed.n)
+	}
+}
+
 // TestUDPFrontConfirmedQUIC: a real quic-go client through the front to a
-// quic-go server (as naive-quic and DoH3 are). With labels its flow is
-// confirmed once the handshake is done: it sends to IDs with the
-// backend's label. Without, it is not: quic-go's client moves to an ID of
-// an encrypted NEW_CONNECTION_ID as soon as the handshake is done, never
-// to the one the server's Initial named, and its flow stays one a full
-// table may give up for a newer one.
+// quic-go server (as naive-quic and DoH3 are), with labels and without,
+// confirms its flow by what the server sends once it has validated the
+// address: quic-go's client moves to an ID of an encrypted
+// NEW_CONNECTION_ID as soon as the handshake is done, usually before it
+// ever sends to the ID the server's Initial named.
 func TestUDPFrontConfirmedQUIC(t *testing.T) {
 	for _, withCID := range []bool{false, true} {
 		front, addr := h3NodeFront(t, withCID)
@@ -202,11 +354,15 @@ func TestUDPFrontConfirmedQUIC(t *testing.T) {
 			t.Fatal(err)
 		}
 		cc := (&http3.Transport{}).NewClientConn(qc)
-		if _, err := h3Get(ctx, cc, 5*time.Second); err != nil {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://h3.example.com/big", nil)
+		resp, err := cc.RoundTrip(req)
+		if err != nil {
 			t.Fatal(err)
 		}
+		n, _ := io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
 		front.access.Lock()
-		n, confirmed := len(front.flows), 0
+		flows, confirmed := len(front.flows), 0
 		for _, fl := range front.flows {
 			if !fl.listed {
 				confirmed++
@@ -215,39 +371,8 @@ func TestUDPFrontConfirmedQUIC(t *testing.T) {
 		front.access.Unlock()
 		qc.CloseWithError(0, "")
 		cancel()
-		want := 0
-		if withCID {
-			want = 1
-		}
-		if n != 1 || confirmed != want {
-			t.Fatalf("labels %v: %d flows, %d confirmed", withCID, n, confirmed)
+		if n < 2*confirmBytes || flows != 1 || confirmed != 1 {
+			t.Fatalf("labels %v: %d bytes down, %d flows, %d confirmed", withCID, n, flows, confirmed)
 		}
 	}
-}
-
-// TestUDPFrontConfirmedLabel: with labels, a client's packet to an ID with
-// its flow's backend's label confirms the flow; to another backend's
-// label, or to a random ID, it does not.
-func TestUDPFrontConfirmedLabel(t *testing.T) {
-	front, _ := cidFront(t, true)
-	now := time.Now()
-	key := flowKey{client: netip.MustParseAddrPort("192.0.2.30:40000"), local: netip.MustParseAddrPort("127.0.0.1:443")}
-	front.pin(key, front.links["a"], shortPacket(cidID(cidSecret, 1, 1), 1200), now)
-	fl := front.flows[key]
-	if fl == nil || fl.route == nil || fl.route.codec == nil || fl.route.label != 1 {
-		t.Fatal("the flow does not know its label")
-	}
-	var random [cidLen]byte
-	copy(random[:], "random!!")
-	for _, d := range [][]byte{shortPacket(random, 1200), shortPacket(cidID(cidSecret, 2, 1), 1200)} {
-		front.pinned(key, d, now)
-		if !fl.listed {
-			t.Fatal("a packet to another ID confirmed the flow")
-		}
-	}
-	front.pinned(key, handshakePacket(cidID(cidSecret, 1, 7), 1200), now)
-	if fl.listed {
-		t.Fatal("a packet to an ID with the flow's label did not confirm it")
-	}
-	checkFlows(t, front)
 }

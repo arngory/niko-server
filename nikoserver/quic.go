@@ -2,14 +2,13 @@ package nikoserver
 
 import (
 	"bytes"
-	"cmp"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hkdf"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
-	"slices"
+	"sort"
 
 	"github.com/sagernet/sing-quic/hysteria2"
 	"golang.org/x/crypto/blake2b"
@@ -208,6 +207,12 @@ func cryptoFrames(payload []byte) ([]cryptoFrame, error) {
 			if !ok {
 				return nil, errNotInitial
 			}
+			if len(data) == 0 {
+				continue
+			}
+			if len(out) == maxPacketFrames {
+				return nil, errNotTLS // only work for the front (helloAssembler)
+			}
 			out = append(out, cryptoFrame{offset: offset, data: data})
 		case 0x1c: // CONNECTION_CLOSE
 			return out, nil
@@ -219,23 +224,24 @@ func cryptoFrames(payload []byte) ([]cryptoFrame, error) {
 }
 
 // helloAssembler puts CRYPTO frames back in order until they hold a
-// whole ClientHello. It keeps the frames as they came, sorted by offset,
-// not a buffer up to the highest offset: what it holds is what was sent
-// (a frame of one byte at offset 16383 holds one byte, not 16 KB), and
-// that is what the front counts against its budget of pending hellos.
-// Frames that overlap must agree: the backend gets the packets as they
+// whole ClientHello. It holds the bytes that came, as pieces sorted by
+// offset that do not overlap, not a buffer up to the highest offset: what
+// it holds is what was sent once (a byte at offset 16383 holds one byte,
+// not 16 KB; a retransmission adds nothing), and that is what the front
+// counts against its budget of pending hellos. A frame must agree with
+// what is held where they overlap: the backend gets the packets as they
 // came, and the name the front routes by is the one it will read.
 type helloAssembler struct {
-	frames []cryptoFrame // copies, by offset; of equal offsets, as they came
+	frames []cryptoFrame // held pieces, by offset, not overlapping
 	size   int           // their bytes
 }
 
 const (
 	maxQUICHello = 16 << 10
 	// maxPacketFrames and maxHelloFrames: Chromium's chaos protection
-	// splits its ClientHello into a few CRYPTO frames a packet (at most 10
+	// splits its ClientHello into a few CRYPTO frames a packet (2 to 10
 	// added), quic-go into two; a packet of hundreds of one-byte frames is
-	// only work for the front.
+	// only work for the front. maxHelloFrames bounds the pieces held.
 	maxPacketFrames = 32
 	maxHelloFrames  = 256
 )
@@ -243,36 +249,47 @@ const (
 // add takes a packet's frames and returns the ClientHello once it is
 // complete.
 func (a *helloAssembler) add(frames []cryptoFrame) (clientHello, bool, error) {
-	n, total := 0, 0
+	n := 0
 	for _, f := range frames {
 		if f.offset+uint64(len(f.data)) > maxQUICHello {
 			return clientHello{}, false, errNotTLS
 		}
 		if len(f.data) > 0 {
 			n++
-			total += len(f.data)
 		}
 	}
-	if n > maxPacketFrames || len(a.frames)+n > maxHelloFrames {
+	if n > maxPacketFrames {
 		return clientHello{}, false, errNotTLS
 	}
-	if n > 0 {
-		// One copy of the packet's CRYPTO data, sliced per frame.
-		buf := make([]byte, 0, total)
-		added := make([]cryptoFrame, 0, n)
-		for _, f := range frames {
-			if len(f.data) == 0 {
-				continue
-			}
-			c := cryptoFrame{offset: f.offset, data: buf[len(buf) : len(buf)+len(f.data) : len(buf)+len(f.data)]}
-			buf = append(buf, f.data...)
-			if !a.agrees(c) || !agree(added, c) {
+	// The pieces of this packet's frames that nothing held covers, each
+	// checked against what is held and against the packet's earlier ones.
+	var added []cryptoFrame
+	for _, f := range frames {
+		if len(f.data) == 0 {
+			continue
+		}
+		pieces, ok := gaps(a.frames, f, nil)
+		if !ok {
+			return clientHello{}, false, errNotTLS
+		}
+		for _, p := range pieces {
+			if added, ok = gaps(added, p, added); !ok || len(a.frames)+len(added) > maxHelloFrames {
 				return clientHello{}, false, errNotTLS
 			}
-			added = append(added, c)
 		}
-		a.frames = append(a.frames, added...)
-		slices.SortStableFunc(a.frames, func(x, y cryptoFrame) int { return cmp.Compare(x.offset, y.offset) })
+	}
+	if len(added) > 0 {
+		total := 0
+		for _, p := range added {
+			total += len(p.data)
+		}
+		buf := make([]byte, 0, total) // one copy of the new bytes
+		for i := range added {
+			start := len(buf)
+			buf = append(buf, added[i].data...)
+			added[i].data = buf[start:len(buf):len(buf)]
+		}
+		a.frames = mergePieces(a.frames, added)
 		a.size += total
 	}
 	have := a.prefix()
@@ -297,36 +314,67 @@ func (a *helloAssembler) add(frames []cryptoFrame) (clientHello, bool, error) {
 	return h, err == nil, err
 }
 
-// agrees reports whether c says the same as every frame held where they
-// overlap.
-func (a *helloAssembler) agrees(c cryptoFrame) bool { return agree(a.frames, c) }
-
-func agree(frames []cryptoFrame, c cryptoFrame) bool {
-	cEnd := c.offset + uint64(len(c.data))
-	for _, f := range frames {
-		fEnd := f.offset + uint64(len(f.data))
-		lo, hi := max(f.offset, c.offset), min(fEnd, cEnd)
-		if lo < hi && !bytes.Equal(f.data[lo-f.offset:hi-f.offset], c.data[lo-c.offset:hi-c.offset]) {
-			return false
+// gaps checks frame f against held, pieces sorted by offset that do not
+// overlap: where they overlap the bytes must agree (false if not). It
+// appends to out the parts of f that held does not cover, in order, and
+// returns it; with out == held, those parts go into held, kept sorted.
+func gaps(held []cryptoFrame, f cryptoFrame, out []cryptoFrame) ([]cryptoFrame, bool) {
+	end := f.offset + uint64(len(f.data))
+	i := sort.Search(len(held), func(i int) bool { return held[i].offset+uint64(len(held[i].data)) > f.offset })
+	var parts []cryptoFrame
+	pos := f.offset
+	for ; i < len(held) && held[i].offset < end; i++ {
+		h := held[i]
+		hEnd := h.offset + uint64(len(h.data))
+		if h.offset > pos {
+			parts = append(parts, cryptoFrame{offset: pos, data: f.data[pos-f.offset : h.offset-f.offset]})
 		}
+		lo, hi := max(h.offset, f.offset), min(hEnd, end)
+		if !bytes.Equal(f.data[lo-f.offset:hi-f.offset], h.data[lo-h.offset:hi-h.offset]) {
+			return out, false
+		}
+		pos = max(pos, hEnd)
 	}
-	return true
+	if pos < end {
+		parts = append(parts, cryptoFrame{offset: pos, data: f.data[pos-f.offset:]})
+	}
+	if len(parts) == 0 {
+		return out, true
+	}
+	if out == nil {
+		return parts, true
+	}
+	return mergePieces(out, parts), true
 }
 
-// prefix is how many bytes from offset 0 the frames hold without a gap.
+// mergePieces merges two lists of pieces sorted by offset that do not
+// overlap one another.
+func mergePieces(a, b []cryptoFrame) []cryptoFrame {
+	out := make([]cryptoFrame, 0, len(a)+len(b))
+	for len(a) > 0 && len(b) > 0 {
+		if a[0].offset < b[0].offset {
+			out, a = append(out, a[0]), a[1:]
+		} else {
+			out, b = append(out, b[0]), b[1:]
+		}
+	}
+	out = append(out, a...)
+	return append(out, b...)
+}
+
+// prefix is how many bytes from offset 0 the pieces hold without a gap.
 func (a *helloAssembler) prefix() int {
 	var have uint64
 	for _, f := range a.frames {
-		if f.offset > have {
+		if f.offset != have {
 			break
 		}
-		have = max(have, f.offset+uint64(len(f.data)))
+		have += uint64(len(f.data))
 	}
 	return int(have)
 }
 
-// fill copies the frames into dst from offset 0, as far as dst goes
-// (frames that overlap agree, add saw to it).
+// fill copies the pieces into dst from offset 0, as far as dst goes.
 func (a *helloAssembler) fill(dst []byte) {
 	for _, f := range a.frames {
 		if f.offset >= uint64(len(dst)) {
@@ -355,13 +403,16 @@ func salamanderInitial(password, datagram []byte) bool {
 	return ok && isQUICInitial(head[:7])
 }
 
+// salamanderSalt is the salt ahead of a salamander datagram.
+const salamanderSalt = 8
+
 // salamanderHead opens the start of a datagram under salamander with this
 // password: the bytes of a QUIC header that tell what it is (cidHead, those
 // there are; the rest zero). Only they are opened, on the stack, so a
 // garbage datagram costs one key and no copy. false: too short for an
 // Initial's 7 bytes.
 func salamanderHead(password, datagram []byte) (head [cidHead]byte, ok bool) {
-	if len(datagram) < 8+7 {
+	if len(datagram) < salamanderSalt+7 {
 		return head, false
 	}
 	key := salamanderKey(password, datagram[:8])

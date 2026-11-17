@@ -54,21 +54,17 @@ type udpFront struct {
 	pendingOrder list.List
 	// cidSources bound the flows pinned by a label per source.
 	cidSources sourceLimits
-	// unconfirmed: the flows not confirmed yet, oldest first; maxFlows:
-	// the table's bound (maxUDPFlows); plainRoutes: what a flow of a plain
-	// QUIC backend with a label needs to be confirmed by it.
+	// unconfirmed: the flows not confirmed yet, least recently used first;
+	// maxFlows: the table's bound (maxUDPFlows).
 	unconfirmed flowList
 	maxFlows    int
-	plainRoutes map[*backendLink]*flowRoute
 }
 
-// flowRoute is what a pinned flow needs of its route to be confirmed: the
-// salamander password its packets are under (nil: none) and its backend's
-// label with the label's key (nil: none). One a route, its flows share it.
+// flowRoute is what a pinned flow needs of its route to read the
+// server's connection ID: the salamander password its packets are under.
+// One a route, its flows share it.
 type flowRoute struct {
 	password []byte
-	codec    *cidCodec
-	label    uint16
 }
 
 type salamanderRoute struct {
@@ -91,21 +87,26 @@ type flowKey struct{ client, local netip.AddrPort }
 type udpFlow struct {
 	link *backendLink
 	last time.Time
-	// unconfirmed: the flow's place in udpFront.unconfirmed until the
-	// client sends to a connection ID of the server's: the one the
-	// backend's first answer named as its own (serverCID), which only one
-	// who got that answer knows, or one with the backend's label (quic-go's
-	// clients move to a new ID, given in an encrypted frame, as soon as the
-	// handshake is done). Until then the flow is pinned by what anyone may
-	// send from any address, and with the table full the oldest such flow
-	// goes for a new one. nil: confirmed.
-	listed     bool       // in udpFront.unconfirmed: not confirmed yet
-	prev, next *udpFlow   // there
+	// A flow is pinned by what anyone may send from any address (an
+	// Initial, a labelled ID) and is listed in udpFront.unconfirmed until
+	// the client shows it got the server's answers: it sends to the
+	// connection ID the backend's first answer named as its own
+	// (serverCID: Chromium does), or the backend sends confirmBytes and
+	// more than three times what the client sent, which a server does only
+	// once it has validated the address (RFC 9000 §8.1; quic-go's clients
+	// move to an ID of an encrypted NEW_CONNECTION_ID right after the
+	// handshake). With the table full the least recently used listed flow
+	// goes for a new one.
+	prev, next *udpFlow   // in udpFront.unconfirmed
 	key        flowKey    // its own, to go from the list
-	route      *flowRoute // nil: plain, no label
+	route      *flowRoute // nil: plain
+	listed     bool       // in udpFront.unconfirmed: not confirmed yet
 	answered   bool       // the backend's first answer was read
 	serverLen  uint8
+	checks     uint8 // datagrams checked against serverCID
 	serverCID  [maxCIDLen]byte
+	fromClient uint64 // bytes, while listed
+	toClient   uint64
 }
 
 // password is the salamander password of the flow's packets, nil if none.
@@ -132,6 +133,15 @@ func (l *flowList) push(fl *udpFlow) {
 	}
 	l.tail = fl
 	l.n++
+}
+
+// moveToBack makes a listed flow the most recently used.
+func (l *flowList) moveToBack(fl *udpFlow) {
+	if !fl.listed || l.tail == fl {
+		return
+	}
+	l.remove(fl)
+	l.push(fl)
 }
 
 func (l *flowList) remove(fl *udpFlow) {
@@ -205,6 +215,13 @@ const (
 	maxUDPFlows       = 1 << 18
 	// maxCIDLen: RFC 9000 §17.2.
 	maxCIDLen = 20
+	// maxServerCIDChecks: the client's datagrams after the backend's first
+	// answer checked against its connection ID (Chromium's next flight
+	// goes to it); confirmBytes: what the backend sends before its 3x
+	// confirms a flow (its handshake's flights and their retransmissions
+	// are less).
+	maxServerCIDChecks = 16
+	confirmBytes       = 64 << 10
 	// cidFlowRate and cidFlowBurst bound the flows a source (an IPv4
 	// address, an IPv6 /64) pins by a label: a client whose address
 	// changes pins one per connection, a CGNAT address a few for all its
@@ -274,13 +291,9 @@ func newUDPFront(c *FrontUDP, backends map[string]BackendRef, log *Logger) (*udp
 			}
 			route := salamanderRoute{password: password, link: link(r.Backend)}
 			route.label, route.codec = key(r.Backend)
-			route.flow = &flowRoute{password: password, codec: route.codec, label: route.label}
+			route.flow = &flowRoute{password: password}
 			f.salamander = append(f.salamander, route)
 		}
-	}
-	f.plainRoutes = map[*backendLink]*flowRoute{}
-	for _, r := range f.byLabel {
-		f.plainRoutes[r.link] = &flowRoute{codec: r.codec, label: r.label}
 	}
 	if keys != nil {
 		labels := len(f.byLabel)
@@ -388,7 +401,11 @@ func (f *udpFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 		if link == nil {
 			continue
 		}
-		f.pin(key, link, datagram, now)
+		sent := 0
+		for _, p := range packets {
+			sent += len(p)
+		}
+		f.pin(key, link, datagram, sent, now)
 		for _, p := range packets {
 			link.send(encodePacket(message, client, local, p))
 		}
@@ -629,8 +646,9 @@ func (f *udpFront) answer(client, local netip.AddrPort, payload []byte) {
 }
 
 // pinned is the backend of a pinned flow, nil if none: the datagram takes
-// the flow's time, and confirms it if it goes to the connection ID the
-// backend named.
+// the flow's time. A flow not confirmed yet counts it, is confirmed by it
+// if it goes to the connection ID the backend's first answer named, and
+// moves to the end of the list: a flow in use is not the oldest.
 func (f *udpFront) pinned(key flowKey, d []byte, now time.Time) *backendLink {
 	f.access.Lock()
 	defer f.access.Unlock()
@@ -639,16 +657,26 @@ func (f *udpFront) pinned(key flowKey, d []byte, now time.Time) *backendLink {
 		return nil
 	}
 	fl.last = now
-	if fl.listed && (fl.serverLen > 0 || fl.route != nil && fl.route.codec != nil) && toServer(fl, d) {
-		f.unconfirmed.remove(fl)
+	if !fl.listed {
+		return fl.link
 	}
+	fl.fromClient += uint64(len(d))
+	if fl.serverLen > 0 && fl.checks < maxServerCIDChecks {
+		fl.checks++
+		if toServerCID(fl, d) {
+			f.unconfirmed.remove(fl)
+			return fl.link
+		}
+	}
+	f.unconfirmed.moveToBack(fl)
 	return fl.link
 }
 
-// pin pins a flow to link by d, the datagram that classified it. With the
-// table full the oldest flow not confirmed yet goes; if every flow is
+// pin pins a flow to link by d, the datagram that classified it; sent is
+// what goes to the backend with it (d and the Initials held for it). With
+// the table full the oldest flow not confirmed yet goes; if every flow is
 // confirmed, this one is not pinned (its datagrams classify one by one).
-func (f *udpFront) pin(key flowKey, link *backendLink, d []byte, now time.Time) {
+func (f *udpFront) pin(key flowKey, link *backendLink, d []byte, sent int, now time.Time) {
 	f.access.Lock()
 	defer f.access.Unlock()
 	if f.flows[key] != nil {
@@ -660,7 +688,7 @@ func (f *udpFront) pin(key flowKey, link *backendLink, d []byte, now time.Time) 
 		}
 		f.unpin(f.unconfirmed.head.key)
 	}
-	fl := &udpFlow{link: link, last: now, key: key, route: f.plainRoutes[link]}
+	fl := &udpFlow{link: link, last: now, key: key, fromClient: uint64(sent)}
 	if r := f.salamanderFor(link, d); r != nil {
 		fl.route = r.flow
 	}
@@ -678,9 +706,15 @@ func (f *udpFront) unpin(key flowKey) {
 	delete(f.flows, key)
 }
 
-// answered takes the time of a backend's answer on a flow, and of its
-// first answer the server's connection ID: a long header's Source
-// Connection ID, which the client sends to once it has the answer.
+// answered takes the time of a backend's answer on a flow. A flow not
+// confirmed yet counts it: once the backend has sent confirmBytes and
+// more than three times what the client sent, it has validated the
+// client's address (RFC 9000 §8.1: no more before that), and the flow is
+// confirmed. Under salamander an answer counts without its salt: the
+// backend's QUIC counts its own datagrams before salamander and the
+// client's after it, and the client's are counted here whole. Of the first answer it reads the server's connection ID, a
+// long header's Source Connection ID, which the client sends to once it
+// has the answer.
 func (f *udpFront) answered(key flowKey, payload []byte, now time.Time) {
 	f.access.Lock()
 	defer f.access.Unlock()
@@ -689,7 +723,19 @@ func (f *udpFront) answered(key flowKey, payload []byte, now time.Time) {
 		return
 	}
 	fl.last = now
-	if fl.answered || !fl.listed {
+	if !fl.listed {
+		return
+	}
+	n := len(payload)
+	if fl.route != nil {
+		n = max(n-salamanderSalt, 0) // as the backend's QUIC counts it, without salamander
+	}
+	fl.toClient += uint64(n)
+	if fl.toClient >= confirmBytes && fl.toClient > 3*fl.fromClient {
+		f.unconfirmed.remove(fl)
+		return
+	}
+	if fl.answered {
 		return
 	}
 	h, n := openHead(fl.password(), payload, 7+2*maxCIDLen)
@@ -712,37 +758,20 @@ func (f *udpFront) answered(key flowKey, payload []byte, now time.Time) {
 	fl.serverLen = uint8(copy(fl.serverCID[:], h[7+dl:7+dl+sl]))
 }
 
-// toServer reports whether d, a client's datagram, starts with a packet to
-// a connection ID of the flow's server: the one its first answer named, or
-// one with the flow's label.
-func toServer(fl *udpFlow, d []byte) bool {
+// toServerCID reports whether d, a client's datagram, starts with a
+// packet to the connection ID the flow's server named in its first answer.
+func toServerCID(fl *udpFlow, d []byte) bool {
 	h, n := openHead(fl.password(), d, 6+maxCIDLen)
-	if want := fl.serverCID[:fl.serverLen]; fl.serverLen > 0 {
-		switch {
-		case n < 1:
-		case h[0]&0x80 != 0: // a long header
-			if n >= 6 && int(h[5]) == len(want) && 6+len(want) <= n && bytes.Equal(h[6:6+len(want)], want) {
-				return true
-			}
-		case h[0]&0x40 != 0: // a short header
-			if 1+len(want) <= n && bytes.Equal(h[1:1+len(want)], want) {
-				return true
-			}
-		}
-	}
-	if fl.route == nil || fl.route.codec == nil {
+	want := fl.serverCID[:fl.serverLen]
+	switch {
+	case n < 1:
 		return false
+	case h[0]&0x80 != 0: // a long header
+		return n >= 6 && int(h[5]) == len(want) && 6+len(want) <= n && bytes.Equal(h[6:6+len(want)], want)
+	case h[0]&0x40 != 0: // a short header
+		return 1+len(want) <= n && bytes.Equal(h[1:1+len(want)], want)
 	}
-	size := len(d)
-	if fl.route.password != nil {
-		size -= 8
-	}
-	id := clientCID(h[:min(n, cidHead)], size)
-	if id == nil {
-		return false
-	}
-	label, ok := fl.route.codec.label(id)
-	return ok && label == fl.route.label
+	return false
 }
 
 // salamanderFor is the salamander route of link that d opens under (an
