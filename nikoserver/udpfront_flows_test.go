@@ -496,18 +496,33 @@ func TestUDPFrontPathProbes(t *testing.T) {
 	for range countedAnswers {
 		front.answered(a, key(2), handshakePacket(id, 1300), now)
 	}
-	if f2.sent != 7200+(countedAnswers-3)*1300 || f2.budget.sent != uint64(f2.sent) {
-		t.Fatalf("%d counted of %d answers, %d for the source", f2.sent, countedAnswers+3, f2.budget.sent)
+	if f2.sent != 7200+countedAnswers*1300 || f2.budget.sent != uint64(f2.sent) {
+		t.Fatalf("plain: %d counted of every long header, %d for the source", f2.sent, f2.budget.sent)
 	}
-	// A client's long header of an Initial's size (a handshake anew on the
-	// flow) has the backend's next answers counted again; a short one not.
-	was := f2.sent
-	front.pinned(key(2), shortPacket(id, 1300), now)
-	front.answered(a, key(2), handshakePacket(id, 1300), now)
-	front.pinned(key(2), handshakePacket(id, 1200), now)
-	front.answered(a, key(2), handshakePacket(id, 1300), now)
-	if f2.sent != was+1300 {
-		t.Fatalf("after the client's new handshake: %d counted, %d before", f2.sent, was)
+	// Under salamander (opening a datagram costs a key) the backend's first
+	// countedAnswers datagrams are read, and again after a client's long
+	// header of an Initial's size (a handshake anew on the flow), not
+	// after a short one.
+	s := front.links["s"]
+	initial := serverInitial(nil, nil)[:minInitialDatagram] // a long header typed Initial
+	front.pin(key(7), s, obfuscate(password, initial), 1208, now)
+	f7 := front.flows[key(7)]
+	if f7 == nil || f7.route == nil {
+		t.Fatal("not pinned under salamander")
+	}
+	for range countedAnswers + 1 {
+		front.answered(s, key(7), obfuscate(password, handshakePacket(id, 1300)), now)
+	}
+	if f7.sent != countedAnswers*1308 {
+		t.Fatalf("under salamander: %d counted of %d answers", f7.sent, countedAnswers+1)
+	}
+	was := f7.sent
+	front.pinned(key(7), obfuscate(password, shortPacket(id, 1300)), now)
+	front.answered(s, key(7), obfuscate(password, handshakePacket(id, 1300)), now)
+	front.pinned(key(7), obfuscate(password, handshakePacket(id, 1200)), now)
+	front.answered(s, key(7), obfuscate(password, handshakePacket(id, 1300)), now)
+	if f7.sent != was+1308 {
+		t.Fatalf("after the client's new handshake: %d counted, %d before", f7.sent, was)
 	}
 	// A new port of a source that sent much has its first probe within the
 	// source's 3x, none of the source's free ones taken (a port hop, a
@@ -554,7 +569,6 @@ func TestUDPFrontPathProbes(t *testing.T) {
 	if front.answered(a, key(9), probe, now) || !front.answered(a, key(9), shortPacket(id, 1252), now) {
 		t.Fatal("to no flow: a probe went or another answer was held")
 	}
-	s := front.links["s"]
 	if front.answered(s, key(9), obfuscate(password, probe), now) || !front.answered(s, key(9), probe, now) {
 		t.Fatal("to no flow of a salamander link: its probe went, or a plain datagram of 1200 bytes was held")
 	}
@@ -819,6 +833,37 @@ func TestUDPFrontConfirmedSilent(t *testing.T) {
 	front.pinned(silentKey, shortPacket(server, 100), later)
 	if silent.listed {
 		t.Fatal("not confirmed anew")
+	}
+	checkFlows(t, front)
+	// An answer idle/2 old with a datagram of the client's after it, or one
+	// between the client's keepalives further apart than idle/2: the
+	// backend answers, the flow is confirmed.
+	half := front.idle / 2
+	for _, c := range []struct {
+		name                string
+		answer, between, at time.Duration // after later
+	}{
+		{"an answer idle/2 old", time.Second, 2 * time.Second, time.Second + half},
+		{"an answer since the client's last datagram", time.Second, 0, time.Second + half + 5*time.Second},
+	} {
+		front.unconfirm(silent)
+		front.pinned(silentKey, shortPacket(other, 100), later)
+		front.answered(nil, silentKey, shortPacket(server, 100), later.Add(c.answer))
+		if c.between > 0 {
+			front.pinned(silentKey, shortPacket(other, 100), later.Add(c.between))
+		}
+		front.pinned(silentKey, shortPacket(server, 100), later.Add(c.at))
+		if silent.listed {
+			t.Fatalf("%s: not confirmed", c.name)
+		}
+		checkFlows(t, front)
+	}
+	// One more than idle/2 old, the client's last datagram after it: not.
+	front.unconfirm(silent)
+	front.pinned(silentKey, shortPacket(other, 100), later.Add(2*time.Second))
+	front.pinned(silentKey, shortPacket(server, 100), later.Add(2*time.Second+half+time.Second))
+	if !silent.listed {
+		t.Fatal("confirmed with the backend silent past idle/2")
 	}
 	checkFlows(t, front)
 }

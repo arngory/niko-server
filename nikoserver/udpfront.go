@@ -221,7 +221,12 @@ func hashID(id []byte) uint32 {
 // start with a long header that holds one.
 func clientID(password, d []byte) uint32 {
 	h, n := openHead(password, d, 6+maxCIDLen)
-	if id, ok := longDCID(h[:], n); ok && len(id) > 0 {
+	return headID(h[:], n)
+}
+
+// headID is clientID of a datagram's opened head, its first n bytes.
+func headID(h []byte, n int) uint32 {
+	if id, ok := longDCID(h, n); ok && len(id) > 0 {
 		return hashID(id)
 	}
 	return 0
@@ -847,32 +852,46 @@ func (f *udpFront) pinned(key flowKey, d []byte, now time.Time) *backendLink {
 	if fl == nil {
 		return nil
 	}
+	prev := fl.last
 	fl.last = f.clock(now)
 	fl.fromClient = addSat(fl.fromClient, len(d))
 	fl.budget.fromClient += uint64(len(d))
-	if fl.answers >= countedAnswers && len(d) >= minInitialDatagram {
-		if h, m := openHead(fl.password(), d, 1); m == 1 && h[0]&0x80 != 0 {
-			fl.answers = 0 // a client's long header: a handshake anew, its answers count
+	// The datagram's head, opened once (under salamander a key) for what
+	// reads it: a salamander flow's client's long header of an Initial's
+	// size starts the count of its backend's answers anew (a handshake on
+	// the flow); a listed flow's IDs.
+	again := fl.route != nil && len(d) >= salamanderSalt+minInitialDatagram
+	ids := fl.listed && fl.checks < maxServerCIDChecks && (!fl.answered || fl.serverLen > 0)
+	if !again && !ids {
+		if fl.listed {
+			f.unconfirmed.moveToBack(fl)
 		}
+		return fl.link
+	}
+	h, n := openHead(fl.password(), d, 6+maxCIDLen)
+	if again && n >= 1 && h[0]&0x80 != 0 {
+		fl.answers = 0
 	}
 	if !fl.listed {
 		return fl.link
 	}
 	if !fl.answered && fl.checks < maxServerCIDChecks {
-		switch h := clientID(fl.password(), d); {
-		case h == 0 || fl.clientChose(h):
+		switch x := headID(h[:], n); {
+		case x == 0 || fl.clientChose(x):
 		case fl.otherID == 0:
-			fl.otherID = h
+			fl.otherID = x
 		default:
 			fl.checks = maxServerCIDChecks // more IDs of its own than a client takes
 		}
 	}
 	if fl.serverLen > 0 && fl.checks < maxServerCIDChecks {
-		switch toServerCID(fl, d) {
+		switch headCID(fl, h[:], n) {
 		case cidServer:
 			// Not while the backend is silent: only its answers show the
 			// client has a connection there, not merely its server's ID.
-			if int32(fl.last-fl.backendAt) <= int32(f.idle/time.Second/2) && f.confirm(fl) {
+			// It has answered within idle/2, or since the client's last
+			// datagram (a client's keepalives further apart than idle/2).
+			if (int32(fl.last-fl.backendAt) <= int32(f.idle/time.Second/2) || int32(fl.backendAt-prev) >= 0) && f.confirm(fl) {
 				return fl.link
 			}
 		case cidOther:
@@ -994,6 +1013,11 @@ func (f *udpFront) answered(link *backendLink, key flowKey, payload []byte, now 
 		}
 		fl.sent = addSat(fl.sent, n)
 		b.sent += uint64(n)
+	case fl.route == nil: // plain: every long header, read at no cost
+		if n > 0 && payload[0]&0x80 != 0 {
+			fl.sent = addSat(fl.sent, n)
+			b.sent += uint64(n)
+		}
 	case fl.answers < countedAnswers:
 		fl.answers++
 		if h, m := openHead(fl.password(), payload, 1); m == 1 && h[0]&0x80 != 0 {
@@ -1078,16 +1102,15 @@ const (
 	cidInitial // an ID the client chose, sent to before the answer
 )
 
-// toServerCID tells where d, a client's datagram, goes by its first
-// packet.
-func toServerCID(fl *udpFlow, d []byte) int {
-	h, n := openHead(fl.password(), d, 6+maxCIDLen)
+// headCID tells where a client's datagram goes by its first packet, from
+// the datagram's opened head, its first n bytes.
+func headCID(fl *udpFlow, h []byte, n int) int {
 	want := fl.serverCID[:fl.serverLen]
 	switch {
 	case n < 1:
 		return cidOther
 	case h[0]&0x80 != 0: // a long header
-		id, ok := longDCID(h[:], n)
+		id, ok := longDCID(h, n)
 		switch {
 		case !ok:
 			return cidOther
