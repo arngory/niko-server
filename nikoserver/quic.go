@@ -2,12 +2,14 @@ package nikoserver
 
 import (
 	"bytes"
+	"cmp"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hkdf"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"slices"
 	"sort"
 
 	"github.com/sagernet/sing-quic/hysteria2"
@@ -261,22 +263,32 @@ func (a *helloAssembler) add(frames []cryptoFrame) (clientHello, bool, error) {
 	if n > maxPacketFrames {
 		return clientHello{}, false, errNotTLS
 	}
-	// The pieces of this packet's frames that nothing held covers, each
-	// checked against what is held and against the packet's earlier ones.
-	var added []cryptoFrame
+	// The parts of this packet's frames that nothing held covers, each
+	// checked against what is held; then against one another, in order of
+	// offset, the overlaps among them dropped.
+	var parts []cryptoFrame
 	for _, f := range frames {
 		if len(f.data) == 0 {
 			continue
 		}
-		pieces, ok := gaps(a.frames, f, nil)
-		if !ok {
+		var ok bool
+		if parts, ok = gaps(a.frames, f, parts); !ok || len(a.frames)+len(parts) > 2*maxHelloFrames {
 			return clientHello{}, false, errNotTLS
 		}
-		for _, p := range pieces {
-			if added, ok = gaps(added, p, added); !ok || len(a.frames)+len(added) > maxHelloFrames {
-				return clientHello{}, false, errNotTLS
-			}
+	}
+	// In order of offset a part goes past the end of those before it or
+	// adds nothing: a hole among them ends before its offset. What it
+	// overlaps must agree.
+	slices.SortFunc(parts, func(x, y cryptoFrame) int { return cmp.Compare(x.offset, y.offset) })
+	added := make([]cryptoFrame, 0, len(parts))
+	for _, p := range parts {
+		var ok bool
+		if added, ok = gaps(added, p, added); !ok {
+			return clientHello{}, false, errNotTLS
 		}
+	}
+	if len(a.frames)+len(added) > maxHelloFrames {
+		return clientHello{}, false, errNotTLS
 	}
 	if len(added) > 0 {
 		total := 0
@@ -317,17 +329,16 @@ func (a *helloAssembler) add(frames []cryptoFrame) (clientHello, bool, error) {
 // gaps checks frame f against held, pieces sorted by offset that do not
 // overlap: where they overlap the bytes must agree (false if not). It
 // appends to out the parts of f that held does not cover, in order, and
-// returns it; with out == held, those parts go into held, kept sorted.
+// returns it.
 func gaps(held []cryptoFrame, f cryptoFrame, out []cryptoFrame) ([]cryptoFrame, bool) {
 	end := f.offset + uint64(len(f.data))
 	i := sort.Search(len(held), func(i int) bool { return held[i].offset+uint64(len(held[i].data)) > f.offset })
-	var parts []cryptoFrame
 	pos := f.offset
 	for ; i < len(held) && held[i].offset < end; i++ {
 		h := held[i]
 		hEnd := h.offset + uint64(len(h.data))
 		if h.offset > pos {
-			parts = append(parts, cryptoFrame{offset: pos, data: f.data[pos-f.offset : h.offset-f.offset]})
+			out = append(out, cryptoFrame{offset: pos, data: f.data[pos-f.offset : h.offset-f.offset]})
 		}
 		lo, hi := max(h.offset, f.offset), min(hEnd, end)
 		if !bytes.Equal(f.data[lo-f.offset:hi-f.offset], h.data[lo-h.offset:hi-h.offset]) {
@@ -336,15 +347,9 @@ func gaps(held []cryptoFrame, f cryptoFrame, out []cryptoFrame) ([]cryptoFrame, 
 		pos = max(pos, hEnd)
 	}
 	if pos < end {
-		parts = append(parts, cryptoFrame{offset: pos, data: f.data[pos-f.offset:]})
+		out = append(out, cryptoFrame{offset: pos, data: f.data[pos-f.offset:]})
 	}
-	if len(parts) == 0 {
-		return out, true
-	}
-	if out == nil {
-		return parts, true
-	}
-	return mergePieces(out, parts), true
+	return out, true
 }
 
 // mergePieces merges two lists of pieces sorted by offset that do not

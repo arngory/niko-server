@@ -6,7 +6,7 @@ import (
 
 // rawHello is a real ClientHello as quic-go sends it, the TLS message
 // whole (type, length, body), from its first flight's CRYPTO frames.
-func rawHello(t *testing.T) []byte {
+func rawHello(t testing.TB) []byte {
 	t.Helper()
 	var a helloAssembler
 	for _, d := range firstFlights(t, "n.example.com", 1)[0] {
@@ -80,6 +80,15 @@ func TestHelloAssembler(t *testing.T) {
 			}
 			return
 		}()}, false},
+		// In order of offset a frame may sit inside one before the last
+		// piece: [0,10), [5,20) leaves [10,20) last, and [7,9) is in the
+		// first.
+		{"a frame inside an earlier piece of the packet", []packet{{frame(raw, 0, 10), frame(raw, 5, 20), frame(raw, 7, 9), frame(raw, 20, n)}}, true},
+		{"disagreeing inside an earlier piece of the packet", []packet{{frame(raw, 0, 10), frame(raw, 5, 20), func() cryptoFrame {
+			f := frame(raw, 7, 9)
+			f.data[0] ^= 1
+			return f
+		}(), frame(raw, 20, n)}}, false},
 		// Empty frames do not count against maxPacketFrames.
 		{"32 frames and empty ones in a packet", []packet{func() (p packet) {
 			for i := range maxPacketFrames - 1 {
@@ -135,5 +144,48 @@ func TestHelloAssembler(t *testing.T) {
 	}
 	if err == nil || len(b.frames) != maxHelloFrames {
 		t.Fatalf("%d frames held, err %v", len(b.frames), err)
+	}
+	// A packet whose frames, against what is held, make more than
+	// 2*maxHelloFrames parts is refused before they are sorted: 100 pieces
+	// held, and 5 frames over all of them, 101 parts each.
+	var c helloAssembler
+	for i := 0; i < 100; i += maxPacketFrames {
+		var p []cryptoFrame
+		for j := i; j < min(i+maxPacketFrames, 100); j++ {
+			p = append(p, frame(raw, 2*j+1, 2*j+2))
+		}
+		if _, _, err := c.add(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var over []cryptoFrame
+	for range 5 {
+		over = append(over, frame(raw, 0, 201))
+	}
+	if _, _, err := c.add(over); err == nil {
+		t.Fatal("a packet of 505 parts was taken")
+	}
+}
+
+// BenchmarkHelloAssemblerWorst: held pieces at every other byte, then a
+// packet of 32 frames each over 4 of them (review 4: 158 us, 353
+// allocations with a merge per part).
+func BenchmarkHelloAssemblerWorst(b *testing.B) {
+	raw := rawHello(b)
+	for b.Loop() {
+		var a helloAssembler
+		for i := range 4 {
+			var p []cryptoFrame
+			for j := range maxPacketFrames {
+				k := 2 * (i*maxPacketFrames + j)
+				p = append(p, cryptoFrame{offset: uint64(k), data: raw[k : k+1]})
+			}
+			a.add(p)
+		}
+		var p []cryptoFrame
+		for j := range maxPacketFrames {
+			p = append(p, cryptoFrame{offset: uint64(8 * j), data: raw[8*j : 8*j+8]})
+		}
+		a.add(p)
 	}
 }

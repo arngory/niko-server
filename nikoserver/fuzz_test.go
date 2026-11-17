@@ -147,8 +147,8 @@ func FuzzQUICInitial(f *testing.F) {
 			held := 0
 			for i, f := range a.frames {
 				held += len(f.data)
-				if i > 0 && a.frames[i-1].offset > f.offset {
-					t.Fatal("frames out of order")
+				if i > 0 && a.frames[i-1].offset+uint64(len(a.frames[i-1].data)) > f.offset {
+					t.Fatal("pieces out of order or overlapping")
 				}
 			}
 			if held != a.size {

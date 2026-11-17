@@ -22,7 +22,7 @@ import (
 // firstFlights dials n QUIC connections to name and returns each one's
 // first flight: the Initials whose CRYPTO frames make up its ClientHello,
 // in the order the client sent them (no retransmissions).
-func firstFlights(t *testing.T, name string, n int) [][][]byte {
+func firstFlights(t testing.TB, name string, n int) [][][]byte {
 	t.Helper()
 	ln, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
