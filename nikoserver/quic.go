@@ -7,6 +7,8 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"slices"
+	"sort"
 
 	"github.com/sagernet/sing-quic/hysteria2"
 	"golang.org/x/crypto/blake2b"
@@ -216,13 +218,21 @@ func cryptoFrames(payload []byte) ([]cryptoFrame, error) {
 }
 
 // helloAssembler puts CRYPTO frames back in order until they hold a
-// whole ClientHello.
+// whole ClientHello. It keeps the frames as they came, sorted by offset,
+// not a buffer up to the highest offset: what it holds is what was sent
+// (a frame of one byte at offset 16383 holds one byte, not 16 KB), and
+// that is what the front counts against its budget of pending hellos.
 type helloAssembler struct {
-	buf    []byte
-	filled []bool
+	frames []cryptoFrame // copies, by offset
+	size   int           // their bytes
 }
 
-const maxQUICHello = 16 << 10
+const (
+	maxQUICHello = 16 << 10
+	// maxHelloFrames: Chromium splits its ClientHello into a few CRYPTO
+	// frames a packet (chaos protection), not hundreds.
+	maxHelloFrames = 256
+)
 
 // add takes frames and returns the ClientHello once it is complete.
 func (a *helloAssembler) add(frames []cryptoFrame) (clientHello, bool, error) {
@@ -231,34 +241,60 @@ func (a *helloAssembler) add(frames []cryptoFrame) (clientHello, bool, error) {
 		if end > maxQUICHello {
 			return clientHello{}, false, errNotTLS
 		}
-		if int(end) > len(a.buf) {
-			a.buf = append(a.buf, make([]byte, int(end)-len(a.buf))...)
-			a.filled = append(a.filled, make([]bool, int(end)-len(a.filled))...)
+		if len(f.data) == 0 {
+			continue
 		}
-		copy(a.buf[f.offset:], f.data)
-		for i := f.offset; i < end; i++ {
-			a.filled[i] = true
+		if len(a.frames) >= maxHelloFrames {
+			return clientHello{}, false, errNotTLS
 		}
+		c := cryptoFrame{offset: f.offset, data: append([]byte(nil), f.data...)}
+		i := sort.Search(len(a.frames), func(i int) bool { return a.frames[i].offset > c.offset })
+		a.frames = slices.Insert(a.frames, i, c)
+		a.size += len(c.data)
 	}
-	have := 0
-	for have < len(a.filled) && a.filled[have] {
-		have++
-	}
+	have := a.prefix()
 	if have < 4 {
 		return clientHello{}, false, nil
 	}
-	if a.buf[0] != 1 {
+	var head [4]byte
+	a.fill(head[:])
+	if head[0] != 1 {
 		return clientHello{}, false, errNotTLS
 	}
-	size := int(a.buf[1])<<16 | int(a.buf[2])<<8 | int(a.buf[3])
+	size := int(head[1])<<16 | int(head[2])<<8 | int(head[3])
 	if 4+size > maxQUICHello {
 		return clientHello{}, false, errNotTLS
 	}
 	if have < 4+size {
 		return clientHello{}, false, nil
 	}
-	h, err := parseClientHello(a.buf[4 : 4+size])
+	buf := make([]byte, 4+size)
+	a.fill(buf)
+	h, err := parseClientHello(buf[4:])
 	return h, err == nil, err
+}
+
+// prefix is how many bytes from offset 0 the frames hold without a gap.
+func (a *helloAssembler) prefix() int {
+	var have uint64
+	for _, f := range a.frames {
+		if f.offset > have {
+			break
+		}
+		have = max(have, f.offset+uint64(len(f.data)))
+	}
+	return int(have)
+}
+
+// fill copies the frames into dst from offset 0, as far as dst goes; of
+// frames that overlap, the one at the higher offset is the one kept.
+func (a *helloAssembler) fill(dst []byte) {
+	for _, f := range a.frames {
+		if f.offset >= uint64(len(dst)) {
+			break
+		}
+		copy(dst[f.offset:], f.data)
+	}
 }
 
 // salamanderOpen removes Hysteria2's salamander obfuscation: 8 bytes of

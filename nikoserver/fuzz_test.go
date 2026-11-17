@@ -137,8 +137,15 @@ func FuzzQUICInitial(f *testing.F) {
 		if frames, err := cryptoFrames(d); err == nil {
 			var a helloAssembler
 			a.add(frames)
-			if len(a.buf) > maxQUICHello {
-				t.Fatalf("assembler grew to %d", len(a.buf))
+			if a.size > maxQUICHello*maxHelloFrames || len(a.frames) > maxHelloFrames {
+				t.Fatalf("assembler holds %d bytes in %d frames", a.size, len(a.frames))
+			}
+			held := 0
+			for _, f := range a.frames {
+				held += len(f.data)
+			}
+			if held != a.size {
+				t.Fatalf("assembler counts %d bytes, holds %d", a.size, held)
 			}
 		}
 	})

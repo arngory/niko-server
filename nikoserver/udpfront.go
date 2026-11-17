@@ -4,6 +4,7 @@ package nikoserver
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"errors"
 	"net"
@@ -46,8 +47,10 @@ type udpFront struct {
 	flows   map[flowKey]*udpFlow
 	pending map[flowKey]*pendingFlow
 	// pendingBytes: what the pending ClientHellos hold, packets and
-	// assemblers, all flows together (maxPendingBytes).
+	// assemblers, all flows together (maxPendingBytes); pendingOrder: the
+	// pending flows' keys, oldest first.
 	pendingBytes int
+	pendingOrder list.List
 	// cidSources bound the flows pinned by a label per source.
 	cidSources sourceLimits
 }
@@ -78,13 +81,14 @@ type udpFlow struct {
 type pendingFlow struct {
 	created time.Time
 	hellos  map[string]*pendingHello
-	seq     uint64 // the last hello's; the oldest has the least
+	seq     uint64        // the last hello's; the oldest has the least
+	elem    *list.Element // in udpFront.pendingOrder
 }
 
 type pendingHello struct {
 	asm     helloAssembler
 	packets [][]byte
-	bytes   int // its packets' and its assembler's, in pendingBytes
+	bytes   int // what it holds, overheads included, in pendingBytes
 	seq     uint64
 }
 
@@ -102,17 +106,27 @@ func (pf *pendingFlow) oldest() string {
 }
 
 const (
-	maxPendingFlows   = 4096
-	maxPendingPackets = 16
-	maxPendingIDs     = 4
-	pendingFor        = 3 * time.Second
-	// maxPendingBytes bounds what all pending ClientHellos hold together:
-	// each up to 16 packets and an assembler of up to 2 x maxQUICHello,
-	// 4 per flow and 4096 flows would be some 0.9 GB of Initials anyone can
-	// make (their keys come from the packet). 16 MiB holds some 3000 first
-	// flights of 2 packets at once, within pendingFor.
+	maxPendingFlows = 4096
+	// minInitialDatagram: RFC 9000 §14.1.
+	minInitialDatagram = 1200
+	maxPendingPackets  = 16
+	maxPendingIDs      = 4
+	pendingFor         = 3 * time.Second
+	// maxPendingBytes bounds what all pending ClientHellos hold together,
+	// datagrams (up to 64 KB, kept whole), CRYPTO data and the overheads
+	// below: 16 packets of 4 hellos of 4096 flows would be gigabytes of
+	// Initials anyone can make (their keys come from the packet). Past it,
+	// and past maxPendingFlows, the oldest flows go, not the newcomer: a
+	// flood must refill it within a real client's gap between two packets
+	// of its first flight, which are sent together. 16 MiB holds some
+	// 5000 first flights of two 1250-byte packets.
 	maxPendingBytes = 16 << 20
-	maxUDPFlows     = 1 << 18
+	// Overheads counted with what a hello holds: the hello, a packet, a
+	// CRYPTO frame (structs, slice headers, the map entry).
+	pendingHelloCost  = 256
+	pendingPacketCost = 48
+	pendingFrameCost  = 48
+	maxUDPFlows       = 1 << 18
 	// cidFlowRate and cidFlowBurst bound the flows a source (an IPv4
 	// address, an IPv6 /64) pins by a label: a client whose address
 	// changes pins one per connection, a CGNAT address a few for all its
@@ -311,6 +325,12 @@ func (f *udpFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 // datagrams to send (an Initial split over several returns them all).
 func (f *udpFront) classify(key flowKey, d []byte, now time.Time) (*backendLink, [][]byte) {
 	if len(f.byName) > 0 && isQUICInitial(d) {
+		// A client's Initial comes in a datagram of 1200 bytes or more
+		// (RFC 9000 §14.1: a server discards a smaller one); so what a
+		// pending ClientHello holds costs its sender as much on the wire.
+		if len(d) < minInitialDatagram {
+			return nil, nil
+		}
 		if p, err := parseQUICInitial(d); err == nil {
 			return f.pendingHello(key, p, d, now)
 		}
@@ -398,16 +418,57 @@ func (f *udpFront) pendingHello(key flowKey, p quicInitial, d []byte, now time.T
 	f.access.Lock()
 	defer f.access.Unlock()
 	pf := f.pending[key]
-	if pf == nil {
-		if len(f.pending) >= maxPendingFlows {
-			return nil, nil
-		}
-		pf = &pendingFlow{created: now, hellos: map[string]*pendingHello{}}
-		f.pending[key] = pf
+	if pf != nil && now.Sub(pf.created) > pendingFor {
+		f.dropPending(key) // its window is over, the sweep or not
+		pf = nil
 	}
 	id := string(p.dcid)
-	ph := pf.hellos[id]
-	if ph == nil {
+	var ph *pendingHello
+	if pf != nil {
+		ph = pf.hellos[id]
+	}
+	fresh := ph == nil
+	if fresh {
+		ph = &pendingHello{}
+	}
+	drop := func() (*backendLink, [][]byte) {
+		if !fresh {
+			f.dropHello(pf, id)
+			f.dropIfEmpty(key, pf)
+		}
+		return nil, nil
+	}
+	if len(ph.packets) >= maxPendingPackets {
+		return drop()
+	}
+	hello, done, err := ph.asm.add(p.crypto)
+	if err != nil {
+		return drop()
+	}
+	ph.packets = append(ph.packets, append([]byte(nil), d...))
+	if done {
+		packets := ph.packets
+		link := f.byName[hello.serverName]
+		if link == nil || hello.serverName == "" {
+			// A name not routed here: dropped, the flow stays free. A
+			// whole ClientHello in one packet leaves nothing behind.
+			return drop()
+		}
+		if pf != nil {
+			f.dropPending(key)
+		}
+		return link, packets
+	}
+	// Not complete yet: it waits, and only now takes a place.
+	if pf == nil {
+		if len(f.pending) >= maxPendingFlows {
+			f.dropPending(f.pendingOrder.Front().Value.(flowKey))
+		}
+		pf = &pendingFlow{created: now, hellos: map[string]*pendingHello{}}
+		pf.elem = f.pendingOrder.PushBack(key)
+		f.pending[key] = pf
+	}
+	if fresh {
 		if len(pf.hellos) >= maxPendingIDs {
 			// The oldest goes, not the newcomer: fakes sent before a
 			// client's first flight on its 4-tuple (udp_desync) may each
@@ -416,38 +477,31 @@ func (f *udpFront) pendingHello(key flowKey, p quicInitial, d []byte, now time.T
 			f.dropHello(pf, pf.oldest())
 		}
 		pf.seq++
-		ph = &pendingHello{seq: pf.seq}
+		ph.seq = pf.seq
 		pf.hellos[id] = ph
 	}
-	if len(ph.packets) >= maxPendingPackets {
-		f.dropHello(pf, id)
-		return nil, nil
-	}
-	ph.packets = append(ph.packets, append([]byte(nil), d...))
-	hello, done, err := ph.asm.add(p.crypto)
 	f.account(ph)
-	if err != nil || (!done && f.pendingBytes > maxPendingBytes) {
+	// Past the budget, the oldest flows go, this one last.
+	for e := f.pendingOrder.Front(); e != nil && f.pendingBytes > maxPendingBytes; {
+		next := e.Next()
+		if k := e.Value.(flowKey); k != key {
+			f.dropPending(k)
+		}
+		e = next
+	}
+	if f.pendingBytes > maxPendingBytes {
+		// Not reached (a flow holds a few MB at most), but this one goes too.
 		f.dropHello(pf, id)
-		return nil, nil
+		f.dropIfEmpty(key, pf)
 	}
-	if !done {
-		return nil, nil
-	}
-	packets := ph.packets
-	f.dropHello(pf, id)
-	link := f.byName[hello.serverName]
-	if link == nil || hello.serverName == "" {
-		return nil, nil // a name not routed here: dropped, the flow stays free
-	}
-	f.dropPending(key)
-	return link, packets
+	return nil, nil
 }
 
 // account brings pendingBytes up to what ph holds now. With f.access.
 func (f *udpFront) account(ph *pendingHello) {
-	n := len(ph.asm.buf) + len(ph.asm.filled)
+	n := pendingHelloCost + ph.asm.size + len(ph.asm.frames)*pendingFrameCost
 	for _, d := range ph.packets {
-		n += len(d)
+		n += len(d) + pendingPacketCost
 	}
 	f.pendingBytes += n - ph.bytes
 	ph.bytes = n
@@ -461,6 +515,14 @@ func (f *udpFront) dropHello(pf *pendingFlow, id string) {
 	}
 }
 
+// dropIfEmpty forgets a flow none of whose ClientHellos waits any more.
+// With f.access.
+func (f *udpFront) dropIfEmpty(key flowKey, pf *pendingFlow) {
+	if len(pf.hellos) == 0 {
+		f.dropPending(key)
+	}
+}
+
 // dropPending forgets a flow's pending ClientHellos. With f.access.
 func (f *udpFront) dropPending(key flowKey) {
 	pf := f.pending[key]
@@ -470,6 +532,7 @@ func (f *udpFront) dropPending(key flowKey) {
 	for id := range pf.hellos {
 		f.dropHello(pf, id)
 	}
+	f.pendingOrder.Remove(pf.elem)
 	delete(f.pending, key)
 }
 
