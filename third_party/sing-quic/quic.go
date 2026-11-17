@@ -29,7 +29,7 @@ type QUICOptions struct {
 	// connection is at rest. A KeepAlivePeriod of 0 leaves the protocol's
 	// default (Hysteria's 10 s); this turns it off. The peer's keepalives
 	// go on, and the idle timeout still ends a connection nobody keeps
-	// alive.
+	// alive. niko-server's tests use it for a client that falls silent.
 	DisableKeepAlive bool
 }
 

@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sagernet/quic-go"
 	sbtls "github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/option"
 	qtls "github.com/sagernet/sing-quic"
@@ -27,40 +28,81 @@ import (
 	N "github.com/sagernet/sing/common/network"
 )
 
-// readLog records when each datagram from the server arrives.
-type readLog struct {
-	net.Conn
-	mu    sync.Mutex
-	times []time.Time
+// TestHysteriaQUICOptions: the server's keepalive is idle/2, 30 s, not
+// sing-quic's 10 s, with or without salamander; DisableKeepAlive, which
+// the silent client below uses, wins over a period.
+func TestHysteriaQUICOptions(t *testing.T) {
+	for _, salamander := range []bool{false, true} {
+		o := hysteriaQUICOptions(salamander)
+		c := &quic.Config{KeepAlivePeriod: 10 * time.Second, MaxIdleTimeout: 30 * time.Second} // sing-quic's defaults
+		qtls.ApplyQUICOptions(c, o)
+		if c.KeepAlivePeriod != 30*time.Second || c.MaxIdleTimeout != 60*time.Second {
+			t.Fatalf("salamander %v: keepalive %v, idle %v", salamander, c.KeepAlivePeriod, c.MaxIdleTimeout)
+		}
+		if salamander != (o.InitialPacketSize == 1280-8) {
+			t.Fatalf("salamander %v: first packet %d", salamander, o.InitialPacketSize)
+		}
+	}
+	c := &quic.Config{KeepAlivePeriod: 10 * time.Second}
+	qtls.ApplyQUICOptions(c, qtls.QUICOptions{KeepAlivePeriod: 25 * time.Second, DisableKeepAlive: true})
+	if c.KeepAlivePeriod != 0 {
+		t.Fatalf("DisableKeepAlive: %v", c.KeepAlivePeriod)
+	}
 }
 
-func (c *readLog) Read(b []byte) (int, error) {
+// wireLog records each datagram a Hysteria2 client sends and gets.
+type wireLog struct {
+	net.Conn
+	mu     sync.Mutex
+	events []wireEvent
+}
+
+type wireEvent struct {
+	at   time.Time
+	sent bool // by the client; else from the server
+}
+
+func (c *wireLog) note(sent bool) {
+	c.mu.Lock()
+	c.events = append(c.events, wireEvent{time.Now(), sent})
+	c.mu.Unlock()
+}
+
+func (c *wireLog) Read(b []byte) (int, error) {
 	n, err := c.Conn.Read(b)
 	if n > 0 {
-		c.mu.Lock()
-		c.times = append(c.times, time.Now())
-		c.mu.Unlock()
+		c.note(false)
 	}
 	return n, err
 }
 
-func (c *readLog) since(t time.Time) int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	n := 0
-	for _, at := range c.times {
-		if at.After(t) {
-			n++
-		}
+func (c *wireLog) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	if n > 0 {
+		c.note(true)
 	}
-	return n
+	return n, err
 }
 
-// loggingDialer hands the Hysteria2 client a socket whose reads are logged.
+func (c *wireLog) since(t time.Time) []wireEvent {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []wireEvent
+	for _, e := range c.events {
+		if e.at.After(t) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// loggingDialer hands the Hysteria2 client a socket whose datagrams are
+// logged.
 type loggingDialer struct {
 	N.Dialer
-	mu   sync.Mutex
-	conn *readLog
+	mu    sync.Mutex
+	conn  *wireLog
+	dials int
 }
 
 func (d *loggingDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
@@ -68,23 +110,34 @@ func (d *loggingDialer) DialContext(ctx context.Context, network string, destina
 	if err != nil {
 		return nil, err
 	}
-	l := &readLog{Conn: c}
+	l := &wireLog{Conn: c}
 	d.mu.Lock()
-	d.conn = l
+	d.conn, d.dials = l, d.dials+1
 	d.mu.Unlock()
 	return l, nil
 }
 
-// TestNekoServerHysteriaQuietIdle: a Hysteria2 connection at rest gets
-// nothing from the server; its keepalives are the client's (client #148).
-// The server's own PING every 10 s (sing-quic's default) woke a phone's
-// radio 360 times an hour and kept no NAT binding of the phone's open
-// (RFC 4787: outbound packets refresh it). The client here asks for 25 s,
-// as Niko does: over 12 s of rest the server must send nothing, where
-// before it pinged at 10 s.
-func TestNekoServerHysteriaQuietIdle(t *testing.T) {
+func (d *loggingDialer) state() (*wireLog, int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.conn, d.dials
+}
+
+// TestNekoServerHysteriaKeepAlive (client #148): the server pings only a
+// client that has fallen silent, and then every 30 s.
+//
+// The server pinged every 10 s (sing-quic's default): its PING, answered at
+// once, reset a client's 25 s timer before it ran out, so a phone at rest
+// woke 360 times an hour. Now a client asking for 25 s, as Niko does, gets
+// nothing from the server it did not ask for: over 32 s at rest every
+// datagram from the server follows one of the client's (its keepalive near
+// 25 s, the server's ACK). A client with no keepalive of its own (a phone
+// whose CPU sleeps stops its Go timers) gets the server's PING near 30 s
+// and nothing before: its answer keeps the connection and the NAT binding.
+// Both connections then carry a request, with no new handshake.
+func TestNekoServerHysteriaKeepAlive(t *testing.T) {
 	if testing.Short() {
-		t.Skip("12 s of rest")
+		t.Skip("32 s at rest")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -132,20 +185,21 @@ func TestNekoServerHysteriaQuietIdle(t *testing.T) {
 
 	page := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, "through hysteria") }))
 	defer page.Close()
-	tlsConfig, err := sbtls.NewClient(ctx, nopLogger(), "h.example.com", option.OutboundTLSOptions{Enabled: true, ServerName: "h.example.com",
-		Insecure: true, ALPN: []string{"h3"}, CurvePreferences: []option.CurvePreference{option.CurvePreference(tls.X25519MLKEM768)}})
-	if err != nil {
-		t.Fatal(err)
+	newClient := func(o qtls.QUICOptions) (*hysteria2.Client, *loggingDialer) {
+		tlsConfig, err := sbtls.NewClient(ctx, nopLogger(), "h.example.com", option.OutboundTLSOptions{Enabled: true, ServerName: "h.example.com",
+			Insecure: true, ALPN: []string{"h3"}, CurvePreferences: []option.CurvePreference{option.CurvePreference(tls.X25519MLKEM768)}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		d := &loggingDialer{Dialer: N.SystemDialer}
+		client, err := hysteria2.NewClient(hysteria2.ClientOptions{Context: ctx, Dialer: d, Logger: nopLogger(),
+			ServerAddress: server, Password: "password-one", TLSConfig: tlsConfig, QUICOptions: o})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return client, d
 	}
-	dialer := &loggingDialer{Dialer: N.SystemDialer}
-	client, err := hysteria2.NewClient(hysteria2.ClientOptions{Context: ctx, Dialer: dialer, Logger: nopLogger(),
-		ServerAddress: server, Password: "password-one", TLSConfig: tlsConfig,
-		QUICOptions: qtls.QUICOptions{KeepAlivePeriod: 25 * time.Second, IdleTimeout: 60 * time.Second}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.CloseWithError(nil)
-	get := func() {
+	get := func(client *hysteria2.Client) {
 		t.Helper()
 		dctx, dcancel := context.WithTimeout(ctx, 5*time.Second)
 		defer dcancel()
@@ -164,33 +218,70 @@ func TestNekoServerHysteriaQuietIdle(t *testing.T) {
 			t.Fatalf("body %q", body)
 		}
 	}
-	get()
+	// a: Niko's settings. b: no keepalive at all.
+	a, ad := newClient(qtls.QUICOptions{KeepAlivePeriod: 25 * time.Second, IdleTimeout: 60 * time.Second})
+	defer a.CloseWithError(nil)
+	b, bd := newClient(qtls.QUICOptions{DisableKeepAlive: true, IdleTimeout: 60 * time.Second})
+	defer b.CloseWithError(nil)
+	get(a)
+	get(b)
 
-	// The stream's last frames and their ACKs settle, then the connection
-	// rests: the client sends nothing before its 25 s, so the server's
-	// keepalive, if it had one, would be the only datagram.
+	// The streams' last frames and their ACKs settle; then both rest.
 	time.Sleep(time.Second)
-	dialer.mu.Lock()
-	logged := dialer.conn
-	dialer.mu.Unlock()
-	if logged == nil {
-		t.Fatal("the client dialed no socket")
-	}
 	rest := time.Now()
-	time.Sleep(12 * time.Second)
-	if n := logged.since(rest); n != 0 {
-		t.Fatalf("the server sent %d datagrams to a connection at rest (its own keepalive)", n)
+	time.Sleep(32 * time.Second)
+
+	describe := func(evs []wireEvent) string {
+		s := ""
+		for _, e := range evs {
+			who := "server"
+			if e.sent {
+				who = "client"
+			}
+			s += fmt.Sprintf(" %s@%.2fs", who, e.at.Sub(rest).Seconds())
+		}
+		return s
 	}
-	// The connection is alive at both ends: the client's next request goes
-	// through on it, with no new handshake.
-	get()
-	if n := logged.since(rest); n == 0 {
-		t.Fatal("no answer after the rest")
+	aLog, _ := ad.state()
+	bLog, _ := bd.state()
+	// a: each datagram from the server answers one of the client's sent
+	// within the second before; the client's own keepalive is there.
+	evs := aLog.since(rest)
+	var lastSent time.Time
+	pinged := false
+	for _, e := range evs {
+		if e.sent {
+			lastSent, pinged = e.at, true
+			continue
+		}
+		if lastSent.IsZero() || e.at.Sub(lastSent) > time.Second {
+			t.Fatalf("a client asking for 25 s got a datagram the server sent on its own:%s", describe(evs))
+		}
 	}
-	dialer.mu.Lock()
-	again := dialer.conn
-	dialer.mu.Unlock()
-	if again != logged {
-		t.Fatal("the client dialed again after the rest")
+	if !pinged {
+		t.Fatalf("a client asking for 25 s sent no keepalive in 32 s:%s", describe(evs))
+	}
+	// b: the server's PING near 30 s after the last exchange, nothing
+	// before it.
+	evs = bLog.since(rest)
+	first := time.Duration(-1)
+	for _, e := range evs {
+		if !e.sent {
+			first = e.at.Sub(rest)
+			break
+		}
+	}
+	if first < 27*time.Second {
+		t.Fatalf("a silent client: the server's first datagram at rest at %v, want near 29 s:%s", first, describe(evs))
+	}
+
+	// Both connections carry a request, on the same socket.
+	get(a)
+	get(b)
+	if _, n := ad.state(); n != 1 {
+		t.Fatalf("a dialed %d times", n)
+	}
+	if _, n := bd.state(); n != 1 {
+		t.Fatalf("b dialed %d times", n)
 	}
 }
