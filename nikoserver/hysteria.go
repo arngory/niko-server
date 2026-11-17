@@ -152,11 +152,19 @@ func runHysteriaWith(ctx context.Context, c *BackendConfig, conn *packetConn, lo
 	// come on top of quic-go's first packets of 1280, so they start 8 bytes
 	// smaller and leave the front at 1280 like every other QUIC on it. Path
 	// MTU discovery then counts only what came through, the salt included.
-	// 60 s idle rather than Hysteria's 30: quic-go pings at min(the
-	// client's keepalive, idle/2), so a client asking for 25 s (Niko 1.28)
-	// gets 25 s and not 15, which saves its battery. A dead connection
+	// 60 s idle rather than Hysteria's 30: a side pings at min(its own
+	// keepalive, idle/2) after the last packet it got, so a client asking
+	// for 25 s (Niko 1.28) can keep 25 s and not 15. A dead connection
 	// without keepalives is closed 30 s later than before.
-	quicOptions := qtls.QUICOptions{IdleTimeout: hysteriaIdle, MaxConcurrentStreams: hy2MaxStreams}
+	// No keepalive of the server's own (client #148): sing-quic's 10 s
+	// PING, answered at once, reset the client's timer before it ran out,
+	// so a phone at rest woke every 10 s (360 times an hour, not 144), and
+	// a packet from the server does not keep the phone's NAT binding open
+	// (RFC 4787: outbound packets refresh it). Clients keep their
+	// connections alive themselves; one that does not is closed after
+	// hysteriaIdle at rest and dials again when it sends. raycontrol's own
+	// QUIC servers (naive, DoH3) ping no more than this.
+	quicOptions := qtls.QUICOptions{IdleTimeout: hysteriaIdle, MaxConcurrentStreams: hy2MaxStreams, DisableKeepAlive: true}
 	if salamander != "" {
 		quicOptions.InitialPacketSize = 1280 - 8
 	}
