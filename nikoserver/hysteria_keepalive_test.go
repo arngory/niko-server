@@ -28,15 +28,15 @@ import (
 	N "github.com/sagernet/sing/common/network"
 )
 
-// TestHysteriaQUICOptions: the server's keepalive is idle/2, 30 s, not
-// sing-quic's 10 s, with or without salamander; DisableKeepAlive, which
-// the silent client below uses, wins over a period.
+// TestHysteriaQUICOptions: the server's keepalive is 28 s, not sing-quic's
+// 10 s, with or without salamander; DisableKeepAlive, which the silent
+// client below uses, wins over a period.
 func TestHysteriaQUICOptions(t *testing.T) {
 	for _, salamander := range []bool{false, true} {
 		o := hysteriaQUICOptions(salamander)
 		c := &quic.Config{KeepAlivePeriod: 10 * time.Second, MaxIdleTimeout: 30 * time.Second} // sing-quic's defaults
 		qtls.ApplyQUICOptions(c, o)
-		if c.KeepAlivePeriod != 30*time.Second || c.MaxIdleTimeout != 60*time.Second {
+		if c.KeepAlivePeriod != 28*time.Second || c.MaxIdleTimeout != 60*time.Second {
 			t.Fatalf("salamander %v: keepalive %v, idle %v", salamander, c.KeepAlivePeriod, c.MaxIdleTimeout)
 		}
 		if salamander != (o.InitialPacketSize == 1280-8) {
@@ -124,7 +124,7 @@ func (d *loggingDialer) state() (*wireLog, int) {
 }
 
 // TestNekoServerHysteriaKeepAlive (client #148): the server pings only a
-// client that has fallen silent, and then every 30 s.
+// client that has fallen silent, and then every 28 s.
 //
 // The server pinged every 10 s (sing-quic's default): its PING, answered at
 // once, reset a client's 25 s timer before it ran out, so a phone at rest
@@ -132,7 +132,7 @@ func (d *loggingDialer) state() (*wireLog, int) {
 // nothing from the server it did not ask for: over 32 s at rest every
 // datagram from the server follows one of the client's (its keepalive near
 // 25 s, the server's ACK). A client with no keepalive of its own (a phone
-// whose CPU sleeps stops its Go timers) gets the server's PING near 30 s
+// whose CPU sleeps stops its Go timers) gets the server's PING near 28 s
 // and nothing before: its answer keeps the connection and the NAT binding.
 // Both connections then carry a request, with no new handshake.
 func TestNekoServerHysteriaKeepAlive(t *testing.T) {
@@ -261,8 +261,8 @@ func TestNekoServerHysteriaKeepAlive(t *testing.T) {
 	if !pinged {
 		t.Fatalf("a client asking for 25 s sent no keepalive in 32 s:%s", describe(evs))
 	}
-	// b: the server's PING near 30 s after the last exchange, nothing
-	// before it.
+	// b: the server's PING near 28 s after the last exchange (27 s after
+	// the rest began), nothing before it.
 	evs = bLog.since(rest)
 	first := time.Duration(-1)
 	for _, e := range evs {
@@ -271,8 +271,8 @@ func TestNekoServerHysteriaKeepAlive(t *testing.T) {
 			break
 		}
 	}
-	if first < 27*time.Second {
-		t.Fatalf("a silent client: the server's first datagram at rest at %v, want near 29 s:%s", first, describe(evs))
+	if first < 25*time.Second {
+		t.Fatalf("a silent client: the server's first datagram at rest at %v, want near 27 s:%s", first, describe(evs))
 	}
 
 	// Both connections carry a request, on the same socket.

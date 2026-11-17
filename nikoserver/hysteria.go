@@ -78,9 +78,9 @@ func readHy2Users(path string) ([]string, []string, error) {
 // hysteriaIdle is the Hysteria2 listener's QUIC idle timeout.
 const hysteriaIdle = 60 * time.Second
 
-// hysteriaKeepAlive is the server's own keepalive: idle/2, the longest
-// quic-go uses (client #148).
-const hysteriaKeepAlive = hysteriaIdle / 2
+// hysteriaKeepAlive is the server's own keepalive (client #148): longer
+// than a client's 25 s plus a round trip, shorter than a NAT's 30 s.
+const hysteriaKeepAlive = 28 * time.Second
 
 // hysteriaQUICOptions is the Hysteria2 server's QUIC: its idle timeout,
 // keepalive and streams, and with salamander a first packet 8 bytes
@@ -90,16 +90,21 @@ const hysteriaKeepAlive = hysteriaIdle / 2
 // keepalive, idle/2) after the last packet it got, so a client asking for
 // 25 s (Niko 1.28) can keep 25 s and not 15.
 //
-// The server's keepalive is 30 s, not sing-quic's 10 s. A 10 s PING,
+// The server's keepalive is 28 s, not sing-quic's 10 s. A 10 s PING,
 // answered at once, reset a client's 25 s timer before it ran out: a phone
 // at rest woke every 10 s, 360 times an hour, on the server's account. Now
-// a client that keeps alive more often than 30 s (Niko's 25 s, Hysteria's
-// own 10 s) resets the server's timer first and the server never pings it.
-// A client that falls silent gets a PING every 30 s, and its answer keeps
-// the connection and its NAT binding: a phone asleep, whose Go timers stop
-// with the CPU (CLOCK_MONOTONIC does not count suspend), would otherwise
-// lose the connection after 60 s, and under salamander, with no stateless
-// resets, its next requests would wait out a whole idle timeout.
+// a client that keeps alive every 25 s (Niko) or more often (Hysteria's
+// own 10 s) resets the server's timer first, its round trip and ACK delay
+// under 3 s, and the server never pings it. A client that falls silent
+// gets a PING every 28 s, and its answer keeps the connection and its NAT
+// binding: a phone asleep, whose Go timers stop with the CPU
+// (CLOCK_MONOTONIC does not count suspend; Niko holds no alarm or wakelock
+// for them), would otherwise lose the connection after 60 s, and under
+// salamander, with no stateless resets, its next requests would wait out a
+// whole idle timeout. 28 s and not idle/2: the PING leaves 28 s after the
+// phone's last ACK came and must reach the phone before a NAT binding of
+// 30 s (some mobile networks; RFC 4787 asks for 2 min) refreshed by that ACK
+// ends, which holds for a round trip under 2 s.
 //
 // The front sends with DF set (probeMTU): salamander's 8 bytes of salt
 // come on top of quic-go's first packets of 1280, so they start 8 bytes
