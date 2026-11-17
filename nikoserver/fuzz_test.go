@@ -135,14 +135,21 @@ func FuzzQUICInitial(f *testing.F) {
 		salamanderInitial([]byte("cxNlY3JldC1zYWxhbWFuZGVy"), d)
 		// The CRYPTO frames of a decrypted Initial, and their assembly.
 		if frames, err := cryptoFrames(d); err == nil {
+			// In two packets, as a flight of two comes.
 			var a helloAssembler
-			a.add(frames)
-			if a.size > maxQUICHello*maxHelloFrames || len(a.frames) > maxHelloFrames {
-				t.Fatalf("assembler holds %d bytes in %d frames", a.size, len(a.frames))
+			half := len(frames) / 2
+			if _, _, err := a.add(frames[:half]); err == nil {
+				a.add(frames[half:])
+			}
+			if len(a.frames) > maxHelloFrames {
+				t.Fatalf("assembler holds %d frames", len(a.frames))
 			}
 			held := 0
-			for _, f := range a.frames {
+			for i, f := range a.frames {
 				held += len(f.data)
+				if i > 0 && a.frames[i-1].offset > f.offset {
+					t.Fatal("frames out of order")
+				}
 			}
 			if held != a.size {
 				t.Fatalf("assembler counts %d bytes, holds %d", a.size, held)

@@ -1,6 +1,8 @@
 package nikoserver
 
 import (
+	"bytes"
+	"cmp"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hkdf"
@@ -8,7 +10,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"slices"
-	"sort"
 
 	"github.com/sagernet/sing-quic/hysteria2"
 	"golang.org/x/crypto/blake2b"
@@ -222,35 +223,57 @@ func cryptoFrames(payload []byte) ([]cryptoFrame, error) {
 // not a buffer up to the highest offset: what it holds is what was sent
 // (a frame of one byte at offset 16383 holds one byte, not 16 KB), and
 // that is what the front counts against its budget of pending hellos.
+// Frames that overlap must agree: the backend gets the packets as they
+// came, and the name the front routes by is the one it will read.
 type helloAssembler struct {
-	frames []cryptoFrame // copies, by offset
+	frames []cryptoFrame // copies, by offset; of equal offsets, as they came
 	size   int           // their bytes
 }
 
 const (
 	maxQUICHello = 16 << 10
-	// maxHelloFrames: Chromium splits its ClientHello into a few CRYPTO
-	// frames a packet (chaos protection), not hundreds.
-	maxHelloFrames = 256
+	// maxPacketFrames and maxHelloFrames: Chromium's chaos protection
+	// splits its ClientHello into a few CRYPTO frames a packet (at most 10
+	// added), quic-go into two; a packet of hundreds of one-byte frames is
+	// only work for the front.
+	maxPacketFrames = 32
+	maxHelloFrames  = 256
 )
 
-// add takes frames and returns the ClientHello once it is complete.
+// add takes a packet's frames and returns the ClientHello once it is
+// complete.
 func (a *helloAssembler) add(frames []cryptoFrame) (clientHello, bool, error) {
+	n, total := 0, 0
 	for _, f := range frames {
-		end := f.offset + uint64(len(f.data))
-		if end > maxQUICHello {
+		if f.offset+uint64(len(f.data)) > maxQUICHello {
 			return clientHello{}, false, errNotTLS
 		}
-		if len(f.data) == 0 {
-			continue
+		if len(f.data) > 0 {
+			n++
+			total += len(f.data)
 		}
-		if len(a.frames) >= maxHelloFrames {
-			return clientHello{}, false, errNotTLS
+	}
+	if n > maxPacketFrames || len(a.frames)+n > maxHelloFrames {
+		return clientHello{}, false, errNotTLS
+	}
+	if n > 0 {
+		// One copy of the packet's CRYPTO data, sliced per frame.
+		buf := make([]byte, 0, total)
+		added := make([]cryptoFrame, 0, n)
+		for _, f := range frames {
+			if len(f.data) == 0 {
+				continue
+			}
+			c := cryptoFrame{offset: f.offset, data: buf[len(buf) : len(buf)+len(f.data) : len(buf)+len(f.data)]}
+			buf = append(buf, f.data...)
+			if !a.agrees(c) || !agree(added, c) {
+				return clientHello{}, false, errNotTLS
+			}
+			added = append(added, c)
 		}
-		c := cryptoFrame{offset: f.offset, data: append([]byte(nil), f.data...)}
-		i := sort.Search(len(a.frames), func(i int) bool { return a.frames[i].offset > c.offset })
-		a.frames = slices.Insert(a.frames, i, c)
-		a.size += len(c.data)
+		a.frames = append(a.frames, added...)
+		slices.SortStableFunc(a.frames, func(x, y cryptoFrame) int { return cmp.Compare(x.offset, y.offset) })
+		a.size += total
 	}
 	have := a.prefix()
 	if have < 4 {
@@ -274,6 +297,22 @@ func (a *helloAssembler) add(frames []cryptoFrame) (clientHello, bool, error) {
 	return h, err == nil, err
 }
 
+// agrees reports whether c says the same as every frame held where they
+// overlap.
+func (a *helloAssembler) agrees(c cryptoFrame) bool { return agree(a.frames, c) }
+
+func agree(frames []cryptoFrame, c cryptoFrame) bool {
+	cEnd := c.offset + uint64(len(c.data))
+	for _, f := range frames {
+		fEnd := f.offset + uint64(len(f.data))
+		lo, hi := max(f.offset, c.offset), min(fEnd, cEnd)
+		if lo < hi && !bytes.Equal(f.data[lo-f.offset:hi-f.offset], c.data[lo-c.offset:hi-c.offset]) {
+			return false
+		}
+	}
+	return true
+}
+
 // prefix is how many bytes from offset 0 the frames hold without a gap.
 func (a *helloAssembler) prefix() int {
 	var have uint64
@@ -286,8 +325,8 @@ func (a *helloAssembler) prefix() int {
 	return int(have)
 }
 
-// fill copies the frames into dst from offset 0, as far as dst goes; of
-// frames that overlap, the one at the higher offset is the one kept.
+// fill copies the frames into dst from offset 0, as far as dst goes
+// (frames that overlap agree, add saw to it).
 func (a *helloAssembler) fill(dst []byte) {
 	for _, f := range a.frames {
 		if f.offset >= uint64(len(dst)) {

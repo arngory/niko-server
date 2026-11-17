@@ -6,6 +6,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
@@ -181,7 +182,7 @@ func TestUDPFrontDesync(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			front, want := desyncFront(t)
 			for i, d := range c.prelude {
-				if link, out := front.classify(key, d, now); link != nil || out != nil {
+				if link, out := classifyChecked(t, front, key, d, now); link != nil || out != nil {
 					t.Fatalf("fake %d routed (%v, %d packets)", i, link != nil, len(out))
 				}
 			}
@@ -195,7 +196,7 @@ func TestUDPFrontDesync(t *testing.T) {
 				if p, err := parseQUICInitial(d); err == nil && string(p.dcid) == dcidOf(t, c.flight[0]) {
 					sent = append(sent, d)
 				}
-				link, o := front.classify(key, d, now)
+				link, o := classifyChecked(t, front, key, d, now)
 				if link != nil {
 					if i != len(c.flight)-1 {
 						t.Fatalf("routed at packet %d of %d", i+1, len(c.flight))
@@ -357,12 +358,12 @@ func TestUDPFrontPendingPackets(t *testing.T) {
 	now := time.Now()
 	key := flowKey{client: netip.MustParseAddrPort("192.0.2.7:40000"), local: netip.MustParseAddrPort("127.0.0.1:443")}
 	for range maxPendingPackets {
-		front.classify(key, cut, now)
+		classifyChecked(t, front, key, cut, now)
 	}
 	if front.pendingBytes == 0 {
 		t.Fatal("nothing pending after 16 packets")
 	}
-	front.classify(key, cut, now)
+	classifyChecked(t, front, key, cut, now)
 	if front.pendingBytes != 0 || len(front.pending) != 0 {
 		t.Fatalf("after packet %d: %d bytes, %d flows", maxPendingPackets+1, front.pendingBytes, len(front.pending))
 	}
@@ -397,5 +398,132 @@ func TestUDPFrontPendingFlows(t *testing.T) {
 	}
 	if got != want {
 		t.Fatal("a real first flight did not get through a full table of pending flows")
+	}
+}
+
+// checkPending recounts what the pending ClientHellos hold from what they
+// hold, and checks the flow list against the flow map.
+func checkPending(t *testing.T, f *udpFront) {
+	t.Helper()
+	total := 0
+	for key, pf := range f.pending {
+		if len(pf.hellos) == 0 {
+			t.Fatalf("flow %v pending with no hello", key)
+		}
+		if pf.elem == nil || pf.elem.Value.(flowKey) != key {
+			t.Fatalf("flow %v not in the list as itself", key)
+		}
+		for id, ph := range pf.hellos {
+			n := pendingHelloCost + len(ph.asm.frames)*pendingFrameCost
+			for _, fr := range ph.asm.frames {
+				n += len(fr.data)
+			}
+			for _, d := range ph.packets {
+				n += len(d) + pendingPacketCost
+			}
+			if n != ph.bytes {
+				t.Fatalf("hello %x counts %d bytes, holds %d", id, ph.bytes, n)
+			}
+			total += n
+		}
+	}
+	if total != f.pendingBytes {
+		t.Fatalf("pendingBytes %d, the hellos hold %d", f.pendingBytes, total)
+	}
+	if f.pendingOrder.Len() != len(f.pending) {
+		t.Fatalf("%d flows listed, %d pending", f.pendingOrder.Len(), len(f.pending))
+	}
+}
+
+func classifyChecked(t *testing.T, f *udpFront, key flowKey, d []byte, now time.Time) (*backendLink, [][]byte) {
+	t.Helper()
+	link, out := f.classify(key, d, now)
+	checkPending(t, f)
+	return link, out
+}
+
+// TestUDPFrontEvictsOldestFlow: of the flows waiting for a ClientHello the
+// oldest go, never the newest: with the table full, a real client's first
+// packet takes a place, and a flood packet right after it takes the
+// oldest one, not the client's, whose second packet then completes the
+// flight. A flood must bring maxPendingFlows new flows between the two
+// packets to keep it out.
+func TestUDPFrontEvictsOldestFlow(t *testing.T) {
+	real := firstFlights(t, "n.example.com", 1)[0]
+	if len(real) < 2 {
+		t.Skip("a first flight of one packet")
+	}
+	flood := func(f *udpFront, from, n int, now time.Time) {
+		for i := range n {
+			k := flowKey{client: netip.AddrPortFrom(netip.AddrFrom4([4]byte{198, 18, byte((from + i) >> 8), byte(from + i)}), 40000),
+				local: netip.MustParseAddrPort("127.0.0.1:443")}
+			f.classify(k, sealInitial(randomDCID(), cryptoFrame16383, minInitialDatagram), now)
+		}
+	}
+	client := flowKey{client: netip.MustParseAddrPort("192.0.2.10:40000"), local: netip.MustParseAddrPort("127.0.0.1:443")}
+	now := time.Now()
+	t.Run("full table, the client, one flood flow", func(t *testing.T) {
+		front, want := desyncFront(t)
+		flood(front, 0, maxPendingFlows, now)
+		classifyChecked(t, front, client, real[0], now)
+		flood(front, maxPendingFlows, 1, now)
+		if link, _ := classifyChecked(t, front, client, real[1], now); link != want {
+			t.Fatal("one flood packet after the client's first evicted it")
+		}
+	})
+	for _, c := range []struct {
+		n      int
+		routed bool
+	}{{maxPendingFlows - 1, true}, {maxPendingFlows, false}} {
+		t.Run(fmt.Sprintf("the client, %d flood flows", c.n), func(t *testing.T) {
+			front, want := desyncFront(t)
+			classifyChecked(t, front, client, real[0], now)
+			flood(front, 0, c.n, now)
+			checkPending(t, front)
+			if link, _ := classifyChecked(t, front, client, real[1], now); (link == want) != c.routed {
+				t.Fatalf("routed %v, want %v", link == want, c.routed)
+			}
+		})
+	}
+}
+
+// TestUDPFrontEvictsOldestBytes: the same for the byte bound, with flood
+// flows of 16 packets each, so that the bound binds before the table: a
+// flood flow right after the client's first packet pushes out the oldest
+// flows, not the client's.
+func TestUDPFrontEvictsOldestBytes(t *testing.T) {
+	real := firstFlights(t, "n.example.com", 1)[0]
+	cut := firstFlights(t, "allowed.example", 1)[0][0]
+	if len(real) < 2 {
+		t.Skip("a first flight of one packet")
+	}
+	front, want := desyncFront(t)
+	now := time.Now()
+	heavy := func(i int) {
+		k := flowKey{client: netip.AddrPortFrom(netip.AddrFrom4([4]byte{198, 19, byte(i >> 8), byte(i)}), 40000),
+			local: netip.MustParseAddrPort("127.0.0.1:443")}
+		for range maxPendingPackets {
+			front.classify(k, cut, now)
+		}
+	}
+	i := 0
+	for ; front.pendingBytes < maxPendingBytes-64<<10 && i < maxPendingFlows; i++ {
+		heavy(i)
+	}
+	checkPending(t, front)
+	if len(front.pending) >= maxPendingFlows {
+		t.Fatalf("%d flows: the table, not the byte bound, binds", len(front.pending))
+	}
+	checkPending(t, front)
+	client := flowKey{client: netip.MustParseAddrPort("192.0.2.10:40000"), local: netip.MustParseAddrPort("127.0.0.1:443")}
+	classifyChecked(t, front, client, real[0], now)
+	heavy(i)
+	heavy(i + 1)
+	checkPending(t, front)
+	if front.pendingBytes > maxPendingBytes {
+		t.Fatalf("%d bytes pending", front.pendingBytes)
+	}
+	if link, _ := classifyChecked(t, front, client, real[1], now); link != want {
+		t.Fatal("flood flows after the client's first packet pushed it out")
 	}
 }
