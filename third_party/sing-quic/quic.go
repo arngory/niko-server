@@ -25,6 +25,12 @@ type QUICOptions struct {
 	MaxConcurrentStreams    int
 	InitialPacketSize       int
 	DisablePathMTUDiscovery bool
+	// neko: DisableKeepAlive: no PING of this side's own when the
+	// connection is at rest. A KeepAlivePeriod of 0 leaves the protocol's
+	// default (Hysteria's 10 s); this turns it off. The peer's keepalives
+	// go on, and the idle timeout still ends a connection nobody keeps
+	// alive. niko-server's tests use it for a client that falls silent.
+	DisableKeepAlive bool
 }
 
 type Config interface {
@@ -66,6 +72,9 @@ func ApplyQUICOptions(quicConfig *quic.Config, options QUICOptions) {
 	}
 	if options.KeepAlivePeriod > 0 {
 		quicConfig.KeepAlivePeriod = options.KeepAlivePeriod
+	}
+	if options.DisableKeepAlive {
+		quicConfig.KeepAlivePeriod = 0
 	}
 	if options.IdleTimeout > 0 {
 		quicConfig.MaxIdleTimeout = options.IdleTimeout
