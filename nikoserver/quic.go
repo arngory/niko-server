@@ -1,12 +1,16 @@
 package nikoserver
 
 import (
+	"bytes"
+	"cmp"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hkdf"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"slices"
+	"sort"
 
 	"github.com/sagernet/sing-quic/hysteria2"
 	"golang.org/x/crypto/blake2b"
@@ -205,6 +209,12 @@ func cryptoFrames(payload []byte) ([]cryptoFrame, error) {
 			if !ok {
 				return nil, errNotInitial
 			}
+			if len(data) == 0 {
+				continue
+			}
+			if len(out) == maxPacketFrames {
+				return nil, errNotTLS // only work for the front (helloAssembler)
+			}
 			out = append(out, cryptoFrame{offset: offset, data: data})
 		case 0x1c: // CONNECTION_CLOSE
 			return out, nil
@@ -216,49 +226,194 @@ func cryptoFrames(payload []byte) ([]cryptoFrame, error) {
 }
 
 // helloAssembler puts CRYPTO frames back in order until they hold a
-// whole ClientHello.
+// whole ClientHello. It holds the bytes that came, as pieces sorted by
+// offset that do not overlap, not a buffer up to the highest offset: what
+// it holds is what was sent once (a byte at offset 16383 holds one byte,
+// not 16 KB; a retransmission adds nothing), and that is what the front
+// counts against its budget of pending hellos. A frame must agree with
+// what is held where they overlap: the backend gets the packets as they
+// came, and the name the front routes by is the one it will read.
 type helloAssembler struct {
-	buf    []byte
-	filled []bool
+	frames []cryptoFrame // held pieces, by offset, not overlapping
+	size   int           // their bytes
 }
 
-const maxQUICHello = 16 << 10
+const (
+	maxQUICHello = 16 << 10
+	// maxPacketFrames and maxHelloFrames: Chromium's chaos protection
+	// splits its ClientHello into a few CRYPTO frames a packet (2 to 10
+	// added), quic-go into two; a packet of hundreds of one-byte frames is
+	// only work for the front. maxHelloFrames bounds the pieces held.
+	maxPacketFrames = 32
+	maxHelloFrames  = 256
+)
 
-// add takes frames and returns the ClientHello once it is complete.
+// add takes a packet's frames and returns the ClientHello once it is
+// complete.
 func (a *helloAssembler) add(frames []cryptoFrame) (clientHello, bool, error) {
+	n := 0
 	for _, f := range frames {
-		end := f.offset + uint64(len(f.data))
-		if end > maxQUICHello {
+		if f.offset+uint64(len(f.data)) > maxQUICHello {
 			return clientHello{}, false, errNotTLS
 		}
-		if int(end) > len(a.buf) {
-			a.buf = append(a.buf, make([]byte, int(end)-len(a.buf))...)
-			a.filled = append(a.filled, make([]bool, int(end)-len(a.filled))...)
-		}
-		copy(a.buf[f.offset:], f.data)
-		for i := f.offset; i < end; i++ {
-			a.filled[i] = true
+		if len(f.data) > 0 {
+			n++
 		}
 	}
-	have := 0
-	for have < len(a.filled) && a.filled[have] {
-		have++
+	if n > maxPacketFrames {
+		return clientHello{}, false, errNotTLS
 	}
+	// The parts of this packet's frames that nothing held covers, each
+	// checked against what is held; then against one another, in order of
+	// offset, the overlaps among them dropped.
+	var parts []cryptoFrame
+	for _, f := range frames {
+		if len(f.data) == 0 {
+			continue
+		}
+		var ok bool
+		if parts, ok = gaps(a.frames, f, parts); !ok || len(a.frames)+len(parts) > 2*maxHelloFrames {
+			return clientHello{}, false, errNotTLS
+		}
+	}
+	// In order of offset a part goes past the end of those before it or
+	// adds nothing: a hole among them ends before its offset. What it
+	// overlaps must agree.
+	slices.SortFunc(parts, func(x, y cryptoFrame) int { return cmp.Compare(x.offset, y.offset) })
+	added := make([]cryptoFrame, 0, len(parts))
+	for _, p := range parts {
+		var ok bool
+		if added, ok = gaps(added, p, added); !ok {
+			return clientHello{}, false, errNotTLS
+		}
+	}
+	if len(a.frames)+len(added) > maxHelloFrames {
+		return clientHello{}, false, errNotTLS
+	}
+	if len(added) > 0 {
+		total := 0
+		for _, p := range added {
+			total += len(p.data)
+		}
+		a.frames = coalesce(mergePieces(a.frames, added), added)
+		a.size += total
+	}
+	have := a.prefix()
 	if have < 4 {
 		return clientHello{}, false, nil
 	}
-	if a.buf[0] != 1 {
+	var head [4]byte
+	a.fill(head[:])
+	if head[0] != 1 {
 		return clientHello{}, false, errNotTLS
 	}
-	size := int(a.buf[1])<<16 | int(a.buf[2])<<8 | int(a.buf[3])
+	size := int(head[1])<<16 | int(head[2])<<8 | int(head[3])
 	if 4+size > maxQUICHello {
 		return clientHello{}, false, errNotTLS
 	}
 	if have < 4+size {
 		return clientHello{}, false, nil
 	}
-	h, err := parseClientHello(a.buf[4 : 4+size])
+	buf := make([]byte, 4+size)
+	a.fill(buf)
+	h, err := parseClientHello(buf[4:])
 	return h, err == nil, err
+}
+
+// gaps checks frame f against held, pieces sorted by offset that do not
+// overlap: where they overlap the bytes must agree (false if not). It
+// appends to out the parts of f that held does not cover, in order, and
+// returns it.
+func gaps(held []cryptoFrame, f cryptoFrame, out []cryptoFrame) ([]cryptoFrame, bool) {
+	end := f.offset + uint64(len(f.data))
+	i := sort.Search(len(held), func(i int) bool { return held[i].offset+uint64(len(held[i].data)) > f.offset })
+	pos := f.offset
+	for ; i < len(held) && held[i].offset < end; i++ {
+		h := held[i]
+		hEnd := h.offset + uint64(len(h.data))
+		if h.offset > pos {
+			out = append(out, cryptoFrame{offset: pos, data: f.data[pos-f.offset : h.offset-f.offset]})
+		}
+		lo, hi := max(h.offset, f.offset), min(hEnd, end)
+		if !bytes.Equal(f.data[lo-f.offset:hi-f.offset], h.data[lo-h.offset:hi-h.offset]) {
+			return out, false
+		}
+		pos = max(pos, hEnd)
+	}
+	if pos < end {
+		out = append(out, cryptoFrame{offset: pos, data: f.data[pos-f.offset:]})
+	}
+	return out, true
+}
+
+// mergePieces merges two lists of pieces sorted by offset that do not
+// overlap one another.
+func mergePieces(a, b []cryptoFrame) []cryptoFrame {
+	out := make([]cryptoFrame, 0, len(a)+len(b))
+	for len(a) > 0 && len(b) > 0 {
+		if a[0].offset < b[0].offset {
+			out, a = append(out, a[0]), a[1:]
+		} else {
+			out, b = append(out, b[0]), b[1:]
+		}
+	}
+	out = append(out, a...)
+	return append(out, b...)
+}
+
+// coalesce joins pieces that touch into one: each run that holds a piece
+// of added (the packet's, in its frames' memory) is copied into an array
+// of its own, exactly its bytes, and a held piece alone is kept. Pieces
+// stay as few as the gaps between them, however a client cut its frames,
+// a frame over held bytes meets one piece, not hundreds, and what is held
+// is what is counted.
+func coalesce(pieces, added []cryptoFrame) []cryptoFrame {
+	out := pieces[:0]
+	k := 0 // the next of added
+	for i := 0; i < len(pieces); {
+		j, end, size := i+1, pieces[i].offset+uint64(len(pieces[i].data)), len(pieces[i].data)
+		for ; j < len(pieces) && pieces[j].offset == end; j++ {
+			end += uint64(len(pieces[j].data))
+			size += len(pieces[j].data)
+		}
+		fresh := false
+		for ; k < len(added) && added[k].offset < end; k++ {
+			fresh = true
+		}
+		p := pieces[i]
+		if fresh { // held pieces never touch: a run of more holds a new one
+			data := make([]byte, 0, size)
+			for _, q := range pieces[i:j] {
+				data = append(data, q.data...)
+			}
+			p.data = data
+		}
+		out = append(out, p) // at i or before: pieces[i:j] is read first
+		i = j
+	}
+	return out
+}
+
+// prefix is how many bytes from offset 0 the pieces hold without a gap.
+func (a *helloAssembler) prefix() int {
+	var have uint64
+	for _, f := range a.frames {
+		if f.offset != have {
+			break
+		}
+		have += uint64(len(f.data))
+	}
+	return int(have)
+}
+
+// fill copies the pieces into dst from offset 0, as far as dst goes.
+func (a *helloAssembler) fill(dst []byte) {
+	for _, f := range a.frames {
+		if f.offset >= uint64(len(dst)) {
+			break
+		}
+		copy(dst[f.offset:], f.data)
+	}
 }
 
 // salamanderOpen removes Hysteria2's salamander obfuscation: 8 bytes of
@@ -280,13 +435,16 @@ func salamanderInitial(password, datagram []byte) bool {
 	return ok && isQUICInitial(head[:7])
 }
 
+// salamanderSalt is the salt ahead of a salamander datagram.
+const salamanderSalt = 8
+
 // salamanderHead opens the start of a datagram under salamander with this
 // password: the bytes of a QUIC header that tell what it is (cidHead, those
 // there are; the rest zero). Only they are opened, on the stack, so a
 // garbage datagram costs one key and no copy. false: too short for an
 // Initial's 7 bytes.
 func salamanderHead(password, datagram []byte) (head [cidHead]byte, ok bool) {
-	if len(datagram) < 8+7 {
+	if len(datagram) < salamanderSalt+7 {
 		return head, false
 	}
 	key := salamanderKey(password, datagram[:8])

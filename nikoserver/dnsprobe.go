@@ -58,6 +58,14 @@ type tokenBucket struct {
 	last   time.Time
 }
 
+// ready reports whether one can be taken now, taking none.
+func (b *tokenBucket) ready(rate, burst float64, now time.Time) bool {
+	if b.last.IsZero() {
+		return burst >= 1
+	}
+	return min(burst, b.tokens+now.Sub(b.last).Seconds()*rate) >= 1
+}
+
 func (b *tokenBucket) take(cost, rate, burst float64, now time.Time) bool {
 	if b.last.IsZero() {
 		b.tokens = burst

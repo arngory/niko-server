@@ -175,10 +175,14 @@ func hysteriaFront(t *testing.T, ctx context.Context, withCID, frontCID bool, li
 }
 
 // A Hysteria2 client whose NAT gives it a new port mid-connection: its
-// stream goes on, and new streams open on the same connection. The front
-// pins the new port by the label of the server's connection ID, the server
-// moves to it at its first packet (DisablePathManager). Plain and under
-// salamander. Without the labels the connection is lost, as before.
+// stream goes on within a second, and new streams open on the same
+// connection. The front pins the new port by the label of the server's
+// connection ID, and the server moves to it once the client answered its
+// PATH_CHALLENGE there (PathValidation): the front lets that probe through
+// at once although the client sent less than a third of it there
+// (pathProbeFree; sagernet's quic-go sends the next one only when it holds
+// the first lost, a second or two later). Plain and under salamander.
+// Without the labels the connection is lost, as before.
 func TestNekoServerHysteriaRebind(t *testing.T) {
 	echo, _ := echoPair(t)
 	for _, c := range []struct {
@@ -235,6 +239,7 @@ func TestNekoServerHysteriaRebind(t *testing.T) {
 				t.Fatalf("before the new port: %v", err)
 			}
 			relay.rebind()
+			start := time.Now()
 			err = round("after the new port", 5*time.Second)
 			if !c.survives {
 				if err == nil {
@@ -244,6 +249,9 @@ func TestNekoServerHysteriaRebind(t *testing.T) {
 			}
 			if err != nil {
 				t.Fatalf("the stream after the new port: %v", err)
+			}
+			if took := time.Since(start); took > time.Second {
+				t.Fatalf("the stream after the new port took %v", took)
 			}
 			// A new stream on the same connection, and another new port.
 			relay.rebind()
@@ -282,6 +290,13 @@ func (quicgoCIDs) ConnectionIDLen() int { return cidLen }
 // client's address as the server sees it.
 func h3Node(t *testing.T, withCID bool) *net.UDPAddr {
 	t.Helper()
+	_, addr := h3NodeFront(t, withCID)
+	return addr
+}
+
+// h3NodeFront is h3Node with its front.
+func h3NodeFront(t *testing.T, withCID bool) (*udpFront, *net.UDPAddr) {
+	t.Helper()
 	dir := t.TempDir()
 	sock := filepath.Join(dir, "h3.sock")
 	pc := packetBackend(t, sock)
@@ -302,12 +317,23 @@ func h3Node(t *testing.T, withCID bool) *net.UDPAddr {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := &http3.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, r.RemoteAddr) })}
+	srv := &http3.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/big" {
+			w.Write(make([]byte, 256<<10))
+			return
+		}
+		io.WriteString(w, r.RemoteAddr)
+	})}
 	go srv.ServeListener(ln)
 	// The socket before the transport: its reader waits on the front's
 	// datagrams, which no deadline wakes.
 	t.Cleanup(func() { srv.Close(); ln.Close(); pc.Close(); tr.Close() })
-	return startUDPFront(t, fc, map[string]BackendRef{"h3": ref})
+	front := runUDPFront(t, fc, map[string]BackendRef{"h3": ref})
+	for _, sock := range front.sockets {
+		return front, sock.LocalAddr().(*net.UDPAddr)
+	}
+	t.Fatal("no socket")
+	return nil, nil
 }
 
 // h3Get asks the server who it thinks the client is.
