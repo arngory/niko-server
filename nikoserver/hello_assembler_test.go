@@ -23,8 +23,12 @@ func rawHello(t testing.TB) []byte {
 	return raw
 }
 
+// frame is a CRYPTO frame of raw[from:to], in an array with room past it:
+// a piece kept in it, not copied, shows as its capacity.
 func frame(raw []byte, from, to int) cryptoFrame {
-	return cryptoFrame{offset: uint64(from), data: append([]byte(nil), raw[from:to]...)}
+	d := make([]byte, to-from, to-from+64)
+	copy(d, raw[from:to])
+	return cryptoFrame{offset: uint64(from), data: d}
 }
 
 // TestHelloAssembler: frames in any order, contained in one another,
@@ -117,6 +121,9 @@ func TestHelloAssembler(t *testing.T) {
 			held := 0
 			for i, f := range a.frames {
 				held += len(f.data)
+				if cap(f.data) != len(f.data) {
+					t.Fatalf("a piece of %d bytes keeps %d", len(f.data), cap(f.data))
+				}
 				if i > 0 && a.frames[i-1].offset+uint64(len(a.frames[i-1].data)) > f.offset {
 					t.Fatal("pieces out of order or overlapping")
 				}

@@ -63,16 +63,43 @@ type udpFront struct {
 	// (maxConfirmedPerSource) each.
 	confirmed    map[netip.Prefix]int32
 	maxConfirmed int32
-	// freeProbes and allFreeProbes bound the path probes that go past a
-	// flow's 3x (pathProbeFree).
+	// budgets: what each source sent and was sent, for its flows' path
+	// probes; freeProbes and allFreeProbes bound those that go past it
+	// (pathProbeFree).
+	budgets       map[uint64]*sourceBudget // by sourceKey
 	freeProbes    sourceLimits
 	allFreeProbes tokenBucket
 	// epoch: the start of udpFlow.last's clock.
 	epoch time.Time
 }
 
-// clock is a time on udpFlow.last's clock.
-func (f *udpFront) clock(now time.Time) int64 { return int64(now.Sub(f.epoch)) }
+// sourceBudget is what a source (an IPv4 address, an IPv6 /64) sent the
+// backends and was sent of path probes and handshakes, all its flows'
+// together. A flow's first probe past its own 3x goes within its source's:
+// a client whose port changed (NAT rebinding, Hysteria2's port hopping, a
+// new socket) has its address's bytes behind the new port's first
+// PATH_CHALLENGE, however small its first packet there and however many
+// clients share the address. Each such probe needs a flow of its own, and
+// a source pins cidFlowRate a second by label: one who spoofs a busy
+// address draws that many probes to it at most.
+type sourceBudget struct {
+	fromClient, sent uint64
+	flows            int32
+}
+
+// sourceKey is the key of a source's budget: an IPv6 address's /64, an
+// IPv4 address with the top 32 bits set (no /64 of unicast IPv6 starts so).
+func sourceKey(a netip.Addr) uint64 {
+	if a = a.Unmap(); a.Is4() {
+		v := a.As4()
+		return 1<<64 - 1<<32 | uint64(binary.BigEndian.Uint32(v[:]))
+	}
+	v := a.As16()
+	return binary.BigEndian.Uint64(v[:8])
+}
+
+// clock is a time on udpFlow.last's clock, in seconds.
+func (f *udpFront) clock(now time.Time) uint32 { return uint32(now.Sub(f.epoch) / time.Second) }
 
 // flowRoute is what a pinned flow needs of its route to read the
 // server's connection ID: the salamander password its packets are under.
@@ -100,7 +127,11 @@ type flowKey struct{ client, local netip.AddrPort }
 
 type udpFlow struct {
 	link *backendLink
-	last int64 // the flow's last datagram, udpFront.clock
+	// last: the flow's last datagram; backendAt: the backend's last, on
+	// udpFront.clock. A confirmed flow the backend has not answered for
+	// idle/2 is listed again: else a host's sources could hold the whole
+	// table with datagrams no backend answers.
+	last, backendAt uint32
 	// A flow is pinned by what anyone may send from any address (an
 	// Initial, a labelled ID) and is listed in udpFront.unconfirmed until
 	// the client shows it got the server's answers: it sends to the
@@ -117,8 +148,8 @@ type udpFlow struct {
 	route      *flowRoute // nil: plain
 	listed     bool       // in udpFront.unconfirmed: not confirmed yet
 	answered   bool       // the backend's first answer was read
-	oneRTT     bool       // a short header came from the backend
 	freeProbe  bool       // a path probe went past the flow's 3x (pathProbeFree)
+	answers    uint8      // the backend's datagrams read for a handshake's, to countedAnswers
 	serverLen  uint8
 	checks     uint8 // datagrams checked against serverCID
 	serverCID  [maxCIDLen]byte
@@ -130,9 +161,10 @@ type udpFlow struct {
 	// before the answer. A third ID leaves the flow unconfirmed.
 	initialID, otherID uint32
 	// fromClient: the client's bytes; sent: the backend's path probes and
-	// its datagrams before its first short header (a handshake's, which
-	// a source gets whether or not it reads them).
+	// the long headers among its first countedAnswers datagrams (a
+	// handshake's, which a source gets whether or not it reads them).
 	fromClient, sent uint32
+	budget           *sourceBudget // its source's, the same counted for all its flows
 }
 
 // addSat is a + n, at most the bound of a uint32.
@@ -316,13 +348,18 @@ const (
 	// a flow, and keep every new flow out.
 	maxConfirmedPerSource = 1024
 	// pathProbeFree: a path probe past its flow's 3x goes all the same,
-	// once a flow, within freeProbeRate a second (freeProbeBurst) of a
-	// source (an IPv4 address, an IPv6 /64) and freeProbeTotalRate
-	// (freeProbeTotalBurst) of all: a client whose address changed gets
-	// its server's PATH_CHALLENGE at once. sagernet's quic-go sends the
-	// next one only when it holds the first lost, a second or two later.
+	// once a flow, within its source's 3x (sourceBudget) or else within
+	// freeProbeRate a second (freeProbeBurst) of the source (an IPv4
+	// address, an IPv6 /64) and freeProbeTotalRate (freeProbeTotalBurst)
+	// of all: a client whose address or port changed gets its server's
+	// PATH_CHALLENGE at once. sagernet's quic-go sends the next one only
+	// when it holds the first lost, a second or two later.
 	freeProbeRate, freeProbeBurst           = 2, 8
 	freeProbeTotalRate, freeProbeTotalBurst = 256, 1024
+	// countedAnswers: the backend's first datagrams to a flow, read for
+	// long headers: its handshake and the handshake's retransmissions,
+	// which count against the source's 3x with the probes.
+	countedAnswers = 32
 	// cidFlowRate and cidFlowBurst bound the flows a source (an IPv4
 	// address, an IPv6 /64) pins by a label: a client whose address
 	// changes pins one per connection, a CGNAT address a few for all its
@@ -337,7 +374,8 @@ const (
 func newUDPFront(c *FrontUDP, backends map[string]BackendRef, log *Logger) (*udpFront, error) {
 	f := &udpFront{log: log, idle: 60 * time.Second, byName: map[string]*backendLink{}, links: map[string]*backendLink{},
 		sockets: map[netip.AddrPort]*net.UDPConn{}, flows: map[flowKey]*udpFlow{}, pending: map[flowKey]*pendingFlow{},
-		maxFlows: maxUDPFlows, confirmed: map[netip.Prefix]int32{}, maxConfirmed: maxConfirmedPerSource, epoch: time.Now()}
+		maxFlows: maxUDPFlows, confirmed: map[netip.Prefix]int32{}, maxConfirmed: maxConfirmedPerSource,
+		budgets: map[uint64]*sourceBudget{}, epoch: time.Now()}
 	if d, err := time.ParseDuration(c.Idle); err == nil && d > 0 {
 		f.idle = d
 	}
@@ -462,9 +500,14 @@ func (f *udpFront) run(ctx context.Context) error {
 func (f *udpFront) expire(now time.Time) {
 	f.access.Lock()
 	defer f.access.Unlock()
+	t := f.clock(now)
+	idle := uint32(f.idle / time.Second)
 	for k, fl := range f.flows {
-		if f.clock(now)-fl.last > int64(f.idle) {
+		switch {
+		case t-fl.last > idle:
 			f.unpin(k)
+		case !fl.listed && t-fl.backendAt > idle/2:
+			f.unconfirm(fl)
 		}
 	}
 	for k, p := range f.pending {
@@ -473,6 +516,7 @@ func (f *udpFront) expire(now time.Time) {
 		}
 	}
 	f.cidSources.age(now)
+	f.freeProbes.age(now)
 }
 
 func (f *udpFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
@@ -503,7 +547,11 @@ func (f *udpFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 		if link == nil {
 			continue
 		}
-		f.pin(key, link, datagram, now)
+		sent := 0
+		for _, p := range packets {
+			sent += len(p)
+		}
+		f.pin(key, link, datagram, sent, now)
 		for _, p := range packets {
 			link.send(encodePacket(message, client, local, p))
 		}
@@ -585,6 +633,11 @@ func (s *sourceLimits) allow(src netip.Addr, now time.Time) bool {
 
 // take takes one from src's bucket of rate a second, burst at most.
 func (s *sourceLimits) take(src netip.Addr, now time.Time, rate, burst float64) bool {
+	return s.bucket(src, now).take(1, rate, burst, now)
+}
+
+// bucket is src's bucket.
+func (s *sourceLimits) bucket(src netip.Addr, now time.Time) *tokenBucket {
 	src = src.Unmap()
 	bits := 64
 	if src.Is4() {
@@ -601,7 +654,7 @@ func (s *sourceLimits) take(src netip.Addr, now time.Time, rate, burst float64) 
 		}
 		s.sources[prefix] = b
 	}
-	return b.take(1, rate, burst, now)
+	return b
 }
 
 // sourcePrefix is src's prefix of bits as IPv6, an IPv4 address whole.
@@ -776,6 +829,7 @@ func (f *udpFront) pinned(key flowKey, d []byte, now time.Time) *backendLink {
 	}
 	fl.last = f.clock(now)
 	fl.fromClient = addSat(fl.fromClient, len(d))
+	fl.budget.fromClient += uint64(len(d))
 	if !fl.listed {
 		return fl.link
 	}
@@ -807,7 +861,7 @@ func (f *udpFront) pinned(key flowKey, d []byte, now time.Time) *backendLink {
 func (f *udpFront) confirm(fl *udpFlow) bool {
 	p := sourcePrefix(fl.key.client.Addr(), 48)
 	if f.confirmed[p] >= f.maxConfirmed {
-		fl.checks = maxServerCIDChecks
+		fl.checks++
 		return false
 	}
 	f.confirmed[p]++
@@ -815,11 +869,29 @@ func (f *udpFront) confirm(fl *udpFlow) bool {
 	return true
 }
 
-// pin pins a flow to link by d, the datagram that classified it. With the
-// table full the least recently used flow not confirmed yet goes; if every
-// flow is confirmed, this one is not pinned (its datagrams classify one by
-// one).
-func (f *udpFront) pin(key flowKey, link *backendLink, d []byte, now time.Time) {
+// unconfirm lists a confirmed flow again, to be confirmed anew. With
+// f.access.
+func (f *udpFront) unconfirm(fl *udpFlow) {
+	f.uncount(fl.key)
+	fl.checks = 0
+	f.unconfirmed.push(fl)
+}
+
+// uncount takes a confirmed flow off its source's count. With f.access.
+func (f *udpFront) uncount(key flowKey) {
+	if p := sourcePrefix(key.client.Addr(), 48); f.confirmed[p] > 1 {
+		f.confirmed[p]--
+	} else {
+		delete(f.confirmed, p)
+	}
+}
+
+// pin pins a flow to link by d, the datagram that classified it; sent is
+// what goes to the backend with it (d and the Initials held for it). With
+// the table full the least recently used flow not confirmed yet goes; if
+// every flow is confirmed, this one is not pinned (its datagrams classify
+// one by one).
+func (f *udpFront) pin(key flowKey, link *backendLink, d []byte, sent int, now time.Time) {
 	f.access.Lock()
 	defer f.access.Unlock()
 	if f.flows[key] != nil {
@@ -831,7 +903,16 @@ func (f *udpFront) pin(key flowKey, link *backendLink, d []byte, now time.Time) 
 		}
 		f.unpin(f.unconfirmed.head.key)
 	}
-	fl := &udpFlow{link: link, last: f.clock(now), key: key, fromClient: addSat(0, len(d))}
+	sk := sourceKey(key.client.Addr())
+	b := f.budgets[sk]
+	if b == nil {
+		b = &sourceBudget{}
+		f.budgets[sk] = b
+	}
+	b.flows++
+	b.fromClient += uint64(sent)
+	fl := &udpFlow{link: link, last: f.clock(now), key: key, fromClient: addSat(0, sent), budget: b}
+	fl.backendAt = fl.last
 	if r := f.salamanderFor(link, d); r != nil {
 		fl.route = r.flow
 	}
@@ -848,20 +929,22 @@ func (f *udpFront) unpin(key flowKey) {
 	}
 	if fl.listed {
 		f.unconfirmed.remove(fl)
-	} else if p := sourcePrefix(key.client.Addr(), 48); f.confirmed[p] > 1 {
-		f.confirmed[p]--
 	} else {
-		delete(f.confirmed, p)
+		f.uncount(key)
+	}
+	if fl.budget.flows--; fl.budget.flows == 0 {
+		delete(f.budgets, sourceKey(key.client.Addr()))
 	}
 	delete(f.flows, key)
 }
 
 // answered takes the time of a backend's answer on a flow and reports
 // whether it goes to the client. A path probe (isPathProbe) goes within
-// three times what the flow's client sent, the backend's datagrams before
-// its first short header (a handshake's) counted with the probes; once a
-// flow, it goes past that within pathProbeFree; to an address with no flow
-// it does not go at all: the address may be anyone's. Of the first answer
+// three times what the flow's client sent, the backend's long headers
+// among its first countedAnswers datagrams (a handshake and its
+// retransmissions) counted with the probes; once a flow, it goes past that
+// (freeProbe); to an address with no flow it does not go at all: the
+// address may be anyone's. Of the first answer
 // to a flow not confirmed yet it reads the server's connection ID, a long
 // header's Source Connection ID, which the client sends to once it has the
 // answer: unless it is one the client chose (a refusal names it, quic-go's
@@ -874,26 +957,44 @@ func (f *udpFront) answered(link *backendLink, key flowKey, payload []byte, now 
 		return !f.linkProbe(link, payload)
 	}
 	fl.last = f.clock(now)
-	switch n := len(payload); {
+	fl.backendAt = fl.last
+	b, n := fl.budget, len(payload)
+	switch {
 	case isPathProbe(fl.password(), payload):
-		if uint64(fl.sent)+uint64(n) > 3*uint64(fl.fromClient) {
-			if fl.freeProbe || !f.freeProbes.take(key.client.Addr(), now, freeProbeRate, freeProbeBurst) ||
-				!f.allFreeProbes.take(1, freeProbeTotalRate, freeProbeTotalBurst, now) {
-				return false
-			}
-			fl.freeProbe = true
+		if uint64(fl.sent)+uint64(n) > 3*uint64(fl.fromClient) && !f.freeProbe(fl, now) {
+			return false
 		}
 		fl.sent = addSat(fl.sent, n)
-	case !fl.oneRTT:
-		if h, m := openHead(fl.password(), payload, 1); m == 1 && h[0]&0x80 == 0 {
-			fl.oneRTT = true
-		} else {
+		b.sent += uint64(n)
+	case fl.answers < countedAnswers:
+		fl.answers++
+		if h, m := openHead(fl.password(), payload, 1); m == 1 && h[0]&0x80 != 0 {
 			fl.sent = addSat(fl.sent, n)
+			b.sent += uint64(n)
 		}
 	}
 	if fl.listed && !fl.answered {
 		f.serverID(fl, payload)
 	}
+	return true
+}
+
+// freeProbe reports whether a flow's probe past its 3x goes (it takes it):
+// once a flow, within its source's 3x, or failing that within
+// freeProbeRate of the source and freeProbeTotalRate of all. With f.access.
+func (f *udpFront) freeProbe(fl *udpFlow, now time.Time) bool {
+	if fl.freeProbe {
+		return false
+	}
+	if b := fl.budget; b.sent+quicProbeSize+salamanderSalt > 3*b.fromClient {
+		sb := f.freeProbes.bucket(fl.key.client.Addr(), now)
+		if !sb.ready(freeProbeRate, freeProbeBurst, now) || !f.allFreeProbes.ready(freeProbeTotalRate, freeProbeTotalBurst, now) {
+			return false
+		}
+		sb.take(1, freeProbeRate, freeProbeBurst, now)
+		f.allFreeProbes.take(1, freeProbeTotalRate, freeProbeTotalBurst, now)
+	}
+	fl.freeProbe = true
 	return true
 }
 

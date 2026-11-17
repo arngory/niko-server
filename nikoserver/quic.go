@@ -295,13 +295,7 @@ func (a *helloAssembler) add(frames []cryptoFrame) (clientHello, bool, error) {
 		for _, p := range added {
 			total += len(p.data)
 		}
-		buf := make([]byte, 0, total) // one copy of the new bytes
-		for i := range added {
-			start := len(buf)
-			buf = append(buf, added[i].data...)
-			added[i].data = buf[start:len(buf):len(buf)]
-		}
-		a.frames = coalesce(mergePieces(a.frames, added))
+		a.frames = coalesce(mergePieces(a.frames, added), added)
 		a.size += total
 	}
 	have := a.prefix()
@@ -367,19 +361,27 @@ func mergePieces(a, b []cryptoFrame) []cryptoFrame {
 	return append(out, b...)
 }
 
-// coalesce joins pieces that touch into one, copied: pieces stay as few
-// as the gaps between them, however a client cut its frames, and a frame
-// over held bytes meets one piece, not hundreds.
-func coalesce(pieces []cryptoFrame) []cryptoFrame {
+// coalesce joins pieces that touch into one: each run that holds a piece
+// of added (the packet's, in its frames' memory) is copied into an array
+// of its own, exactly its bytes, and a held piece alone is kept. Pieces
+// stay as few as the gaps between them, however a client cut its frames,
+// a frame over held bytes meets one piece, not hundreds, and what is held
+// is what is counted.
+func coalesce(pieces, added []cryptoFrame) []cryptoFrame {
 	out := pieces[:0]
+	k := 0 // the next of added
 	for i := 0; i < len(pieces); {
 		j, end, size := i+1, pieces[i].offset+uint64(len(pieces[i].data)), len(pieces[i].data)
 		for ; j < len(pieces) && pieces[j].offset == end; j++ {
 			end += uint64(len(pieces[j].data))
 			size += len(pieces[j].data)
 		}
+		fresh := false
+		for ; k < len(added) && added[k].offset < end; k++ {
+			fresh = true
+		}
 		p := pieces[i]
-		if j > i+1 {
+		if fresh { // held pieces never touch: a run of more holds a new one
 			data := make([]byte, 0, size)
 			for _, q := range pieces[i:j] {
 				data = append(data, q.data...)
