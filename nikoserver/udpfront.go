@@ -45,6 +45,9 @@ type udpFront struct {
 	access  sync.Mutex
 	flows   map[flowKey]*udpFlow
 	pending map[flowKey]*pendingFlow
+	// pendingBytes: what the pending ClientHellos hold, packets and
+	// assemblers, all flows together (maxPendingBytes).
+	pendingBytes int
 	// cidSources bound the flows pinned by a label per source.
 	cidSources sourceLimits
 }
@@ -75,11 +78,27 @@ type udpFlow struct {
 type pendingFlow struct {
 	created time.Time
 	hellos  map[string]*pendingHello
+	seq     uint64 // the last hello's; the oldest has the least
 }
 
 type pendingHello struct {
 	asm     helloAssembler
 	packets [][]byte
+	bytes   int // its packets' and its assembler's, in pendingBytes
+	seq     uint64
+}
+
+// oldest is the ID of the hello that came first.
+func (pf *pendingFlow) oldest() string {
+	var id string
+	var seq uint64
+	first := true
+	for k, h := range pf.hellos {
+		if first || h.seq < seq {
+			id, seq, first = k, h.seq, false
+		}
+	}
+	return id
 }
 
 const (
@@ -87,7 +106,13 @@ const (
 	maxPendingPackets = 16
 	maxPendingIDs     = 4
 	pendingFor        = 3 * time.Second
-	maxUDPFlows       = 1 << 18
+	// maxPendingBytes bounds what all pending ClientHellos hold together:
+	// each up to 16 packets and an assembler of up to 2 x maxQUICHello,
+	// 4 per flow and 4096 flows would be some 0.9 GB of Initials anyone can
+	// make (their keys come from the packet). 16 MiB holds some 3000 first
+	// flights of 2 packets at once, within pendingFor.
+	maxPendingBytes = 16 << 20
+	maxUDPFlows     = 1 << 18
 	// cidFlowRate and cidFlowBurst bound the flows a source (an IPv4
 	// address, an IPv6 /64) pins by a label: a client whose address
 	// changes pins one per connection, a CGNAT address a few for all its
@@ -231,7 +256,7 @@ func (f *udpFront) expire(now time.Time) {
 	}
 	for k, p := range f.pending {
 		if now.Sub(p.created) > pendingFor {
-			delete(f.pending, k)
+			f.dropPending(k)
 		}
 	}
 	f.cidSources.age(now)
@@ -384,31 +409,68 @@ func (f *udpFront) pendingHello(key flowKey, p quicInitial, d []byte, now time.T
 	ph := pf.hellos[id]
 	if ph == nil {
 		if len(pf.hellos) >= maxPendingIDs {
-			return nil, nil
+			// The oldest goes, not the newcomer: fakes sent before a
+			// client's first flight on its 4-tuple (udp_desync) may each
+			// carry a ClientHello cut short under an ID of its own, and the
+			// real flight comes after them.
+			f.dropHello(pf, pf.oldest())
 		}
-		ph = &pendingHello{}
+		pf.seq++
+		ph = &pendingHello{seq: pf.seq}
 		pf.hellos[id] = ph
 	}
 	if len(ph.packets) >= maxPendingPackets {
-		delete(pf.hellos, id)
+		f.dropHello(pf, id)
 		return nil, nil
 	}
 	ph.packets = append(ph.packets, append([]byte(nil), d...))
 	hello, done, err := ph.asm.add(p.crypto)
-	if err != nil {
-		delete(pf.hellos, id)
+	f.account(ph)
+	if err != nil || (!done && f.pendingBytes > maxPendingBytes) {
+		f.dropHello(pf, id)
 		return nil, nil
 	}
 	if !done {
 		return nil, nil
 	}
-	delete(pf.hellos, id)
+	packets := ph.packets
+	f.dropHello(pf, id)
 	link := f.byName[hello.serverName]
 	if link == nil || hello.serverName == "" {
 		return nil, nil // a name not routed here: dropped, the flow stays free
 	}
+	f.dropPending(key)
+	return link, packets
+}
+
+// account brings pendingBytes up to what ph holds now. With f.access.
+func (f *udpFront) account(ph *pendingHello) {
+	n := len(ph.asm.buf) + len(ph.asm.filled)
+	for _, d := range ph.packets {
+		n += len(d)
+	}
+	f.pendingBytes += n - ph.bytes
+	ph.bytes = n
+}
+
+// dropHello forgets one pending ClientHello. With f.access.
+func (f *udpFront) dropHello(pf *pendingFlow, id string) {
+	if ph := pf.hellos[id]; ph != nil {
+		f.pendingBytes -= ph.bytes
+		delete(pf.hellos, id)
+	}
+}
+
+// dropPending forgets a flow's pending ClientHellos. With f.access.
+func (f *udpFront) dropPending(key flowKey) {
+	pf := f.pending[key]
+	if pf == nil {
+		return
+	}
+	for id := range pf.hellos {
+		f.dropHello(pf, id)
+	}
 	delete(f.pending, key)
-	return link, ph.packets
 }
 
 // answer sends a backend's datagram from the local address the flow came to.
