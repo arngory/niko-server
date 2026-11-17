@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"container/list"
 	"context"
+	"encoding/binary"
 	"errors"
 	"net"
 	"net/netip"
@@ -53,11 +54,27 @@ type udpFront struct {
 	pendingOrder list.List
 	// cidSources bound the flows pinned by a label per source.
 	cidSources sourceLimits
+	// unconfirmed: the flows not confirmed yet, oldest first; maxFlows:
+	// the table's bound (maxUDPFlows); plainRoutes: what a flow of a plain
+	// QUIC backend with a label needs to be confirmed by it.
+	unconfirmed flowList
+	maxFlows    int
+	plainRoutes map[*backendLink]*flowRoute
+}
+
+// flowRoute is what a pinned flow needs of its route to be confirmed: the
+// salamander password its packets are under (nil: none) and its backend's
+// label with the label's key (nil: none). One a route, its flows share it.
+type flowRoute struct {
+	password []byte
+	codec    *cidCodec
+	label    uint16
 }
 
 type salamanderRoute struct {
 	password []byte
 	link     *backendLink
+	flow     *flowRoute
 	label    uint16    // its backend's label, 0 none
 	codec    *cidCodec // the label's key; nil: no routing by ID
 }
@@ -74,6 +91,65 @@ type flowKey struct{ client, local netip.AddrPort }
 type udpFlow struct {
 	link *backendLink
 	last time.Time
+	// unconfirmed: the flow's place in udpFront.unconfirmed until the
+	// client sends to a connection ID of the server's: the one the
+	// backend's first answer named as its own (serverCID), which only one
+	// who got that answer knows, or one with the backend's label (quic-go's
+	// clients move to a new ID, given in an encrypted frame, as soon as the
+	// handshake is done). Until then the flow is pinned by what anyone may
+	// send from any address, and with the table full the oldest such flow
+	// goes for a new one. nil: confirmed.
+	listed     bool       // in udpFront.unconfirmed: not confirmed yet
+	prev, next *udpFlow   // there
+	key        flowKey    // its own, to go from the list
+	route      *flowRoute // nil: plain, no label
+	answered   bool       // the backend's first answer was read
+	serverLen  uint8
+	serverCID  [maxCIDLen]byte
+}
+
+// password is the salamander password of the flow's packets, nil if none.
+func (fl *udpFlow) password() []byte {
+	if fl.route == nil {
+		return nil
+	}
+	return fl.route.password
+}
+
+// flowList is the flows not confirmed yet, oldest first, linked through
+// them: no allocation of its own.
+type flowList struct {
+	head, tail *udpFlow
+	n          int
+}
+
+func (l *flowList) push(fl *udpFlow) {
+	fl.prev, fl.next, fl.listed = l.tail, nil, true
+	if l.tail != nil {
+		l.tail.next = fl
+	} else {
+		l.head = fl
+	}
+	l.tail = fl
+	l.n++
+}
+
+func (l *flowList) remove(fl *udpFlow) {
+	if !fl.listed {
+		return
+	}
+	if fl.prev != nil {
+		fl.prev.next = fl.next
+	} else {
+		l.head = fl.next
+	}
+	if fl.next != nil {
+		fl.next.prev = fl.prev
+	} else {
+		l.tail = fl.prev
+	}
+	fl.prev, fl.next, fl.listed = nil, nil, false
+	l.n--
 }
 
 // pendingFlow holds Initials whose ClientHello is not complete yet, per
@@ -127,6 +203,8 @@ const (
 	pendingPacketCost = 48
 	pendingFrameCost  = 48
 	maxUDPFlows       = 1 << 18
+	// maxCIDLen: RFC 9000 §17.2.
+	maxCIDLen = 20
 	// cidFlowRate and cidFlowBurst bound the flows a source (an IPv4
 	// address, an IPv6 /64) pins by a label: a client whose address
 	// changes pins one per connection, a CGNAT address a few for all its
@@ -140,7 +218,8 @@ const (
 
 func newUDPFront(c *FrontUDP, backends map[string]BackendRef, log *Logger) (*udpFront, error) {
 	f := &udpFront{log: log, idle: 60 * time.Second, byName: map[string]*backendLink{}, links: map[string]*backendLink{},
-		sockets: map[netip.AddrPort]*net.UDPConn{}, flows: map[flowKey]*udpFlow{}, pending: map[flowKey]*pendingFlow{}}
+		sockets: map[netip.AddrPort]*net.UDPConn{}, flows: map[flowKey]*udpFlow{}, pending: map[flowKey]*pendingFlow{},
+		maxFlows: maxUDPFlows}
 	if d, err := time.ParseDuration(c.Idle); err == nil && d > 0 {
 		f.idle = d
 	}
@@ -195,8 +274,13 @@ func newUDPFront(c *FrontUDP, backends map[string]BackendRef, log *Logger) (*udp
 			}
 			route := salamanderRoute{password: password, link: link(r.Backend)}
 			route.label, route.codec = key(r.Backend)
+			route.flow = &flowRoute{password: password, codec: route.codec, label: route.label}
 			f.salamander = append(f.salamander, route)
 		}
+	}
+	f.plainRoutes = map[*backendLink]*flowRoute{}
+	for _, r := range f.byLabel {
+		f.plainRoutes[r.link] = &flowRoute{codec: r.codec, label: r.label}
 	}
 	if keys != nil {
 		labels := len(f.byLabel)
@@ -265,7 +349,7 @@ func (f *udpFront) expire(now time.Time) {
 	defer f.access.Unlock()
 	for k, fl := range f.flows {
 		if now.Sub(fl.last) > f.idle {
-			delete(f.flows, k)
+			f.unpin(k)
 		}
 	}
 	for k, p := range f.pending {
@@ -296,25 +380,15 @@ func (f *udpFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 		datagram := buffer[:n]
 		now := time.Now()
 
-		f.access.Lock()
-		flow := f.flows[key]
-		if flow != nil {
-			flow.last = now
-		}
-		f.access.Unlock()
-		if flow != nil {
-			flow.link.send(encodePacket(message, client, local, datagram))
+		if link := f.pinned(key, datagram, now); link != nil {
+			link.send(encodePacket(message, client, local, datagram))
 			continue
 		}
 		link, packets := f.classify(key, datagram, now)
 		if link == nil {
 			continue
 		}
-		f.access.Lock()
-		if len(f.flows) < maxUDPFlows {
-			f.flows[key] = &udpFlow{link: link, last: now}
-		}
-		f.access.Unlock()
+		f.pin(key, link, datagram, now)
 		for _, p := range packets {
 			link.send(encodePacket(message, client, local, p))
 		}
@@ -550,12 +624,169 @@ func (f *udpFront) answer(client, local netip.AddrPort, payload []byte) {
 	if conn == nil {
 		return
 	}
-	f.access.Lock()
-	if fl := f.flows[flowKey{client, local}]; fl != nil {
-		fl.last = time.Now()
-	}
-	f.access.Unlock()
+	f.answered(flowKey{client, local}, payload, time.Now())
 	_, _ = conn.WriteToUDPAddrPort(payload, client)
+}
+
+// pinned is the backend of a pinned flow, nil if none: the datagram takes
+// the flow's time, and confirms it if it goes to the connection ID the
+// backend named.
+func (f *udpFront) pinned(key flowKey, d []byte, now time.Time) *backendLink {
+	f.access.Lock()
+	defer f.access.Unlock()
+	fl := f.flows[key]
+	if fl == nil {
+		return nil
+	}
+	fl.last = now
+	if fl.listed && (fl.serverLen > 0 || fl.route != nil && fl.route.codec != nil) && toServer(fl, d) {
+		f.unconfirmed.remove(fl)
+	}
+	return fl.link
+}
+
+// pin pins a flow to link by d, the datagram that classified it. With the
+// table full the oldest flow not confirmed yet goes; if every flow is
+// confirmed, this one is not pinned (its datagrams classify one by one).
+func (f *udpFront) pin(key flowKey, link *backendLink, d []byte, now time.Time) {
+	f.access.Lock()
+	defer f.access.Unlock()
+	if f.flows[key] != nil {
+		return
+	}
+	if len(f.flows) >= f.maxFlows {
+		if f.unconfirmed.head == nil {
+			return
+		}
+		f.unpin(f.unconfirmed.head.key)
+	}
+	fl := &udpFlow{link: link, last: now, key: key, route: f.plainRoutes[link]}
+	if r := f.salamanderFor(link, d); r != nil {
+		fl.route = r.flow
+	}
+	f.unconfirmed.push(fl)
+	f.flows[key] = fl
+}
+
+// unpin forgets a flow. With f.access.
+func (f *udpFront) unpin(key flowKey) {
+	fl := f.flows[key]
+	if fl == nil {
+		return
+	}
+	f.unconfirmed.remove(fl)
+	delete(f.flows, key)
+}
+
+// answered takes the time of a backend's answer on a flow, and of its
+// first answer the server's connection ID: a long header's Source
+// Connection ID, which the client sends to once it has the answer.
+func (f *udpFront) answered(key flowKey, payload []byte, now time.Time) {
+	f.access.Lock()
+	defer f.access.Unlock()
+	fl := f.flows[key]
+	if fl == nil {
+		return
+	}
+	fl.last = now
+	if fl.answered || !fl.listed {
+		return
+	}
+	h, n := openHead(fl.password(), payload, 7+2*maxCIDLen)
+	if n < 7 || h[0]&0x80 == 0 {
+		fl.answered = true // a short header: no ID of its own to read
+		return
+	}
+	if binary.BigEndian.Uint32(h[1:5]) == 0 {
+		return // version negotiation: the next answer
+	}
+	fl.answered = true
+	dl := int(h[5])
+	if dl > maxCIDLen || 6+dl >= n {
+		return
+	}
+	sl := int(h[6+dl])
+	if sl == 0 || sl > maxCIDLen || 7+dl+sl > n {
+		return
+	}
+	fl.serverLen = uint8(copy(fl.serverCID[:], h[7+dl:7+dl+sl]))
+}
+
+// toServer reports whether d, a client's datagram, starts with a packet to
+// a connection ID of the flow's server: the one its first answer named, or
+// one with the flow's label.
+func toServer(fl *udpFlow, d []byte) bool {
+	h, n := openHead(fl.password(), d, 6+maxCIDLen)
+	if want := fl.serverCID[:fl.serverLen]; fl.serverLen > 0 {
+		switch {
+		case n < 1:
+		case h[0]&0x80 != 0: // a long header
+			if n >= 6 && int(h[5]) == len(want) && 6+len(want) <= n && bytes.Equal(h[6:6+len(want)], want) {
+				return true
+			}
+		case h[0]&0x40 != 0: // a short header
+			if 1+len(want) <= n && bytes.Equal(h[1:1+len(want)], want) {
+				return true
+			}
+		}
+	}
+	if fl.route == nil || fl.route.codec == nil {
+		return false
+	}
+	size := len(d)
+	if fl.route.password != nil {
+		size -= 8
+	}
+	id := clientCID(h[:min(n, cidHead)], size)
+	if id == nil {
+		return false
+	}
+	label, ok := fl.route.codec.label(id)
+	return ok && label == fl.route.label
+}
+
+// salamanderFor is the salamander route of link that d opens under (an
+// Initial, or a packet to a label of that route), nil for a plain route.
+func (f *udpFront) salamanderFor(link *backendLink, d []byte) *salamanderRoute {
+	for i := range f.salamander {
+		r := &f.salamander[i]
+		if r.link != link {
+			continue
+		}
+		head, ok := salamanderHead(r.password, d)
+		if !ok {
+			continue
+		}
+		if isQUICInitial(head[:7]) {
+			return r
+		}
+		if r.codec != nil {
+			if id := clientCID(head[:min(len(d)-8, cidHead)], len(d)-8); id != nil {
+				if label, ok := r.codec.label(id); ok && label == r.label {
+					return r
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// openHead is up to n bytes of a datagram's start, opened under salamander
+// with password if there is one, on the stack.
+func openHead(password, d []byte, n int) (h [7 + 2*maxCIDLen]byte, m int) {
+	n = min(n, len(h))
+	if password == nil {
+		return h, copy(h[:n], d)
+	}
+	if len(d) <= 8 {
+		return h, 0
+	}
+	key := salamanderKey(password, d[:8])
+	m = min(n, len(d)-8)
+	for i := range m {
+		h[i] = d[8+i] ^ key[i%len(key)]
+	}
+	return h, m
 }
 
 // probeMTU does on the front's sockets what quic-go does on its own: DF

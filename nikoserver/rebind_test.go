@@ -282,6 +282,13 @@ func (quicgoCIDs) ConnectionIDLen() int { return cidLen }
 // client's address as the server sees it.
 func h3Node(t *testing.T, withCID bool) *net.UDPAddr {
 	t.Helper()
+	_, addr := h3NodeFront(t, withCID)
+	return addr
+}
+
+// h3NodeFront is h3Node with its front.
+func h3NodeFront(t *testing.T, withCID bool) (*udpFront, *net.UDPAddr) {
+	t.Helper()
 	dir := t.TempDir()
 	sock := filepath.Join(dir, "h3.sock")
 	pc := packetBackend(t, sock)
@@ -307,7 +314,12 @@ func h3Node(t *testing.T, withCID bool) *net.UDPAddr {
 	// The socket before the transport: its reader waits on the front's
 	// datagrams, which no deadline wakes.
 	t.Cleanup(func() { srv.Close(); ln.Close(); pc.Close(); tr.Close() })
-	return startUDPFront(t, fc, map[string]BackendRef{"h3": ref})
+	front := runUDPFront(t, fc, map[string]BackendRef{"h3": ref})
+	for _, sock := range front.sockets {
+		return front, sock.LocalAddr().(*net.UDPAddr)
+	}
+	t.Fatal("no socket")
+	return nil, nil
 }
 
 // h3Get asks the server who it thinks the client is.
