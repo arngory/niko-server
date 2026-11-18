@@ -13,7 +13,7 @@ import (
 // The zone apex (zones[].ns): the DNS front answers SOA and NS for the zone
 // itself, and NODATA with the SOA for any other type there, as an
 // authoritative server does. Some resolvers gave SERVFAIL for a delegated
-// zone whose apex had neither (raycontrol docs/13-dns-resolvers.md). The
+// zone whose apex had neither (raycontrol docs/research/dns-resolvers.md). The
 // answers are built as dnstt builds its own: QR and AA, the question as
 // asked, an OPT of 4096 when the query had one. Only for dnstt zones:
 // masterdns answers otherwise.

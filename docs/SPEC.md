@@ -3,7 +3,7 @@
 niko-server — data plane и «наше ядро»: обслуживает протоколы клиента Niko. Управляет им raycontrol (control plane):
 хранит пользователей и ключи, генерирует конфиги niko-server и Xray, ведёт nftables и SPA, ротирует ключи,
 отдаёт подписку и API. Решения raycontrol главнее этого документа: при расхождении действует
-[`docs/08-decisions.md`](https://github.com/arngory/raycontrol/blob/claude/clever-feynman-w0e2v1/docs/08-decisions.md).
+[`docs/decisions.md`](https://github.com/arngory/raycontrol/blob/main/docs/decisions.md).
 
 Ответы на вопросы raycontrol и черновики контрактов: [`RAYCONTROL.md`](https://github.com/arngory/niko/blob/claude/intelligent-allen-0oa8na/docs/server/RAYCONTROL.md), [`CONFIG.md`](CONFIG.md), [`IPC.md`](IPC.md).
 
@@ -14,7 +14,7 @@ niko-server — data plane и «наше ядро»: обслуживает пр
 | Приложение (клиент) | `arngory/niko`, ветка `claude/intelligent-allen-0oa8na` |
 | Ядро и niko-server (форк sing-box 1.14.4) | `arngory/sing-box`, та же ветка, `cmd/niko-server`; коммит клиента — `COMMIT_SING_BOX` в `buildScript/lib/core/get_source_env.sh` |
 | raycontrol (control plane) | `arngory/raycontrol`, ветка `claude/clever-feynman-w0e2v1` |
-| SPA v2 | [`docs/spec/spa-v2.md`](https://github.com/arngory/raycontrol/blob/claude/clever-feynman-w0e2v1/docs/spec/spa-v2.md) в raycontrol (заморожен) |
+| SPA v2 | [`docs/spec/spa-v2.md`](https://github.com/arngory/raycontrol/blob/main/docs/spec/spa-v2.md) в raycontrol (заморожен) |
 | Xray (REALITY, `inner`) | `arngory/xray-core`, закреплён в `.github/xray-interop.env` (v26.10.31) |
 | Проверка клиента против Xray | `.github/workflows/xray-interop.yml` в `arngory/niko` |
 | Проверка Yggdrasil на публичных пирах | `.github/workflows/ygg-probe.yml` в `arngory/niko` |
@@ -420,7 +420,7 @@ PING клиента: при keepalive клиента меньше половин
 
 ### 3.5. SPA
 
-SPA v2 — [`spa-v2.md`](https://github.com/arngory/raycontrol/blob/claude/clever-feynman-w0e2v1/docs/spec/spa-v2.md):
+SPA v2 — [`spa-v2.md`](https://github.com/arngory/raycontrol/blob/main/docs/spec/spa-v2.md):
 ключи устройств по эпохам, порт по слотам, scope и время внутри пакета XChaCha20-Poly1305. Пакеты принимает
 `rayspa` через NFLOG и добавляет адрес в allow-наборы портов из scope. niko-server в SPA не участвует.
 
