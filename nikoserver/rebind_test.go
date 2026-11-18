@@ -463,7 +463,7 @@ func TestNekoServerQUICRebind(t *testing.T) {
 // neither makes it the active one nor retires the old one (path_manager.go
 // SwitchToPath), so the spares run out; at the third move it skips the
 // validation ("no connection ID is available") and never moves. When quic-go
-// is fixed (raycontrol docs/04-roadmap.md), this test fails: lift the limit
+// is fixed (raycontrol docs/roadmap.md), this test fails: lift the limit
 // here and in spec quic-cid-route-v1 §5.
 func TestNekoServerQUICRebindLimit(t *testing.T) {
 	for _, c := range []struct {
