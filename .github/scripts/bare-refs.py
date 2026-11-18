@@ -1,12 +1,13 @@
-"""Bare issue references in what a change brings to main (CONTRIBUTING.md, «Сообщения коммитов»).
+"""Bare issue references in the commits a change brings (CONTRIBUTING.md, «Сообщения коммитов»).
 
 GitHub links a bare #N in a commit message to an issue, and in a fork with its issues off to the parent's: Niko's
 commits on its task 148 showed up in MatsuriDayo/NekoBoxForAndroid's issue 148. owner/repo#N links where it says,
 and «задача N» links nowhere.
 
-Usage: bare-refs.py BASE HEAD (the commits of BASE..HEAD), the pull request's title and description in PR_TITLE and
-PR_BODY if set (a squash merge makes its commit of them). Prints each bare reference with where it is; exit status 1
-if there is one.
+Usage: bare-refs.py [--first-parent] BASE HEAD (the commits of BASE..HEAD), the pull request's title and description
+in PR_TITLE and PR_BODY if set (a squash merge makes its commit of them). --first-parent takes the commits of the
+pull request's own line only: in a fork, upstream's commits come in by a merge, and their #N are upstream's and link
+to upstream's issues as meant. Prints each bare reference with where it is; exit status 1 if there is one.
 """
 
 import os
@@ -27,9 +28,9 @@ def bare(label, text):
     return found
 
 
-def commits(base, head):
+def commits(base, head, first_parent=False):
     out = subprocess.run(
-        ["git", "log", "--format=%H%x00%B%x00", f"{base}..{head}"],
+        ["git", "log", *(["--first-parent"] if first_parent else []), "--format=%H%x00%B%x00", f"{base}..{head}"],
         check=True, capture_output=True, text=True,
     ).stdout
     fields = out.split("\0")
@@ -38,10 +39,14 @@ def commits(base, head):
 
 
 def main():
-    if len(sys.argv) != 3:
-        sys.exit("usage: bare-refs.py BASE HEAD")
+    args = sys.argv[1:]
+    first_parent = args[:1] == ["--first-parent"]
+    if first_parent:
+        args = args[1:]
+    if len(args) != 2:
+        sys.exit("usage: bare-refs.py [--first-parent] BASE HEAD")
     found = []
-    for sha, message in commits(sys.argv[1], sys.argv[2]):
+    for sha, message in commits(args[0], args[1], first_parent):
         found += bare(f"commit {sha[:12]}", message)
     for name, label in (("PR_TITLE", "the pull request's title"), ("PR_BODY", "the pull request's description")):
         found += bare(label, os.environ.get(name, ""))

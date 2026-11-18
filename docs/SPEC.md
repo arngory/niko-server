@@ -247,11 +247,11 @@ PING клиента: при keepalive клиента меньше половин
 - Оба туннеля не открывают соединений к произвольным адресам: каждый поток идёт в бэкенд `inner` (§3.9).
   Клиент поднимает VLESS с ML-KEM-768 к `inner` внутри туннеля.
 
-**dnstt** (`arngory/dnstt`, от `master` = v1.20260501.0):
+**dnstt** (апстрим v1.20260501.0, вендорен в `third_party/dnstt`, `replace` в `go.mod`; серверная часть — `dnsttserver/`):
 1. Вынести серверную часть в библиотеку: `server.Run(ctx, Options{Domain, PrivKey, PacketConn, Upstream func() (net.Conn, error)})`.
 2. `PacketConn` — виртуальный от IPC, `Upstream` — соединение с `inner` через unix-сокет.
 
-**MasterDnsVPN** (`arngory/MasterDnsVPN`, `main`):
+**MasterDnsVPN** (`third_party/masterdnsvpn` форка `arngory/sing-box`, закреплён в `go.mod`):
 1. Добавить серверу `SetPacketConnFactory` (для клиента такой патч уже есть: `SetListenerFactory`).
 2. Режим `PROTOCOL_TYPE = "TCP"` с фиксированным upstream = `inner`. Режим `SOCKS5` на ноде не используется.
 3. `DATA_ENCRYPTION_METHOD` = **5** (AES-256-GCM). Нода разрешает только AEAD (raycontrol R1-8): метод 2 у MasterDnsVPN — ChaCha20 без аутентификации. Ключ — файл с 32 символами через `LoadCredential=`; niko-server его только читает и никогда не генерирует.
@@ -499,8 +499,7 @@ systemd credentials (TPM при наличии), systemd-resolved stub выкл�
 |---|---|---|
 | `arngory/sing-box` | ядро клиента и niko-server | есть |
 | `arngory/xray-core` | REALITY, `inner`, эталон для тестов | есть |
-| `arngory/dnstt` | серверная библиотека (§3.3) | есть: зеркало апстрима, работа от `master` (v1.20260501.0) |
-| `arngory/MasterDnsVPN` | сервер с внешним PacketConn | есть, `main` (сервер в `cmd/server`, `internal/`) |
+| `arngory/dnstt`, `arngory/MasterDnsVPN` | — | копии апстримов без наших правок; сейчас **не ориентир** для сборки и разработки. Код: dnstt — `third_party/dnstt` (апстрим v1.20260501.0), MasterDnsVPN — `third_party/masterdnsvpn` форка `arngory/sing-box` (§3.3) |
 | sing-quic | сервер Hysteria2 | вендорен в `third_party/sing-quic` (`replace` в `go.mod`, с версии v0.6.0). Правки помечены `neko`: хук соединений с пользователем, статистикой QUIC и Brutal и (v0.15.0) способом закрыть соединение, атомарная доля подтверждённых у Brutal, атомарная замена таблицы пользователей (раньше запись без блокировки гонялась с чтением), salamander без побайтового цикла и без обрезки полного пакета до 1444 байт (v0.7.1), номер UDP-сессии у её соединения (`SessionID`, v0.17.0: по нему отказ сессии считается один раз), закончившееся соединение UDP-сессии убирает из таблицы сессий только себя (v0.17.0: датаграмма того же номера между отменой и удалением заводила новое, и старое его удаляло — новое жило дальше невидимым до конца простоя), `QUICOptions.DisableKeepAlive` (v0.18.2: сторона без своего keepalive; в тестах — замолчавший клиент) |
 | `arngory/yggdrasil-go` | патч `LinkDialer` (исходящие линки через дозвонщик встраивающей программы); `DebugPrivacy` (без ответов на удалённые getSelf, getPeers, getTree); ipv6rwc: Packet Too Big только на адрес, сверенный с ключом отправителя | есть: 0.5.15 с патчем в `develop` ([#1](https://github.com/arngory/yggdrasil-go/pull/1)); `DebugPrivacy` — `9ba3c0a`, Packet Too Big только своему (ipv6rwc) — `5afe92f`, оба в `claude/clever-feynman-w0e2v1`. niko-server берёт ядро отсюда (`replace` в `go.mod`, `5afe92f` с v0.15.0); клиенту — перейти с `sing-box/third_party/yggdrasil-go` на этот форк |
 | `arngory/naiveproxy` | клиент naive для тестов и плагин Android | есть, Chromium 154.0.8037.49; в `apk/` — сборка плагина (свой ключ подписи) |
