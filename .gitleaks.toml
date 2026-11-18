@@ -1,0 +1,14 @@
+# gitleaks (checks.yml, job Secrets): its default rules on a pull request's commits. The check reads this file as
+# main has it, so a change here is a pull request of its own and counts from the next one; gitleaks:allow comments
+# are not taken.
+#
+# A false finding, say a test's throwaway key, goes to an allowlist here, with where the key comes from, for example:
+#
+# [[allowlists]]
+# description = "the throwaway keys of a test, generated for it"
+# paths = ['''^nikoserver/testdata/''']
+
+title = "niko-server"
+
+[extend]
+useDefault = true

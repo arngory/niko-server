@@ -3,12 +3,20 @@ name: CI
 # niko-server end to end: the DNS front, the dnstt and masterdns backends and
 # the inner stage on Xray, with the Niko client core through both tunnels.
 on:
+  # main after a merge, and pull requests (CONTRIBUTING.md): a branch's own push is not run as well, so a commit
+  # gets one full run
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
   workflow_dispatch:
   # release.yml
   workflow_call:
+
+# a newer push to the same pull request or branch cancels the run it supersedes; release.yml's call is in its own
+# group (github.workflow is the caller's there)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -167,3 +175,18 @@ jobs:
           for f in inner dns mdns front client; do echo "--- $f"; tail -n 20 /tmp/$f.log 2>/dev/null || true; done
           pkill -x xray || true; pkill -x niko-server || true; pkill -x sing-box || true
 
+  # The one check the ruleset on main asks of CI: green when every job above passed or was skipped.
+  result:
+    name: CI result
+    if: always()
+    needs: [govulncheck, integration]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "jobs: $RESULTS"
+          for r in $RESULTS; do
+            case "$r" in success|skipped) ;; *) echo "a job ended $r"; exit 1 ;; esac
+          done

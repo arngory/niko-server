@@ -1,0 +1,77 @@
+name: Checks
+
+# What a pull request brings to main, before the build (CONTRIBUTING.md): its messages and its secrets. Light, and
+# run on an edit of the title or the description too, which a squash merge makes main's commit of; the ruleset on
+# main asks for "Commit messages" and "Secrets" beside ci.yml's "CI result". A push to main is not checked again:
+# its pull request was, and what was pushed stays as it is
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+# one run per pull request: a newer push or edit cancels the run it supersedes
+concurrency:
+  group: checks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # no bare #N in the commits, the title or the description: in a fork GitHub links a bare #N to the parent's issues
+  commits:
+    name: Commit messages
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # the commits the pull request brings: those of its head not on its base as the base is now (the event's
+      # base.sha can be older, and main's commits since would count). The script is the base's, not the pull
+      # request's (the pull request's only while the base has none)
+      - env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          script="$RUNNER_TEMP/bare-refs.py"
+          git show "origin/$BASE_REF:.github/scripts/bare-refs.py" > "$script" 2> /dev/null ||
+            cp .github/scripts/bare-refs.py "$script"
+          python3 -I "$script" "origin/$BASE_REF" "$HEAD"
+
+  # keys and tokens in the pull request's commits: gitleaks from its module (sum.golang.org checks what go install
+  # takes), findings shown redacted. Its rules and ignored findings are the base's .gitleaks.toml and .gitleaksignore,
+  # not the pull request's (gitleaks reads a .gitleaksignore at the root of what it scans by itself, so the pull
+  # request's goes), and a gitleaks:allow comment is not taken: an exception is a pull request of its own and counts
+  # from the next one. Everything else this file runs is fixed here or the base's (the commits job's script, this
+  # job's Go), so what it does not cover is the workflow itself: a pull request that changes this file changes its
+  # own checks (CONTRIBUTING.md: another's such pull request the owner merges)
+  secrets:
+    name: Secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # the Go that builds gitleaks is this file's, not a go.mod's the pull request can change
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.11"
+          cache: false
+      - env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          config="$RUNNER_TEMP/gitleaks.toml" ignore="$RUNNER_TEMP/gitleaksignore"
+          if ! git show "origin/$BASE_REF:.gitleaks.toml" > "$config" 2> /dev/null; then
+            printf '[extend]\nuseDefault = true\n' > "$config"
+          fi
+          git show "origin/$BASE_REF:.gitleaksignore" > "$ignore" 2> /dev/null || : > "$ignore"
+          rm -f .gitleaks.toml .gitleaksignore
+          GOBIN="$RUNNER_TEMP/bin" go install github.com/zricethezav/gitleaks/v8@v8.30.1
+          "$RUNNER_TEMP/bin/gitleaks" git --no-banner --redact --verbose --config "$config" --ignore-gitleaks-allow \
+            --gitleaks-ignore-path "$ignore" --log-opts="origin/$BASE_REF..$HEAD" .
