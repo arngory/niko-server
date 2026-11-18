@@ -1,5 +1,7 @@
 # niko-server
 
+English | [Русский](README.ru.md)
+
 Data plane of a [raycontrol](https://github.com/arngory/raycontrol) node. Its front takes the clients' traffic on
 UDP 53, TCP 443 and UDP 443 and hands each connection to a protocol backend (DNS tunnels, Hysteria2, Yggdrasil, or a
 socket of raycontrol's own services); the backends pass the streams on to the node's inner stage. raycontrol writes
@@ -24,12 +26,5 @@ client core of Niko through every tunnel.
 
 - [docs/README.md](docs/README.md): specification, configs, IPC, release notes.
 - [CONTRIBUTING.md](CONTRIBUTING.md): branches, checks and releases.
-
----
-
-**По-русски.** niko-server — data plane ноды [raycontrol](https://github.com/arngory/raycontrol): фронт на UDP 53,
-TCP 443 и UDP 443 раздаёт соединения клиентов бэкендам протоколов (DNS-туннели, Hysteria2, Yggdrasil, сокеты
-сервисов raycontrol), а те — во внутреннюю ступень ноды. Конфиги пишет и запускает его raycontrol. Сборка — выше,
-документы — [docs/README.md](docs/README.md), правила — [CONTRIBUTING.md](CONTRIBUTING.md).
 
 License: GPL-3.0-or-later, see [LICENSE](LICENSE); inside: dnstt (CC0), MasterDnsVPN (MIT), sing (GPL-3.0).
