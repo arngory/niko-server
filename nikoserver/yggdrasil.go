@@ -40,6 +40,7 @@ import (
 	"github.com/sagernet/gvisor/pkg/waiter"
 	sbtls "github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/option"
+	"github.com/yggdrasil-network/yggdrasil-go/src/address"
 	"github.com/yggdrasil-network/yggdrasil-go/src/core"
 	"github.com/yggdrasil-network/yggdrasil-go/src/ipv6rwc"
 	"golang.org/x/crypto/blake2b"
@@ -147,7 +148,7 @@ func runYggdrasil(ctx context.Context, c *BackendConfig, log *Logger) error {
 	for _, port := range c.Options.ExitPorts {
 		exits[uint16(port)] = true
 	}
-	serveExits(s, exits, c.Inner, log)
+	serveExits(s, exits, c.Inner, users.exits, log)
 
 	ln, err := ListenFD(c.Socket, c.FrontUID, log)
 	if err != nil {
@@ -267,6 +268,9 @@ type yggUsers struct {
 	// peers (yggRule.linked): swapped whole as a key gets its first link or
 	// loses its last.
 	linked atomic.Pointer[yggKeys]
+	// addrs are the addresses and /64 subnets of the users' keys: the
+	// only sources the exits take (serveExits), swapped whole.
+	addrs atomic.Pointer[yggAddrs]
 
 	mu    sync.Mutex
 	keys  map[[32]byte]string
@@ -289,9 +293,20 @@ func (u *yggUsers) set(keys map[[32]byte]string) (dropped, grouped int) {
 			groups[key] = byName[name]
 		}
 	}
+	addrs := yggAddrs{}
+	for key := range keys {
+		if key == u.node {
+			continue
+		}
+		addrs[netip.AddrFrom16(*address.AddrForKey(ed25519.PublicKey(key[:])))] = true
+		var sub [16]byte
+		copy(sub[:], address.SubnetForKey(ed25519.PublicKey(key[:]))[:])
+		addrs[netip.AddrFrom16(sub)] = true
+	}
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.groups.Store(&groups)
+	u.addrs.Store(&addrs)
 	u.keys = keys
 	gone := false
 	for key, conns := range u.links {
@@ -309,6 +324,26 @@ func (u *yggUsers) set(keys map[[32]byte]string) (dropped, grouped int) {
 		u.relink()
 	}
 	return dropped, len(groups)
+}
+
+// yggAddrs are addresses of the users' keys, and their subnets' first
+// addresses (the /64 with the rest zero).
+type yggAddrs map[netip.Addr]bool
+
+// exits says whether src may reach the node's exits: an address of a user's
+// key or in one's subnet. The mesh binds an address to its key (ipv6rwc
+// takes from a key only its own addresses): with public peers anyone on the
+// mesh reaches the node's address, and gets past none but its own users.
+func (u *yggUsers) exits(src netip.Addr) bool {
+	a := u.addrs.Load()
+	if a == nil {
+		return false
+	}
+	if (*a)[src] {
+		return true
+	}
+	sub, _ := src.Prefix(64)
+	return (*a)[sub.Addr()]
 }
 
 // group is G of the link filter (raycontrol lan-v1 §2.2): the keys' LAN
@@ -611,17 +646,22 @@ func yggNetstack(ctx context.Context, rwc io.ReadWriter, address netip.Addr, mtu
 	return s, nil
 }
 
-// serveExits takes TCP to the exit ports of the node's address to inner;
-// any other port gets a reset, UDP nothing.
-func serveExits(s *stack.Stack, exits map[uint16]bool, inner string, log *Logger) {
+// serveExits takes TCP to the exit ports of the node's address to inner,
+// from the sources allowed lets through, at most yggExitsMax at once and
+// yggExitsPerSource from one: each holds a socket to inner before its
+// client says who it is, which inner's limits count only then.
+func serveExits(s *stack.Stack, exits map[uint16]bool, inner string, allowed func(netip.Addr) bool, log *Logger) {
+	open := &yggExitCount{by: map[netip.Addr]int{}}
 	fwd := tcp.NewForwarder(s, 0, 1024, func(r *tcp.ForwarderRequest) {
-		if !exits[r.ID().LocalPort] {
+		src := netip.AddrFrom16(r.ID().RemoteAddress.As16())
+		if !exits[r.ID().LocalPort] || !allowed(src) || !open.take(src) {
 			r.Complete(true)
 			return
 		}
 		var wq waiter.Queue
 		ep, terr := r.CreateEndpoint(&wq)
 		if terr != nil {
+			open.done(src)
 			r.Complete(true)
 			return
 		}
@@ -631,9 +671,43 @@ func serveExits(s *stack.Stack, exits map[uint16]bool, inner string, log *Logger
 		idle, interval := tcpip.KeepaliveIdleOption(time.Minute), tcpip.KeepaliveIntervalOption(15*time.Second)
 		_ = ep.SetSockOpt(&idle)
 		_ = ep.SetSockOpt(&interval)
-		go exitToInner(gonet.NewTCPConn(&wq, ep), inner, log)
+		go func() {
+			defer open.done(src)
+			exitToInner(gonet.NewTCPConn(&wq, ep), inner, log)
+		}()
 	})
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, fwd.HandlePacket)
+}
+
+// The exits open at once: in all, and from one source. Above a user's limit
+// of TCP at once in inner (raycontrol conn-limit-v1, 1024), which answers
+// first, with its reason.
+const yggExitsMax, yggExitsPerSource = 8192, 1100
+
+type yggExitCount struct {
+	mu    sync.Mutex
+	total int
+	by    map[netip.Addr]int
+}
+
+func (c *yggExitCount) take(src netip.Addr) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.total >= yggExitsMax || c.by[src] >= yggExitsPerSource {
+		return false
+	}
+	c.total++
+	c.by[src]++
+	return true
+}
+
+func (c *yggExitCount) done(src netip.Addr) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.total--
+	if c.by[src]--; c.by[src] <= 0 {
+		delete(c.by, src)
+	}
 }
 
 func exitToInner(c *gonet.TCPConn, inner string, log *Logger) {

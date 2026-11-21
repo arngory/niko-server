@@ -352,6 +352,31 @@ func lanIsolation(ctx context.Context, t *testing.T) {
 		}
 	})
 
+	// A public peer brings in the whole mesh: a device on it with no key
+	// in the users file reaches the node's address, and not its exits; a
+	// user's device on the mesh does (protocol review 2026-11).
+	t.Run("exits users only", func(t *testing.T) {
+		t.Parallel()
+		p, peer := newLANPublicDevice(t, ctx)
+		n := startYggNode(t, ctx, func(c *BackendConfig) { c.Options.Peers = []string{peer} })
+		m := newLANDevice(t, ctx, n)
+		n.setLAN(t, yggDevice{m.key, ""})
+		m.up(t)
+		if !waitFor(15*time.Second, func() bool { return peerUp(p.core) }) {
+			t.Fatal("the node never dialed its public peer")
+		}
+		if !m.exits(ctx, n) {
+			t.Fatal("a user's device does not exit")
+		}
+		if p.exits(ctx, n) {
+			t.Fatal("a device of the mesh not in the users file exits")
+		}
+		n.setLAN(t, yggDevice{m.key, ""}, yggDevice{p.key, ""})
+		if !p.exits(ctx, n) {
+			t.Fatal("a user's device on the mesh does not exit")
+		}
+	})
+
 	// lan_relay_mbps 0: two devices of one group do not reach each other
 	// through the node; both reach the node.
 	t.Run("relay 0", func(t *testing.T) {

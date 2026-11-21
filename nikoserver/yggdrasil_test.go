@@ -639,3 +639,62 @@ func TestNekoServerYggdrasilPacketTooBig(t *testing.T) {
 		t.Fatal("bob got alice's bytes from the node")
 	}
 }
+
+// The exits' count: at most yggExitsPerSource from one source, yggExitsMax
+// in all, and a place frees when an exit ends.
+func TestYggExitCount(t *testing.T) {
+	c := &yggExitCount{by: map[netip.Addr]int{}}
+	one := netip.MustParseAddr("200::1")
+	for i := range yggExitsPerSource {
+		if !c.take(one) {
+			t.Fatalf("exit %d refused", i)
+		}
+	}
+	if c.take(one) {
+		t.Fatal("one source past its share")
+	}
+	c.done(one)
+	if !c.take(one) {
+		t.Fatal("a place freed, yet refused")
+	}
+	for i := 0; c.total < yggExitsMax; i++ {
+		if !c.take(netip.AddrFrom16([16]byte{0x02, 12: 0xaa, 13: byte(i >> 16), 14: byte(i >> 8), 15: byte(i)})) {
+			t.Fatalf("exit %d of %d refused", c.total, yggExitsMax)
+		}
+	}
+	if c.take(netip.MustParseAddr("200::ffff")) {
+		t.Fatal("past the total")
+	}
+}
+
+// The users' addresses and subnets pass, others do not.
+func TestYggExitsAllowed(t *testing.T) {
+	pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	other, _, _ := ed25519.GenerateKey(rand.Reader)
+	u := &yggUsers{relay: newYggRelay(0)}
+	if u.exits(netip.AddrFrom16(*address.AddrForKey(pub))) {
+		t.Fatal("no users yet, yet an address passes")
+	}
+	u.set(map[[32]byte]string{[32]byte(pub): ""})
+	sub := address.SubnetForKey(pub)
+	var in [16]byte
+	copy(in[:], sub[:])
+	in[15] = 7
+	for _, c := range []struct {
+		addr netip.Addr
+		want bool
+	}{
+		{netip.AddrFrom16(*address.AddrForKey(pub)), true},
+		{netip.AddrFrom16(in), true},
+		{netip.AddrFrom16(*address.AddrForKey(other)), false},
+		{netip.MustParseAddr("200::1"), false},
+	} {
+		if got := u.exits(c.addr); got != c.want {
+			t.Errorf("%v: %v, want %v", c.addr, got, c.want)
+		}
+	}
+	u.set(map[[32]byte]string{})
+	if u.exits(netip.AddrFrom16(*address.AddrForKey(pub))) {
+		t.Fatal("a removed user's address passes")
+	}
+}
