@@ -96,7 +96,7 @@ replace masterdnsvpn-go => github.com/arngory/sing-box/third_party/masterdnsvpn 
 
 replace github.com/yggdrasil-network/yggdrasil-go => github.com/arngory/yggdrasil-go v0.5.16-0.20261108201637-5afe92f15200
 
-// ironwood from the fork (b3dc58f on upstream's 0712ecc): a repeated session
+// ironwood from the fork (de48fd0 on upstream's 0712ecc): a repeated session
 // init gets its first ack again, while nothing came over the session, so the
 // first contact of a device no longer hangs a minute when that ack was lost
 // (found and fixed by the client, arngory/niko); a window of 8128 nonces
@@ -106,8 +106,11 @@ replace github.com/yggdrasil-network/yggdrasil-go => github.com/arngory/yggdrasi
 // the size check, and any peer of a session crashed the process with one
 // (arngory/ironwood#1); at a ratchet step the new receive key keeps the strict
 // mark it had as the next key, and the minute of packets before the step no
-// longer opens again (arngory/ironwood#2). The wire is the same.
-replace github.com/Arceliar/ironwood => github.com/arngory/ironwood v0.0.0-20261121225107-b3dc58fc31ba
+// longer opens again (arngory/ironwood#2); a peer's init keeps the replay
+// state of the keys that stay receive keys, and a re-init no longer opens
+// again what the peer sent before it, as upstream did (arngory/ironwood#3).
+// The wire is the same.
+replace github.com/Arceliar/ironwood => github.com/arngory/ironwood v0.0.0-20261121231825-de48fd05dcfe
 
 replace github.com/sagernet/sing-quic => ./third_party/sing-quic
 
