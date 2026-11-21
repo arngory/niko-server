@@ -253,7 +253,7 @@ func TestYggStatsTraffic(t *testing.T) {
 func TestYggUsersLAN(t *testing.T) {
 	dir := t.TempDir()
 	k1, k2, k3 := strings.Repeat("a1", 32), strings.Repeat("b2", 32), strings.Repeat("c3", 32)
-	read := func(users ...string) (map[[32]byte]string, error) {
+	read := func(users ...string) (map[[32]byte]yggEntry, error) {
 		path := filepath.Join(dir, "users.json")
 		if err := os.WriteFile(path, []byte(`{"users":[`+strings.Join(users, ",")+`]}`), 0o600); err != nil {
 			t.Fatal(err)
@@ -275,8 +275,9 @@ func TestYggUsersLAN(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := func(h string) [32]byte { b, _ := hex.DecodeString(h); return [32]byte(b) }
-	if len(keys) != 5 || keys[key(k1)] != "u5" || keys[key(k2)] != "u5" || keys[key(k3)] != "" ||
-		keys[key(strings.Repeat("d4", 32))] != "" || keys[key(strings.Repeat("e5", 32))] != longest {
+	if len(keys) != 5 || keys[key(k1)] != (yggEntry{"u5", "u5"}) || keys[key(k2)] != (yggEntry{"u5", "u5"}) ||
+		keys[key(k3)] != (yggEntry{"", "u6"}) || keys[key(strings.Repeat("d4", 32))] != (yggEntry{"", "u7"}) ||
+		keys[key(strings.Repeat("e5", 32))] != (yggEntry{longest, "u8"}) {
 		t.Fatalf("keys %v", keys)
 	}
 	for name, lan := range map[string]string{
@@ -310,7 +311,7 @@ func TestYggUsersGroups(t *testing.T) {
 	if u.group() != nil {
 		t.Fatal("groups before the first reading")
 	}
-	u.set(map[[32]byte]string{keyK: "u5", keyG: "u5", keyA: "u6", keyN: "u5"})
+	u.set(map[[32]byte]yggEntry{keyK: {lan: "u5"}, keyG: {lan: "u5"}, keyA: {lan: "u6"}, keyN: {lan: "u5"}})
 	rule := yggRule{node: keyN, key: keyK, groups: u.group}
 	g := u.group()
 	if g[keyK] == nil || g[keyK] != g[keyG] || g[keyA] == g[keyK] || g[keyN] != nil {
@@ -318,7 +319,7 @@ func TestYggUsersGroups(t *testing.T) {
 	}
 	// Nor does the node's key make a group of its own.
 	other := &yggUsers{node: keyN, relay: newYggRelay(20)}
-	if other.set(map[[32]byte]string{keyK: "u5", keyN: "u9"}); len(other.relay.traffic().Users) != 1 {
+	if other.set(map[[32]byte]yggEntry{keyK: {lan: "u5"}, keyN: {lan: "u9"}}); len(other.relay.traffic().Users) != 1 {
 		t.Fatalf("the node's key made a group: %v", other.relay.traffic().Users)
 	}
 	n, gk, ka := keyN, keyG, keyA
@@ -355,7 +356,7 @@ func TestYggUsersGroups(t *testing.T) {
 	u.leave(keyK, second)
 	linked(keyK, keyG, keyA)
 	// K moves to u6, G leaves.
-	dropped, grouped := u.set(map[[32]byte]string{keyK: "u6", keyA: "u6"})
+	dropped, _, grouped := u.set(map[[32]byte]yggEntry{keyK: {lan: "u6"}, keyA: {lan: "u6"}})
 	if dropped != 1 || grouped != 2 || conns[keyK].closed || !conns[keyG].closed || conns[keyA].closed {
 		t.Fatalf("dropped %d, grouped %d; closed K %v G %v A %v", dropped, grouped, conns[keyK].closed, conns[keyG].closed, conns[keyA].closed)
 	}
@@ -366,7 +367,7 @@ func TestYggUsersGroups(t *testing.T) {
 		t.Fatal("the new groups are not seen")
 	}
 	// K out of any group: its link stays, it reaches N only.
-	if dropped, _ := u.set(map[[32]byte]string{keyK: "", keyA: "u6"}); dropped != 0 || conns[keyK].closed {
+	if dropped, _, _ := u.set(map[[32]byte]yggEntry{keyK: {}, keyA: {lan: "u6"}}); dropped != 0 || conns[keyK].closed {
 		t.Fatal("K's link closed as it left its group")
 	}
 	if passes(&keyK, &ka) || !passes(&keyK, &n) {
@@ -385,7 +386,7 @@ func TestYggUsersGroups(t *testing.T) {
 // where it comes in from G.
 func TestYggLinksRule(t *testing.T) {
 	u := &yggUsers{node: keyN, relay: newYggRelay(20)}
-	u.set(map[[32]byte]string{keyK: "u5", keyG: "u5"})
+	u.set(map[[32]byte]yggEntry{keyK: {lan: "u5"}, keyG: {lan: "u5"}})
 	for _, k := range [][32]byte{keyK, keyG} {
 		u.admit(k, &closeConn{})
 	}
