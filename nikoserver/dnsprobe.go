@@ -37,13 +37,15 @@ const (
 	probeRate, probeBurst             = 20, 40
 	probeGlobalRate, probeGlobalBurst = 400, 800
 	probeSmallCost, probeLargeCost    = 1, 8
-	// probeAnswersMax: answers to one label, to the resolver and its
-	// retries; copies past them get none. A label lives probeSkew either
-	// way, its count two generations of probeLabelsLife, at most
-	// probeLabelsMax labels a generation.
-	probeAnswersMax = 3
-	probeLabelsLife = 5 * time.Minute
-	probeLabelsMax  = 1 << 16
+	// Answers to one label, for the resolver and its retries (a public
+	// resolver asks from more than one of its addresses, and a censor's
+	// copy may come first, dnsprobe-v1 §3): copies past them get none. A
+	// large probe's are few: each costs the global bucket eight. A label
+	// lives probeSkew either way, its count two generations of
+	// probeLabelsLife, at most probeLabelsMax labels a generation.
+	probeAnswersSmall, probeAnswersLarge = 8, 3
+	probeLabelsLife                      = 5 * time.Minute
+	probeLabelsMax                       = 1 << 16
 	// The plaintext of an answer: the token, what the node saw, and for a
 	// large probe zeros up to probeLarge bytes. On the wire it follows a
 	// random nonce of the answer's own.
@@ -205,9 +207,13 @@ func (p *dnsProbe) answer(query []byte, name string, questionEnd int, zone strin
 	}
 	// A copy of a label learns nothing (each answer has its nonce), but
 	// copies from many sources spent the buckets of every client: a label
-	// gets probeAnswersMax answers, enough for the resolver's retries, and
-	// none past them. The rate first: a probe over it costs no parse of
-	// the message.
+	// gets a few answers, enough for the resolver's retries, and none
+	// past them. The message parsed first: one that does not parse goes to
+	// the backend and takes none of them.
+	q, err := dns.MessageFromWireFormat(query)
+	if err != nil || len(q.Question) != 1 {
+		return nil, false
+	}
 	large := b[1] == 1
 	cost := float64(probeSmallCost)
 	if large {
@@ -215,10 +221,6 @@ func (p *dnsProbe) answer(query []byte, name string, questionEnd int, zone strin
 	}
 	if !p.allowLabel([probeLabelBytes]byte(b), src, cost, large, now) {
 		return nil, true
-	}
-	q, err := dns.MessageFromWireFormat(query)
-	if err != nil || len(q.Question) != 1 {
-		return nil, false
 	}
 	var nonce [probeNonceLen]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
@@ -281,31 +283,33 @@ func probeReply(p *dnsProbe, q dns.Message, b, rawLabel []byte, src netip.Addr, 
 	return build(probeSmall)
 }
 
-// allowLabel counts an answer to label, past probeAnswersMax none, and
-// takes its cost as allow does.
+// allowLabel counts an answer to label, past probeAnswersSmall or
+// probeAnswersLarge none, and takes its cost as allowLocked does.
 func (p *dnsProbe) allowLabel(label [probeLabelBytes]byte, src netip.Addr, cost float64, large bool, now time.Time) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if now.Sub(p.labelsSwapped) > probeLabelsLife || len(p.labels) >= probeLabelsMax {
 		p.olderLabels, p.labels, p.labelsSwapped = p.labels, map[[probeLabelBytes]byte]uint8{}, now
 	}
+	most := uint8(probeAnswersSmall)
+	if large {
+		most = probeAnswersLarge
+	}
 	n := max(p.labels[label], p.olderLabels[label])
-	if n >= probeAnswersMax || !p.allowLocked(src, cost, large, now) {
+	if n >= most || !p.allowLocked(src, cost, large, now) {
 		return false
 	}
 	p.labels[label] = n + 1
 	return true
 }
 
-// allow takes the probe's cost from its source's bucket, and a large one's
-// from the global one too. A small answer is no bigger than the query it
-// answers: no source spends the others' share of them.
-func (p *dnsProbe) allow(src netip.Addr, cost float64, large bool, now time.Time) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.allowLocked(src, cost, large, now)
-}
-
+// allowLocked takes the probe's cost from its source's bucket, and a large
+// one's from the global one too. A small answer is about twice the query
+// (127 bytes for 71, 148 sealed): what a source reflects stays in its own
+// bucket, and the others' share is not spent on it. Whoever holds the key
+// (every user of the zone, §2) can still empty the global bucket of large
+// probes from spoofed sources; a copier without it, only by the labels it
+// sees, three answers each.
 func (p *dnsProbe) allowLocked(src netip.Addr, cost float64, large bool, now time.Time) bool {
 	src = src.Unmap()
 	bits := 48
