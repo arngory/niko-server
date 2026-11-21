@@ -71,6 +71,19 @@ type ServiceOptions struct {
 	// aims its download at the victim. Port hopping works either way; with
 	// it a hop costs one round trip.
 	PathValidation bool
+	// StatelessResetKey (neko), if set, is the key of the server's
+	// stateless resets, with an obfuscation too: a client whose connection
+	// the server no longer has (closed while the client slept, or by a
+	// restart) gets a reset at its next packet, and does not wait out its
+	// idle timeout. Without it (upstream), resets with a key of the
+	// process's own, and none under an obfuscation, where a reset would
+	// answer anyone's probe; the caller sets it only where nothing but its
+	// own clients' packets reaches the server (neko: the UDP front routes
+	// by the labels of the server's connection IDs).
+	StatelessResetKey *quic.StatelessResetKey
+	// ObfsConnFilter (neko), if set, wraps the packet socket under the
+	// obfuscation, where the QUIC packets are plain.
+	ObfsConnFilter func(net.PacketConn) net.PacketConn
 }
 
 // errClosedByHook is how a connection ends when its ConnectionHook closes it
@@ -115,6 +128,8 @@ type Service[U comparable] struct {
 	bbrProfile            congestion_meta2.Profile
 	realmServer           *realm.Server
 	connIDGenerator       quic.ConnectionIDGenerator
+	statelessResetKey     *quic.StatelessResetKey
+	obfsConnFilter        func(net.PacketConn) net.PacketConn
 }
 
 func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
@@ -185,6 +200,8 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		bbrProfile:            bbrProfile,
 		realmServer:           realmServer,
 		connIDGenerator:       options.ConnectionIDGenerator,
+		statelessResetKey:     options.StatelessResetKey,
+		obfsConnFilter:        options.ObfsConnFilter,
 	}
 	service.users.Store(&map[string]U{})
 	return service, nil
@@ -207,14 +224,18 @@ func (s *Service[U]) Start(conn net.PacketConn) error {
 	} else if s.salamanderPassword != "" {
 		conn = NewSalamanderConn(conn, []byte(s.salamanderPassword))
 	}
+	obfsEnabled := s.geckoPassword != "" || s.salamanderPassword != ""
+	if obfsEnabled && s.obfsConnFilter != nil {
+		conn = s.obfsConnFilter(conn)
+	}
 	err := qtls.ConfigureHTTP3(s.tlsConfig)
 	if err != nil {
 		return err
 	}
-	obfsEnabled := s.geckoPassword != "" || s.salamanderPassword != ""
 	listener, err := qtls.ListenWithOptions(conn, s.tlsConfig, s.quicConfig, qtls.ListenOptions{
 		DisableVersionNegotiationPackets: obfsEnabled,
 		StatelessReset:                   !obfsEnabled,
+		StatelessResetKey:                s.statelessResetKey,
 		ConnectionIDGenerator:            s.connIDGenerator,
 	})
 	if err != nil {
