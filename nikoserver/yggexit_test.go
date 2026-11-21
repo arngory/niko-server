@@ -333,8 +333,8 @@ func TestYggExitDrains(t *testing.T) {
 
 // A slow client keeps its exit: each write has yggExitStall of its own.
 func TestYggExitSlowClient(t *testing.T) {
-	setVar(t, &yggExitStall, time.Second)
-	const size, pauses = 4 << 20, 4
+	setVar(t, &yggExitStall, 3*time.Second)
+	const size, pauses = 16 << 20, 4 // past the buffers (to 4 MiB): writes wait in the pauses
 	r := newExitRig(t, writeAll(size), nil)
 	smallWindow(t, r)
 	c := r.dial(t)
@@ -354,7 +354,9 @@ func TestYggExitSlowClient(t *testing.T) {
 		}
 		if paused < pauses && got >= (paused+1)*size/(pauses+1) {
 			paused++
-			time.Sleep(700 * time.Millisecond) // under the stall
+			// Under the stall, with room for the wait for half the buffer
+			// (three runs at once failed with 700 ms against 1 s).
+			time.Sleep(time.Second)
 		}
 	}
 	if got != size || paused != pauses {
