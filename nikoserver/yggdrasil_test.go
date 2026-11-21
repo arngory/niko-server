@@ -640,12 +640,12 @@ func TestNekoServerYggdrasilPacketTooBig(t *testing.T) {
 	}
 }
 
-// The exits' count: at most yggExitsPerKey of one key, yggExitsPerUser of
-// one user whatever its keys (second review: a user of 8 keys, 1100 each,
-// filled the node), yggExitsMax in all, and yggExitsShaking of one user's
-// handshakes at once (1024 unanswered SYNs of one key held every user's
-// for two minutes); a place frees when an exit ends, and drop closes the
-// exits of the keys gone, each once.
+// The exits' count: at most yggExitsPerUser of one user whatever its keys
+// (second review: a user of 8 keys, 1100 each, filled the node),
+// yggExitsMax in all, and yggExitsShaking of one user's handshakes at once
+// (1024 unanswered SYNs of one key held every user's for two minutes); a
+// place frees when an exit ends, and drop closes the exits of the keys
+// gone, each once.
 func TestYggExitCount(t *testing.T) {
 	c := newYggExitCount()
 	who := func(user string, i int) yggExitSource {
@@ -658,16 +658,8 @@ func TestYggExitCount(t *testing.T) {
 		c.shook(w)
 		return true
 	}
-	for i := range yggExitsPerKey {
-		if !take(who("u5", 0)) {
-			t.Fatalf("exit %d of a key refused", i)
-		}
-	}
-	if take(who("u5", 0)) {
-		t.Fatal("one key past its share")
-	}
-	for i := yggExitsPerKey; i < yggExitsPerUser; i++ {
-		if !take(who("u5", 1+i/yggExitsPerKey)) {
+	for i := range yggExitsPerUser {
+		if !take(who("u5", i%3)) {
 			t.Fatalf("exit %d of a user refused", i)
 		}
 	}
@@ -679,7 +671,7 @@ func TestYggExitCount(t *testing.T) {
 		t.Fatal("a place freed, yet refused")
 	}
 	for i := 0; c.total < yggExitsMax; i++ {
-		if !take(who(fmt.Sprintf("u%d", 100+i/yggExitsPerKey), i%yggExitsPerKey)) {
+		if !take(who(fmt.Sprintf("u%d", 100+i/yggExitsPerUser), i%7)) {
 			t.Fatalf("exit %d of %d refused", c.total, yggExitsMax)
 		}
 	}
@@ -720,8 +712,8 @@ func TestYggExitCount(t *testing.T) {
 	}
 	c.done(a, mine)
 	c.done(b, theirs)
-	if c.total != 0 || len(c.byUser)+len(c.byKey)+len(c.shaking)+len(c.conns) != 0 {
-		t.Fatalf("left: %d, %v, %v, %v, %v", c.total, c.byUser, c.byKey, c.shaking, c.conns)
+	if c.total != 0 || len(c.byUser)+len(c.shaking)+len(c.conns) != 0 {
+		t.Fatalf("left: %d, %v, %v, %v", c.total, c.byUser, c.shaking, c.conns)
 	}
 }
 

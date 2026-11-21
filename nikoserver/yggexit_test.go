@@ -69,6 +69,7 @@ func exitPair(t *testing.T, serve func(net.Conn)) (dial func() *gonet.TCPConn, o
 	}()
 	open = newYggExitCount()
 	who := yggExitSource{key: [32]byte{1}, user: "u1"}
+	t.Cleanup(func() { open.drop(func([32]byte) bool { return false }) })
 	serveExits(ns, map[uint16]bool{443: true}, inner, func(src netip.Addr) (yggExitSource, bool) { return who, src == client },
 		open, NewLogger("error", io.Discard))
 	return func() *gonet.TCPConn {
@@ -136,5 +137,60 @@ func TestYggExitLinger(t *testing.T) {
 	}
 	if d := time.Since(start); d < yggExitLinger-time.Second {
 		t.Fatalf("closed after %v, before the linger", d)
+	}
+}
+
+// An exit dropped (its key gone from the users file) ends at once, though
+// inner says nothing and closes nothing (third review: a closed gonet conn
+// reads as the client's FIN, and inner's way waited on inner).
+func TestYggExitDropSilentInner(t *testing.T) {
+	hold := make(chan struct{})
+	t.Cleanup(func() { close(hold) })
+	dial, open := exitPair(t, func(c net.Conn) {
+		defer c.Close()
+		<-hold // reads nothing, writes nothing
+	})
+	c := dial()
+	if _, err := c.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if !waitFor(2*time.Second, func() bool { open.mu.Lock(); defer open.mu.Unlock(); return open.total == 1 }) {
+		t.Fatal("no exit")
+	}
+	if !waitFor(2*time.Second, func() bool { open.mu.Lock(); defer open.mu.Unlock(); return len(open.conns) == 1 }) {
+		t.Fatal("the exit not held")
+	}
+	start := time.Now()
+	open.drop(func([32]byte) bool { return false })
+	if !waitFor(2*time.Second, func() bool { open.mu.Lock(); defer open.mu.Unlock(); return open.total == 0 }) {
+		t.Fatal("a dropped exit stayed, inner silent")
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("dropped after %v", d)
+	}
+}
+
+// After the client's FIN, inner's way ends once inner is silent
+// yggExitHalfIdle: the node bounds it, whatever inner's timers.
+func TestYggExitHalfCloseIdle(t *testing.T) {
+	was := yggExitHalfIdle
+	yggExitHalfIdle = 500 * time.Millisecond
+	t.Cleanup(func() { yggExitHalfIdle = was })
+	hold := make(chan struct{})
+	t.Cleanup(func() { close(hold) })
+	dial, open := exitPair(t, func(c net.Conn) {
+		defer c.Close()
+		_, _ = io.Copy(io.Discard, c)
+		<-hold // silent after the request, open
+	})
+	c := dial()
+	if _, err := c.Write([]byte("GET / HTTP/1.0\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	if !waitFor(5*time.Second, func() bool { open.mu.Lock(); defer open.mu.Unlock(); return open.total == 0 }) {
+		t.Fatal("a half-closed exit stayed with inner silent")
 	}
 }
