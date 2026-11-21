@@ -382,12 +382,13 @@ func TestHyLimitsPairJournal(t *testing.T) {
 	if !l.reach(slotOf(t, l, "u6"), destOf(6000)) {
 		t.Fatal("another user refused")
 	}
-	// Half of them answered.
+	// Half of them answered, 3 s on: streams (past 2 s from the first).
+	c.t = c.t.Add(3 * time.Second)
 	for i := 0; i < 1024; i += 2 {
 		slot.heard(destOf(i), monoAt(c.t))
 	}
 	// 29 s on: all still held.
-	c.t = c.t.Add(29 * time.Second)
+	c.t = c.t.Add(26 * time.Second)
 	refillDest(l, "u5")
 	if l.reach(slot, destOf(5000)) {
 		t.Fatal("unanswered pairs gone before 30 s")
@@ -413,7 +414,7 @@ func TestHyLimitsPairJournal(t *testing.T) {
 		t.Fatalf("at the session's end: journal %d, pairs %d; want %d", journal, pairs, 1024/2)
 	}
 	slot2 := slotOf(t, l, "u5")
-	c.t = c.t.Add(30 * time.Second) // 130 s: the answered ones of 0 s are gone (120 s), 0 and 2 not (100 s)
+	c.t = c.t.Add(30 * time.Second) // 130 s: the answered ones of 3 s are gone (123 s), 0 and 2 not (100 s)
 	refillDest(l, "u5")
 	if !l.reach(slot2, destOf(7000)) {
 		t.Fatal("refused with the old pairs gone")
@@ -429,6 +430,63 @@ func TestHyLimitsPairJournal(t *testing.T) {
 	l.mu.Unlock()
 	if left != 0 {
 		t.Fatalf("pairs left in the process: %d", left)
+	}
+}
+
+// A lookup (a query, its answer within 2 s) is a pair 30 s after its
+// answer, as conntrack keeps it; a stream (a packet past 2 s from the
+// first) 120 s. Counted 120 s, a user's pairs ran out at some 8 lookups a
+// second, and the node dropped its DNS.
+func TestHyLimitsPairLookup(t *testing.T) {
+	l, c := fakeHyLimits()
+	lookup, stream := slotOf(t, l, "u5"), slotOf(t, l, "u5")
+	l.reach(lookup, destOf(1))
+	l.reach(stream, destOf(2))
+	c.t = c.t.Add(time.Second)
+	lookup.heard(destOf(1), monoAt(c.t))
+	stream.heard(destOf(2), monoAt(c.t))
+	c.t = c.t.Add(2 * time.Second) // 3 s: a packet of the stream, past 2 s
+	l.reach(stream, destOf(2))
+	l.udpPut(lookup)
+	l.udpPut(stream)
+	aged := func() int {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		l.ageLocked(l.users["u5"], c.t, true)
+		return l.users["u5"].pairs
+	}
+	c.t = c.t.Add(27*time.Second + time.Second/2) // 30.5 s: the lookup's 30 s from its answer at 1 s are not out
+	if pairs := aged(); pairs != 2 {
+		t.Fatalf("at 30.5 s: %d pairs, want 2", pairs)
+	}
+	c.t = c.t.Add(time.Second + time.Second/2) // 32 s: they are
+	if pairs := aged(); pairs != 1 {
+		t.Fatalf("at 32 s: %d pairs, want the stream's", pairs)
+	}
+	c.t = c.t.Add(90 * time.Second) // 122 s: the stream's 120 s from 3 s are not out
+	if pairs := aged(); pairs != 1 {
+		t.Fatalf("at 122 s: %d pairs, want the stream's", pairs)
+	}
+	c.t = c.t.Add(2 * time.Second) // 124 s: they are
+	if pairs := aged(); pairs != 0 {
+		t.Fatalf("at 124 s: %d pairs", pairs)
+	}
+}
+
+// A browser's lookups, 30 a second, each from its own port (its own
+// session), for five minutes, get through: 1024 pairs hold 34 a second.
+func TestHyLimitsLookupRate(t *testing.T) {
+	l, c := fakeHyLimits()
+	resolver := netip.AddrPortFrom(netip.AddrFrom4([4]byte{198, 18, 0, 53}), 53)
+	for i := range 30 * 300 {
+		c.t = c.t.Add(time.Second / 30)
+		s := slotOf(t, l, "u5")
+		if !l.reach(s, resolver) {
+			t.Fatalf("lookup %d (%v) refused: %v", i, time.Duration(i)*time.Second/30, l.Refused()["u5"])
+		}
+		c.t = c.t.Add(20 * time.Millisecond)
+		s.heard(resolver, monoAt(c.t))
+		l.udpPut(s)
 	}
 }
 
