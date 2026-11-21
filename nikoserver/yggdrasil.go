@@ -26,6 +26,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/sagernet/gvisor/pkg/buffer"
@@ -842,7 +843,7 @@ const yggExitLinger = 5 * time.Second
 // (yggExitDrained).
 var (
 	yggExitHalfIdle = 2 * time.Minute // vars for the tests
-	yggExitStall    = 5 * time.Minute
+	yggExitStall    = 15 * time.Minute
 	yggExitDrain    = 10 * time.Minute
 )
 
@@ -918,8 +919,11 @@ func yggCopy(dst io.Writer, src io.Reader) error {
 
 // stallWriter writes inner's way to the client: each write has
 // yggExitStall to find room in the send buffer, which a blocked write
-// gets once the client has acked half of it (up to 2 MiB). A client that
-// takes nothing ends the exit; one that takes 8 KiB/s does not. Not TCP's
+// gets once the client has acked half of it (up to 2 MiB: gVisor grows it
+// with the window while the client is the bottleneck, to 4 MiB within the
+// first few MiB of a download). A client that takes nothing ends the exit,
+// once more waits for it than the buffer holds; one that takes 2.3 KiB/s
+// does not (fifth review: 5 min cut audio paced at 32-48 kbit/s). Not TCP's
 // user timeout: gVisor's runs from the first retransmission until all
 // sent is acked, and it cut a download that went on through a path's
 // losses (the fourth review's fix, tried here).
@@ -941,7 +945,14 @@ func (r idleAfterFIN) Read(b []byte) (int, error) {
 	if r.fin.Load() {
 		_ = r.uc.SetReadDeadline(time.Now().Add(yggExitHalfIdle))
 	}
-	return r.uc.Read(b)
+	n, err := r.uc.Read(b)
+	if errors.Is(err, syscall.ECONNRESET) {
+		// On a unix socket: inner closed with some of the client's bytes
+		// unread, its reply whole (fifth review: a reset cut a slow
+		// client's reply at 160 of 768 KiB).
+		err = io.EOF
+	}
+	return n, err
 }
 
 func exitToInner(e *yggExit, inner string, log *Logger) {

@@ -263,14 +263,14 @@ func TestYggExitHalfCloseIdle(t *testing.T) {
 }
 
 // writeAll is an inner that reads the request, writes n bytes and closes.
-func writeAll(n int) func(net.Conn) {
+func writeAll(size int) func(net.Conn) {
 	return func(c net.Conn) {
 		defer c.Close()
 		b := make([]byte, 64<<10)
 		if _, err := c.Read(b); err != nil {
 			return
 		}
-		for ; n > 0; n -= len(b) {
+		for n := size; n > 0; n -= len(b) {
 			if _, err := c.Write(b[:min(n, len(b))]); err != nil {
 				return
 			}
@@ -421,5 +421,64 @@ func TestYggExitHandshakesHeld(t *testing.T) {
 	}
 	if d := time.Since(start); d > 2*time.Second {
 		t.Fatalf("a new user's exit after %v", d)
+	}
+}
+
+// Inner that closes with some of the client's bytes unread gives a reset on
+// its unix socket, its reply whole: the client gets all of it, then EOF
+// (fifth review: a reset cut a slow client's reply at 160 of 768 KiB).
+func TestYggExitInnerResetWhole(t *testing.T) {
+	const size = 768 << 10
+	r := newExitRig(t, func(c net.Conn) {
+		defer c.Close()
+		b := make([]byte, 64<<10)
+		if _, err := c.Read(b[:1]); err != nil {
+			return
+		}
+		for n := size; n > 0; n -= len(b) {
+			if _, err := c.Write(b[:min(n, len(b))]); err != nil {
+				return
+			}
+		}
+	}, nil)
+	smallWindow(t, r)
+	c := r.dial(t)
+	if _, err := c.Write(make([]byte, 64<<10)); err != nil {
+		t.Fatal(err)
+	}
+	b := make([]byte, 16<<10)
+	got := 0
+	for {
+		n, err := c.Read(b)
+		got += n
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("after %d of %d bytes: %v", got, size, err)
+		}
+		time.Sleep(time.Millisecond) // slow
+	}
+	if got != size {
+		t.Fatalf("%d of %d bytes", got, size)
+	}
+}
+
+// A drop while the exit drains resets its endpoint at once and frees its
+// place (fifth review: nothing pinned the reset in yggExit.Close).
+func TestYggExitDropDraining(t *testing.T) {
+	r := newExitRig(t, writeAll(512<<10), nil)
+	smallWindow(t, r)
+	c := r.dial(t)
+	if _, err := c.Write([]byte("GET")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(yggExitLinger + time.Second) // inner done, the node's side closed, draining
+	if n, s := r.total(), r.sending(); n != 1 || s != 1 {
+		t.Fatalf("draining: %d counted, %d endpoints sending; want 1 and 1", n, s)
+	}
+	r.open.drop(func([32]byte) bool { return false })
+	if !waitFor(time.Second, func() bool { return r.total() == 0 && r.sending() == 0 }) {
+		t.Fatalf("a drop left the draining exit: %d counted, %d endpoints sending", r.total(), r.sending())
 	}
 }
