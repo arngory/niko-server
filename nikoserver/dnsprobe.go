@@ -37,6 +37,13 @@ const (
 	probeRate, probeBurst             = 20, 40
 	probeGlobalRate, probeGlobalBurst = 400, 800
 	probeSmallCost, probeLargeCost    = 1, 8
+	// probeAnswersMax: answers to one label, to the resolver and its
+	// retries; copies past them get none. A label lives probeSkew either
+	// way, its count two generations of probeLabelsLife, at most
+	// probeLabelsMax labels a generation.
+	probeAnswersMax = 3
+	probeLabelsLife = 5 * time.Minute
+	probeLabelsMax  = 1 << 16
 	// The plaintext of an answer: the token, what the node saw, and for a
 	// large probe zeros up to probeLarge bytes. On the wire it follows a
 	// random nonce of the answer's own.
@@ -91,6 +98,9 @@ type dnsProbe struct {
 	sources, older map[netip.Prefix]*tokenBucket
 	swapped        time.Time
 	global         tokenBucket
+	// The answers given to each label, in two generations.
+	labels, olderLabels map[[probeLabelBytes]byte]uint8
+	labelsSwapped       time.Time
 }
 
 // loadProbeKey reads the probe key: 32 bytes in hex.
@@ -108,7 +118,8 @@ func loadProbeKey(path string) (*dnsProbe, error) {
 
 func newDNSProbe(key []byte) *dnsProbe {
 	return &dnsProbe{key: key, enc: probeMAC(key, []byte("dnsprobe-v1 e")), now: time.Now,
-		sources: map[netip.Prefix]*tokenBucket{}, older: map[netip.Prefix]*tokenBucket{}}
+		sources: map[netip.Prefix]*tokenBucket{}, older: map[netip.Prefix]*tokenBucket{},
+		labels: map[[probeLabelBytes]byte]uint8{}, olderLabels: map[[probeLabelBytes]byte]uint8{}}
 }
 
 func probeMAC(key []byte, parts ...[]byte) []byte {
@@ -192,17 +203,17 @@ func (p *dnsProbe) answer(query []byte, name string, questionEnd int, zone strin
 	if sent := binary.BigEndian.Uint32(b[2:6]); sent+probeSkew < minute || sent > minute+probeSkew {
 		return nil, false
 	}
-	// No replay set: the answer to a label is the same whoever asks, and
-	// on the wire it is one more answer of the tunnel. A censor that
-	// races the client's query to the node learns nothing, and the
-	// client still gets its answer.
+	// A copy of a label learns nothing (each answer has its nonce), but
+	// copies from many sources spent the buckets of every client: a label
+	// gets probeAnswersMax answers, enough for the resolver's retries, and
+	// none past them. The rate first: a probe over it costs no parse of
+	// the message.
 	large := b[1] == 1
 	cost := float64(probeSmallCost)
 	if large {
 		cost = probeLargeCost
 	}
-	// The rate first: a probe over it costs no parse of the message.
-	if !p.allow(src, cost, now) {
+	if !p.allowLabel([probeLabelBytes]byte(b), src, cost, large, now) {
 		return nil, true
 	}
 	q, err := dns.MessageFromWireFormat(query)
@@ -270,17 +281,38 @@ func probeReply(p *dnsProbe, q dns.Message, b, rawLabel []byte, src netip.Addr, 
 	return build(probeSmall)
 }
 
-// allow takes the probe's cost from its source's bucket and the global
-// one.
-func (p *dnsProbe) allow(src netip.Addr, cost float64, now time.Time) bool {
+// allowLabel counts an answer to label, past probeAnswersMax none, and
+// takes its cost as allow does.
+func (p *dnsProbe) allowLabel(label [probeLabelBytes]byte, src netip.Addr, cost float64, large bool, now time.Time) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if now.Sub(p.labelsSwapped) > probeLabelsLife || len(p.labels) >= probeLabelsMax {
+		p.olderLabels, p.labels, p.labelsSwapped = p.labels, map[[probeLabelBytes]byte]uint8{}, now
+	}
+	n := max(p.labels[label], p.olderLabels[label])
+	if n >= probeAnswersMax || !p.allowLocked(src, cost, large, now) {
+		return false
+	}
+	p.labels[label] = n + 1
+	return true
+}
+
+// allow takes the probe's cost from its source's bucket, and a large one's
+// from the global one too. A small answer is no bigger than the query it
+// answers: no source spends the others' share of them.
+func (p *dnsProbe) allow(src netip.Addr, cost float64, large bool, now time.Time) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.allowLocked(src, cost, large, now)
+}
+
+func (p *dnsProbe) allowLocked(src netip.Addr, cost float64, large bool, now time.Time) bool {
 	src = src.Unmap()
 	bits := 48
 	if src.Is4() {
 		bits = 24
 	}
 	prefix, _ := src.Prefix(bits)
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if now.Sub(p.swapped) > time.Minute || len(p.sources) >= probeSourcesMax {
 		p.older, p.sources, p.swapped = p.sources, map[netip.Prefix]*tokenBucket{}, now
 	}
@@ -295,5 +327,5 @@ func (p *dnsProbe) allow(src netip.Addr, cost float64, now time.Time) bool {
 	if !b.take(cost, probeRate, probeBurst, now) {
 		return false
 	}
-	return p.global.take(cost, probeGlobalRate, probeGlobalBurst, now)
+	return !large || p.global.take(cost, probeGlobalRate, probeGlobalBurst, now)
 }

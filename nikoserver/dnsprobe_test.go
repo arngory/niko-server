@@ -237,13 +237,72 @@ func TestProbeRate(t *testing.T) {
 	// for want of room.
 	now = now.Add(time.Hour)
 	for j := range probeSourcesMax + 10 {
-		p.allow(netip.AddrFrom4([4]byte{11, byte(j >> 8), byte(j), 1}), 0, now)
+		p.allow(netip.AddrFrom4([4]byte{11, byte(j >> 8), byte(j), 1}), 0, false, now)
 	}
 	if len(p.sources)+len(p.older) > 2*probeSourcesMax {
 		t.Fatalf("%d sources kept", len(p.sources)+len(p.older))
 	}
-	if !p.allow(netip.MustParseAddr("192.0.2.1"), 1, now) {
+	if !p.allow(netip.MustParseAddr("192.0.2.1"), 1, false, now) {
 		t.Fatal("a new source refused with the map full")
+	}
+}
+
+// One label gets probeAnswersMax answers, from whatever sources it comes:
+// copies of a client's label do not spend the buckets of every client.
+// Small probes, which amplify nothing, are not held to the global bucket.
+func TestProbeLabelAnswers(t *testing.T) {
+	key := bytes.Repeat([]byte{7}, 32)
+	zone := "t.example.com"
+	now := time.Unix(1_740_000_000, 0)
+	p := newDNSProbe(key)
+	p.now = func() time.Time { return now }
+	minute := uint32(now.Unix() / 60)
+	label := probeLabel(key, zone, false, minute, [8]byte{1})
+	answered := 0
+	for j := range 10 {
+		reply, ok := ask(t, p, zone, label, 16, 1232, netip.AddrFrom4([4]byte{10, byte(j), 0, 1}).String())
+		if !ok {
+			t.Fatal("not a probe")
+		}
+		if reply != nil {
+			answered++
+		}
+	}
+	if answered != probeAnswersMax {
+		t.Fatalf("one label from 10 sources: %d answered, want %d", answered, probeAnswersMax)
+	}
+	// Its count goes on into the next generation, the label still valid.
+	p.labelsSwapped = now.Add(-probeLabelsLife - time.Second)
+	if reply, ok := ask(t, p, zone, label, 16, 1232, "198.51.100.9"); !ok || reply != nil {
+		t.Fatalf("after a new generation: probe %v, answered %v", ok, reply != nil)
+	}
+	if _, ok := p.olderLabels[[probeLabelBytes]byte(mustLabelBytes(t, label))]; !ok {
+		t.Fatal("no new generation")
+	}
+	// Small probes from many sources, each its own label: all answered,
+	// past what the global bucket holds.
+	now = now.Add(time.Hour)
+	minute = uint32(now.Unix() / 60)
+	answered = 0
+	for j := range probeGlobalBurst + 200 {
+		var nonce [8]byte
+		binary.BigEndian.PutUint64(nonce[:], uint64(j)+100)
+		src := netip.AddrFrom4([4]byte{11, byte(j >> 8), byte(j), 1}).String()
+		if reply, _ := ask(t, p, zone, probeLabel(key, zone, false, minute, nonce), 16, 1232, src); reply != nil {
+			answered++
+		}
+	}
+	if answered != probeGlobalBurst+200 {
+		t.Fatalf("small probes from %d sources: %d answered", probeGlobalBurst+200, answered)
+	}
+	// The labels' memory stays bounded.
+	for j := range probeLabelsMax + 10 {
+		var l [probeLabelBytes]byte
+		binary.BigEndian.PutUint64(l[:], uint64(j))
+		p.allowLabel(l, netip.AddrFrom4([4]byte{12, byte(j >> 16), byte(j >> 8), 1}), 0, false, now)
+	}
+	if len(p.labels)+len(p.olderLabels) > 2*probeLabelsMax {
+		t.Fatalf("%d labels kept", len(p.labels)+len(p.olderLabels))
 	}
 }
 
@@ -291,4 +350,13 @@ func TestProbePad(t *testing.T) {
 			t.Fatalf("%d: token", i)
 		}
 	}
+}
+
+func mustLabelBytes(t *testing.T, label string) []byte {
+	t.Helper()
+	b, err := probeBase32.DecodeString(strings.ToUpper(label))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }
