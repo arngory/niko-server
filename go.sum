@@ -10,8 +10,8 @@ github.com/BurntSushi/toml v1.4.1-0.20240526193622-a339e1f7089c h1:pxW6RcqyfI9/k
 github.com/BurntSushi/toml v1.4.1-0.20240526193622-a339e1f7089c/go.mod h1:ukJfTF/6rtPPRCnwkur4qwRxa8vTRFBF0uk2lLoLwho=
 github.com/andybalholm/brotli v1.2.8 h1:H9F6r7RNwzSRsx/lytpIYkbjNFMt2yNBwsJ2+0gpx78=
 github.com/andybalholm/brotli v1.2.8/go.mod h1:rzTDkvFWvIrjDXZHkuS16NPggd91W3kUSvPlQ1pLaKY=
-github.com/arngory/ironwood v0.0.0-20261121102837-898a3130bbd5 h1:G1iLZ/ig6lfPTWclaYBVsYlbCOD/HirlP746f3sfymc=
-github.com/arngory/ironwood v0.0.0-20261121102837-898a3130bbd5/go.mod h1:+4Nkaq0kqo0xK/XGawV7wVyj2D2LZeLJOzozZp7yhdM=
+github.com/arngory/ironwood v0.0.0-20261121225107-b3dc58fc31ba h1:hlAIRF/MOMjpiy6y/4zEIoC9LAVOFJzVaMEHsAeiqzY=
+github.com/arngory/ironwood v0.0.0-20261121225107-b3dc58fc31ba/go.mod h1:+4Nkaq0kqo0xK/XGawV7wVyj2D2LZeLJOzozZp7yhdM=
 github.com/arngory/sing-box v1.14.5-0.20261102040805-34eaa8c9c5a9 h1:jx7VbuAu1ibVInj/x5amj2qG7LwAOBkT/du8hB/0cIc=
 github.com/arngory/sing-box v1.14.5-0.20261102040805-34eaa8c9c5a9/go.mod h1:PtwjfzE+TEhHf0J+6rYE9Y5l7T5/Yc00+F2t9jaFaNM=
 github.com/arngory/sing-box/third_party/masterdnsvpn v0.0.0-20261106212949-f0eadfa3e71c h1:mnh81fyVpy5MILlM8tEpiC9Gdcpv68ZGsF09/HJHozo=
