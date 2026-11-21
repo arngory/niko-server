@@ -148,7 +148,10 @@ func runYggdrasil(ctx context.Context, c *BackendConfig, log *Logger) error {
 	for _, port := range c.Options.ExitPorts {
 		exits[uint16(port)] = true
 	}
-	serveExits(s, exits, c.Inner, users.exits, log)
+	users.mu.Lock()
+	users.open = newYggExitCount()
+	users.mu.Unlock()
+	serveExits(s, exits, c.Inner, users.exits, users.open, log)
 
 	ln, err := ListenFD(c.Socket, c.FrontUID, log)
 	if err != nil {
@@ -271,6 +274,9 @@ type yggUsers struct {
 	// addrs are the addresses and /64 subnets of the users' keys: the
 	// only sources the exits take (serveExits), swapped whole.
 	addrs atomic.Pointer[yggAddrs]
+	// open are the exits open now, by key: a key gone from the file
+	// loses them as it loses its links. Nil until serveExits.
+	open *yggExitCount
 
 	mu    sync.Mutex
 	keys  map[[32]byte]string
@@ -298,10 +304,10 @@ func (u *yggUsers) set(keys map[[32]byte]string) (dropped, grouped int) {
 		if key == u.node {
 			continue
 		}
-		addrs[netip.AddrFrom16(*address.AddrForKey(ed25519.PublicKey(key[:])))] = true
+		addrs[netip.AddrFrom16(*address.AddrForKey(ed25519.PublicKey(key[:])))] = key
 		var sub [16]byte
 		copy(sub[:], address.SubnetForKey(ed25519.PublicKey(key[:]))[:])
-		addrs[netip.AddrFrom16(sub)] = true
+		addrs[netip.AddrFrom16(sub)] = key
 	}
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -323,27 +329,33 @@ func (u *yggUsers) set(keys map[[32]byte]string) (dropped, grouped int) {
 	if gone {
 		u.relink()
 	}
+	if u.open != nil {
+		dropped += u.open.drop(func(key [32]byte) bool { _, ok := keys[key]; return ok })
+	}
 	return dropped, len(groups)
 }
 
 // yggAddrs are addresses of the users' keys, and their subnets' first
-// addresses (the /64 with the rest zero).
-type yggAddrs map[netip.Addr]bool
+// addresses (the /64 with the rest zero), each to its key.
+type yggAddrs map[netip.Addr][32]byte
 
-// exits says whether src may reach the node's exits: an address of a user's
-// key or in one's subnet. The mesh binds an address to its key (ipv6rwc
-// takes from a key only its own addresses): with public peers anyone on the
-// mesh reaches the node's address, and gets past none but its own users.
-func (u *yggUsers) exits(src netip.Addr) bool {
+// exits says whose src is, if it may reach the node's exits: an address of
+// a user's key or in one's subnet. The mesh binds an address to its key
+// (ipv6rwc takes from a key only its own addresses): with public peers
+// anyone on the mesh reaches the node's address, and gets past none but its
+// own users. A subnet holds 48 bits of its key: a key made to share one
+// takes some 2^49 tries, and inner still asks who the client is.
+func (u *yggUsers) exits(src netip.Addr) ([32]byte, bool) {
 	a := u.addrs.Load()
 	if a == nil {
-		return false
+		return [32]byte{}, false
 	}
-	if (*a)[src] {
-		return true
+	if key, ok := (*a)[src]; ok {
+		return key, true
 	}
 	sub, _ := src.Prefix(64)
-	return (*a)[sub.Addr()]
+	key, ok := (*a)[sub.Addr()]
+	return key, ok
 }
 
 // group is G of the link filter (raycontrol lan-v1 §2.2): the keys' LAN
@@ -647,21 +659,26 @@ func yggNetstack(ctx context.Context, rwc io.ReadWriter, address netip.Addr, mtu
 }
 
 // serveExits takes TCP to the exit ports of the node's address to inner,
-// from the sources allowed lets through, at most yggExitsMax at once and
-// yggExitsPerSource from one: each holds a socket to inner before its
-// client says who it is, which inner's limits count only then.
-func serveExits(s *stack.Stack, exits map[uint16]bool, inner string, allowed func(netip.Addr) bool, log *Logger) {
-	open := &yggExitCount{by: map[netip.Addr]int{}}
+// from the sources allowed names the key of, at most yggExitsMax at once
+// and yggExitsPerKey of one key, from any of its addresses: each holds a
+// socket to inner before its client says who it is, which inner's limits
+// count only then.
+func serveExits(s *stack.Stack, exits map[uint16]bool, inner string, allowed func(netip.Addr) ([32]byte, bool), open *yggExitCount, log *Logger) {
 	fwd := tcp.NewForwarder(s, 0, 1024, func(r *tcp.ForwarderRequest) {
+		if !exits[r.ID().LocalPort] {
+			r.Complete(true)
+			return
+		}
 		src := netip.AddrFrom16(r.ID().RemoteAddress.As16())
-		if !exits[r.ID().LocalPort] || !allowed(src) || !open.take(src) {
+		key, ok := allowed(src)
+		if !ok || !open.take(key) {
 			r.Complete(true)
 			return
 		}
 		var wq waiter.Queue
 		ep, terr := r.CreateEndpoint(&wq)
 		if terr != nil {
-			open.done(src)
+			open.done(key, nil)
 			r.Complete(true)
 			return
 		}
@@ -671,44 +688,100 @@ func serveExits(s *stack.Stack, exits map[uint16]bool, inner string, allowed fun
 		idle, interval := tcpip.KeepaliveIdleOption(time.Minute), tcpip.KeepaliveIntervalOption(15*time.Second)
 		_ = ep.SetSockOpt(&idle)
 		_ = ep.SetSockOpt(&interval)
+		conn := gonet.NewTCPConn(&wq, ep)
+		open.hold(key, conn)
+		// The key may have left the file since allowed: set swaps the
+		// addresses, then drops the exits held, so one of the two sees it.
+		if k, ok := allowed(src); !ok || k != key {
+			_ = conn.Close()
+			open.done(key, conn)
+			return
+		}
 		go func() {
-			defer open.done(src)
-			exitToInner(gonet.NewTCPConn(&wq, ep), inner, log)
+			defer open.done(key, conn)
+			exitToInner(conn, inner, log)
 		}()
 	})
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, fwd.HandlePacket)
 }
 
-// The exits open at once: in all, and from one source. Above a user's limit
-// of TCP at once in inner (raycontrol conn-limit-v1, 1024), which answers
+// The exits open at once: in all, and of one key. Above a user's limit of
+// TCP at once in inner (raycontrol conn-limit-v1, 1024), which answers
 // first, with its reason.
-const yggExitsMax, yggExitsPerSource = 8192, 1100
+const yggExitsMax, yggExitsPerKey = 8192, 1100
 
+// yggExitCount counts the exits by key, and holds them to close those of a
+// key gone (drop).
 type yggExitCount struct {
 	mu    sync.Mutex
 	total int
-	by    map[netip.Addr]int
+	by    map[[32]byte]int
+	conns map[[32]byte]map[io.Closer]bool
 }
 
-func (c *yggExitCount) take(src netip.Addr) bool {
+func newYggExitCount() *yggExitCount {
+	return &yggExitCount{by: map[[32]byte]int{}, conns: map[[32]byte]map[io.Closer]bool{}}
+}
+
+func (c *yggExitCount) take(key [32]byte) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.total >= yggExitsMax || c.by[src] >= yggExitsPerSource {
+	if c.total >= yggExitsMax || c.by[key] >= yggExitsPerKey {
 		return false
 	}
 	c.total++
-	c.by[src]++
+	c.by[key]++
 	return true
 }
 
-func (c *yggExitCount) done(src netip.Addr) {
+// hold keeps conn under key, for drop.
+func (c *yggExitCount) hold(key [32]byte, conn io.Closer) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.conns[key] == nil {
+		c.conns[key] = map[io.Closer]bool{}
+	}
+	c.conns[key][conn] = true
+}
+
+// done frees an exit's place, and forgets conn when it was held.
+func (c *yggExitCount) done(key [32]byte, conn io.Closer) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.total--
-	if c.by[src]--; c.by[src] <= 0 {
-		delete(c.by, src)
+	if c.by[key]--; c.by[key] <= 0 {
+		delete(c.by, key)
+	}
+	if conn != nil {
+		delete(c.conns[key], conn)
+		if len(c.conns[key]) == 0 {
+			delete(c.conns, key)
+		}
 	}
 }
+
+// drop closes the exits of the keys keep says no to, and returns how many.
+// Their places free as each exit ends.
+func (c *yggExitCount) drop(keep func([32]byte) bool) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for key := range c.conns {
+		if keep(key) {
+			continue
+		}
+		for conn := range c.conns[key] {
+			_ = conn.Close()
+			n++
+		}
+	}
+	return n
+}
+
+// yggExitLinger is how long one way of an exit stays once the other has
+// ended: a client that says nothing more does not keep its place after
+// inner closed (inner's own timers are shorter).
+const yggExitLinger = 5 * time.Second
 
 func exitToInner(c *gonet.TCPConn, inner string, log *Logger) {
 	defer c.Close()
@@ -731,6 +804,11 @@ func exitToInner(c *gonet.TCPConn, inner string, log *Logger) {
 		done <- struct{}{}
 	}()
 	<-done
+	t := time.AfterFunc(yggExitLinger, func() {
+		_ = c.Close()
+		_ = uc.Close()
+	})
+	defer t.Stop()
 	<-done
 }
 

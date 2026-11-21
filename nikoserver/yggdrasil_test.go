@@ -640,39 +640,90 @@ func TestNekoServerYggdrasilPacketTooBig(t *testing.T) {
 	}
 }
 
-// The exits' count: at most yggExitsPerSource from one source, yggExitsMax
-// in all, and a place frees when an exit ends.
+// The exits' count: at most yggExitsPerKey of one key, from any of its
+// addresses, yggExitsMax in all; a place frees when an exit ends, and drop
+// closes the exits of the keys gone.
 func TestYggExitCount(t *testing.T) {
-	c := &yggExitCount{by: map[netip.Addr]int{}}
-	one := netip.MustParseAddr("200::1")
-	for i := range yggExitsPerSource {
-		if !c.take(one) {
+	pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	u := &yggUsers{relay: newYggRelay(0)}
+	u.set(map[[32]byte]string{[32]byte(pub): ""})
+	c := newYggExitCount()
+	// Its address and one in its subnet are the one key.
+	addr := netip.AddrFrom16(*address.AddrForKey(pub))
+	var in [16]byte
+	copy(in[:], address.SubnetForKey(pub)[:])
+	in[15] = 9
+	for i := range yggExitsPerKey {
+		src := addr
+		if i%2 == 1 {
+			src = netip.AddrFrom16(in)
+		}
+		key, ok := u.exits(src)
+		if !ok || !c.take(key) {
 			t.Fatalf("exit %d refused", i)
 		}
 	}
-	if c.take(one) {
-		t.Fatal("one source past its share")
+	key, _ := u.exits(netip.AddrFrom16(in))
+	if c.take(key) {
+		t.Fatal("one key past its share, from its subnet")
 	}
-	c.done(one)
-	if !c.take(one) {
+	c.done(key, nil)
+	if !c.take(key) {
 		t.Fatal("a place freed, yet refused")
 	}
 	for i := 0; c.total < yggExitsMax; i++ {
-		if !c.take(netip.AddrFrom16([16]byte{0x02, 12: 0xaa, 13: byte(i >> 16), 14: byte(i >> 8), 15: byte(i)})) {
+		if !c.take([32]byte{1, byte(i >> 16), byte(i >> 8), byte(i)}) {
 			t.Fatalf("exit %d of %d refused", c.total, yggExitsMax)
 		}
 	}
-	if c.take(netip.MustParseAddr("200::ffff")) {
+	if c.take([32]byte{2}) {
 		t.Fatal("past the total")
+	}
+
+	// drop closes the held exits of the keys gone, not the others'.
+	c = newYggExitCount()
+	mine, theirs := &closeCount{}, &closeCount{}
+	a, b := [32]byte{1}, [32]byte{2}
+	c.take(a)
+	c.hold(a, mine)
+	c.take(b)
+	c.hold(b, theirs)
+	if n := c.drop(func(k [32]byte) bool { return k == b }); n != 1 || mine.n != 1 || theirs.n != 0 {
+		t.Fatalf("dropped %d; closed %d and %d", n, mine.n, theirs.n)
+	}
+	c.done(a, mine)
+	c.done(b, theirs)
+	if c.total != 0 || len(c.by) != 0 || len(c.conns) != 0 {
+		t.Fatalf("left: %d, %v, %v", c.total, c.by, c.conns)
 	}
 }
 
-// The users' addresses and subnets pass, others do not.
+type closeCount struct{ n int }
+
+func (c *closeCount) Close() error { c.n++; return nil }
+
+// A key gone from the users file loses its exits as its links (set).
+func TestYggUsersDropExits(t *testing.T) {
+	pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	other, _, _ := ed25519.GenerateKey(rand.Reader)
+	u := &yggUsers{relay: newYggRelay(0), open: newYggExitCount()}
+	u.set(map[[32]byte]string{[32]byte(pub): "", [32]byte(other): ""})
+	mine, theirs := &closeCount{}, &closeCount{}
+	u.open.take([32]byte(pub))
+	u.open.hold([32]byte(pub), mine)
+	u.open.take([32]byte(other))
+	u.open.hold([32]byte(other), theirs)
+	if dropped, _ := u.set(map[[32]byte]string{[32]byte(other): ""}); dropped != 1 || mine.n != 1 || theirs.n != 0 {
+		t.Fatalf("dropped %d; closed %d and %d", dropped, mine.n, theirs.n)
+	}
+}
+
+// The users' addresses and subnets pass, with their keys; others do not.
 func TestYggExitsAllowed(t *testing.T) {
 	pub, _, _ := ed25519.GenerateKey(rand.Reader)
 	other, _, _ := ed25519.GenerateKey(rand.Reader)
 	u := &yggUsers{relay: newYggRelay(0)}
-	if u.exits(netip.AddrFrom16(*address.AddrForKey(pub))) {
+	if _, ok := u.exits(netip.AddrFrom16(*address.AddrForKey(pub))); ok {
 		t.Fatal("no users yet, yet an address passes")
 	}
 	u.set(map[[32]byte]string{[32]byte(pub): ""})
@@ -689,12 +740,13 @@ func TestYggExitsAllowed(t *testing.T) {
 		{netip.AddrFrom16(*address.AddrForKey(other)), false},
 		{netip.MustParseAddr("200::1"), false},
 	} {
-		if got := u.exits(c.addr); got != c.want {
+		key, got := u.exits(c.addr)
+		if got != c.want || got && key != [32]byte(pub) {
 			t.Errorf("%v: %v, want %v", c.addr, got, c.want)
 		}
 	}
 	u.set(map[[32]byte]string{})
-	if u.exits(netip.AddrFrom16(*address.AddrForKey(pub))) {
+	if _, ok := u.exits(netip.AddrFrom16(*address.AddrForKey(pub))); ok {
 		t.Fatal("a removed user's address passes")
 	}
 }

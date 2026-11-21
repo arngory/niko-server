@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -374,6 +375,28 @@ func lanIsolation(ctx context.Context, t *testing.T) {
 		n.setLAN(t, yggDevice{m.key, ""}, yggDevice{p.key, ""})
 		if !p.exits(ctx, n) {
 			t.Fatal("a user's device on the mesh does not exit")
+		}
+		// Gone from the users file, it loses the exit it holds open: the
+		// mesh still reaches the node, the exit does not stay.
+		c, err := yggDial(ctx, p.net, n.key, 4433, 10*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		c.SetDeadline(time.Now().Add(10 * time.Second))
+		got := make([]byte, 5)
+		if _, err := c.Write([]byte("hello")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.ReadFull(c, got); err != nil {
+			t.Fatal(err)
+		}
+		n.setLAN(t, yggDevice{m.key, ""})
+		start := time.Now()
+		_, err = c.Read(got)
+		var ne net.Error
+		if err == nil || errors.As(err, &ne) && ne.Timeout() {
+			t.Fatalf("the exit of a removed key stays: %v after %v", err, time.Since(start))
 		}
 	})
 
