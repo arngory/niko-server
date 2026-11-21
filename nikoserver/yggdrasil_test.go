@@ -639,3 +639,144 @@ func TestNekoServerYggdrasilPacketTooBig(t *testing.T) {
 		t.Fatal("bob got alice's bytes from the node")
 	}
 }
+
+// The exits' count: at most yggExitsPerUser of one user whatever its keys
+// (second review: a user of 8 keys, 1100 each, filled the node),
+// yggExitsMax in all, and yggExitsShaking of one user's handshakes at once
+// (1024 unanswered SYNs of one key held every user's for two minutes); a
+// place frees when an exit ends, and drop closes the exits of the keys
+// gone, each once.
+func TestYggExitCount(t *testing.T) {
+	c := newYggExitCount()
+	who := func(user string, i int) yggExitSource {
+		return yggExitSource{key: [32]byte{byte(len(user)), byte(i >> 8), byte(i)}, user: user}
+	}
+	take := func(w yggExitSource) bool {
+		if !c.take(w) {
+			return false
+		}
+		c.shook(w)
+		return true
+	}
+	for i := range yggExitsPerUser {
+		if !take(who("u5", i%3)) {
+			t.Fatalf("exit %d of a user refused", i)
+		}
+	}
+	if take(who("u5", 9)) {
+		t.Fatal("a user past its share from a key of its own")
+	}
+	c.done(who("u5", 0), nil)
+	if !take(who("u5", 9)) {
+		t.Fatal("a place freed, yet refused")
+	}
+	for i := 0; c.total < yggExitsMax; i++ {
+		if !take(who(fmt.Sprintf("u%d", 100+i/yggExitsPerUser), i%7)) {
+			t.Fatalf("exit %d of %d refused", c.total, yggExitsMax)
+		}
+	}
+	if take(who("u7", 0)) {
+		t.Fatal("past the total")
+	}
+
+	// Handshakes: yggExitsShaking of one user at once, whatever its keys.
+	c = newYggExitCount()
+	for i := range yggExitsShaking {
+		if !c.take(who("u5", i)) {
+			t.Fatalf("handshake %d refused", i)
+		}
+	}
+	if c.take(who("u5", 99)) || !c.take(who("u6", 0)) {
+		t.Fatal("handshakes: one user past its share, or another refused")
+	}
+	c.shook(who("u5", 0))
+	if !c.take(who("u5", 99)) {
+		t.Fatal("a handshake done, yet refused")
+	}
+
+	// drop closes the held exits of the keys gone, not the others', and
+	// counts each once.
+	c = newYggExitCount()
+	mine, theirs := &closeCount{}, &closeCount{}
+	a, b := who("u5", 1), who("u6", 2)
+	take(a)
+	c.hold(a.key, mine)
+	take(b)
+	c.hold(b.key, theirs)
+	gone := func(k [32]byte) bool { return k == b.key }
+	if n := c.drop(gone); n != 1 || mine.n != 1 || theirs.n != 0 {
+		t.Fatalf("dropped %d; closed %d and %d", n, mine.n, theirs.n)
+	}
+	if n := c.drop(gone); n != 0 || mine.n != 1 {
+		t.Fatalf("dropped again: %d, closed %d", n, mine.n)
+	}
+	c.done(a, mine)
+	c.done(b, theirs)
+	if c.total != 0 || len(c.byUser)+len(c.shaking)+len(c.conns) != 0 {
+		t.Fatalf("left: %d, %v, %v, %v", c.total, c.byUser, c.shaking, c.conns)
+	}
+}
+
+type closeCount struct{ n int }
+
+func (c *closeCount) Close() error { c.n++; return nil }
+
+// A key gone from the users file loses its exits as its links (set).
+func TestYggUsersDropExits(t *testing.T) {
+	pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	other, _, _ := ed25519.GenerateKey(rand.Reader)
+	u := &yggUsers{relay: newYggRelay(0), open: newYggExitCount()}
+	u.set(map[[32]byte]yggEntry{[32]byte(pub): {}, [32]byte(other): {}})
+	mine, theirs := &closeCount{}, &closeCount{}
+	u.open.take(yggExitSource{key: [32]byte(pub)})
+	u.open.hold([32]byte(pub), mine)
+	u.open.take(yggExitSource{key: [32]byte(other)})
+	u.open.hold([32]byte(other), theirs)
+	if links, exits, _ := u.set(map[[32]byte]yggEntry{[32]byte(other): {}}); links != 0 || exits != 1 || mine.n != 1 || theirs.n != 0 {
+		t.Fatalf("closed %d links and %d exits; closed %d and %d", links, exits, mine.n, theirs.n)
+	}
+}
+
+// The users' addresses pass, with their keys and users; their subnets do
+// not (Niko connects from the address: second review), nor others.
+func TestYggExitsAllowed(t *testing.T) {
+	pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	other, _, _ := ed25519.GenerateKey(rand.Reader)
+	unnamed, _, _ := ed25519.GenerateKey(rand.Reader)
+	u := &yggUsers{relay: newYggRelay(0)}
+	if _, ok := u.exits(netip.AddrFrom16(*address.AddrForKey(pub))); ok {
+		t.Fatal("no users yet, yet an address passes")
+	}
+	u.set(map[[32]byte]yggEntry{[32]byte(pub): {user: "u5"}, [32]byte(unnamed): {}})
+	sub := address.SubnetForKey(pub)
+	var first, in [16]byte
+	copy(first[:], sub[:])
+	copy(in[:], sub[:])
+	in[15] = 7
+	for _, c := range []struct {
+		addr netip.Addr
+		want bool
+	}{
+		{netip.AddrFrom16(*address.AddrForKey(pub)), true},
+		{netip.AddrFrom16(first), false},
+		{netip.AddrFrom16(in), false},
+		{netip.AddrFrom16(*address.AddrForKey(other)), false},
+		{netip.MustParseAddr("200::1"), false},
+	} {
+		w, got := u.exits(c.addr)
+		if got != c.want || got && w != (yggExitSource{[32]byte(pub), "u5"}) {
+			t.Errorf("%v: %v %v, want %v", c.addr, got, w, c.want)
+		}
+	}
+	// A key without a name is a user of its own.
+	if w, ok := u.exits(netip.AddrFrom16(*address.AddrForKey(unnamed))); !ok || w.user != hex.EncodeToString(unnamed) {
+		t.Fatalf("unnamed: %v %v", w, ok)
+	}
+	u.set(map[[32]byte]yggEntry{})
+	if _, ok := u.exits(netip.AddrFrom16(*address.AddrForKey(pub))); ok {
+		t.Fatal("a removed user's address passes")
+	}
+	if yggUserOf("u12-d7-n") != "u12" || yggUserOf("u12") != "u12" || yggUserOf("-x") != "" {
+		t.Fatal("yggUserOf")
+	}
+}
