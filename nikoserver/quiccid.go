@@ -215,6 +215,29 @@ func (g *cidGenerator) ahead(id []byte) bool {
 	return d >= 1 && d <= cidAheadWindow
 }
 
+// behind reports whether id is one of the generator's own, its label under
+// its key, issued already or by a process before (not ahead).
+func (g *cidGenerator) behind(id []byte) bool {
+	if len(id) < cidLen {
+		return false
+	}
+	x, _ := g.codec.decrypt(binary.BigEndian.Uint32(id[0:4]), binary.BigEndian.Uint32(id[4:8]))
+	return uint16(x>>16) == g.label && x&0xff00 == 0 && !g.ahead(id)
+}
+
+// dropUnlabelled reports whether a server under an obfuscation drops a
+// client's packet: a short header whose destination ID is not one of the
+// generator's own it issued (behind). There the server sends stateless
+// resets (hysteriaResetKey), and a reset to anything else would answer a
+// prober's packet, which the obfuscation reads as random QUIC, whatever
+// the front passes; one of 2^24 random IDs passes the label's check.
+func (g *cidGenerator) dropUnlabelled(p []byte) bool {
+	if len(p) < 1 || p[0]&0xc0 != 0x40 {
+		return false
+	}
+	return len(p) < minCIDPacket || !g.behind(p[1:1+cidLen])
+}
+
 // dropAhead reports whether a server drops a client's packet: a short
 // header whose destination ID is one the generator will issue (ahead).
 // Long headers are not read: their ID is elsewhere, and a client's

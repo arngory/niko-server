@@ -261,6 +261,11 @@ type ListenOptions struct {
 	// that carry a label the UDP front routes by); nil: quic-go's random
 	// ones. A TLS config that brings its own listener refuses one.
 	ConnectionIDGenerator quic.ConnectionIDGenerator
+	// StatelessResetKey (neko), if set, is the key of the server's
+	// stateless resets, StatelessReset or not: one that outlives the
+	// process, so that a client of the one before gets a reset whose token
+	// it takes. StatelessReset alone draws a key for this process.
+	StatelessResetKey *quic.StatelessResetKey
 }
 
 func Listen(conn net.PacketConn, config aTLS.ServerConfig, quicConfig *quic.Config) (Listener, error) {
@@ -285,7 +290,9 @@ func ListenWithOptions(conn net.PacketConn, config aTLS.ServerConfig, quicConfig
 	transport := quic.Transport{Conn: conn, DisableVersionNegotiationPackets: options.DisableVersionNegotiationPackets,
 		ConnectionIDGenerator: options.ConnectionIDGenerator}
 	transport.SetSingleUse(true)
-	if options.StatelessReset {
+	if options.StatelessResetKey != nil {
+		transport.StatelessResetKey = options.StatelessResetKey
+	} else if options.StatelessReset {
 		transport.StatelessResetKey = new(quic.StatelessResetKey)
 		_, err = rand.Read(transport.StatelessResetKey[:])
 		if err != nil {
@@ -318,7 +325,9 @@ func ListenEarlyWithOptions(conn net.PacketConn, config aTLS.ServerConfig, quicC
 	transport := quic.Transport{Conn: conn, DisableVersionNegotiationPackets: options.DisableVersionNegotiationPackets,
 		ConnectionIDGenerator: options.ConnectionIDGenerator}
 	transport.SetSingleUse(true)
-	if options.StatelessReset {
+	if options.StatelessResetKey != nil {
+		transport.StatelessResetKey = options.StatelessResetKey
+	} else if options.StatelessReset {
 		transport.StatelessResetKey = new(quic.StatelessResetKey)
 		_, err = rand.Read(transport.StatelessResetKey[:])
 		if err != nil {
