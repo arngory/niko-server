@@ -96,6 +96,14 @@ replace masterdnsvpn-go => github.com/arngory/sing-box/third_party/masterdnsvpn 
 
 replace github.com/yggdrasil-network/yggdrasil-go => github.com/arngory/yggdrasil-go v0.5.16-0.20261108201637-5afe92f15200
 
+// ironwood from the fork (f70babd on upstream's 0712ecc): a repeated session
+// init gets its first ack again, while nothing came over the session, so the
+// first contact of a device no longer hangs a minute when that ack was lost
+// (found and fixed by the client, arngory/niko); and a window of 8128 nonces
+// (upstream's Arceliar/ironwood#53, as WireGuard's) takes a packet reordered
+// on the way, which a strict high-water mark dropped. The wire is the same.
+replace github.com/Arceliar/ironwood => github.com/arngory/ironwood v0.0.0-20261121063706-f70babd98f13
+
 replace github.com/sagernet/sing-quic => ./third_party/sing-quic
 
 replace www.bamsoftware.com/git/dnstt.git => ./third_party/dnstt

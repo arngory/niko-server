@@ -3,8 +3,6 @@ code.pfad.fr/check v1.1.0 h1:GWvjdzhSEgHvEHe2uJujDcpmZoySKuHQNrZMfzfO0bE=
 code.pfad.fr/check v1.1.0/go.mod h1:NiUH13DtYsb7xp5wll0U4SXx7KhXQVCtRgdC96IPfoM=
 filippo.io/edwards25519 v1.2.0 h1:crnVqOiS4jqYleHd9vaKZ+HKtHfllngJIiOpNpoJsjo=
 filippo.io/edwards25519 v1.2.0/go.mod h1:xzAOLCNug/yB62zG1bQ8uziwrIqIuxhctzJT18Q77mc=
-github.com/Arceliar/ironwood v0.0.0-20261023231900-0712eccbb962 h1:SsGZmDZf5iyqfs1vJjeIJv+Hk9+fH7lSLRI4WB+kpWw=
-github.com/Arceliar/ironwood v0.0.0-20261023231900-0712eccbb962/go.mod h1:+4Nkaq0kqo0xK/XGawV7wVyj2D2LZeLJOzozZp7yhdM=
 github.com/Arceliar/phony v0.0.0-20220903101357-530938a4b13d h1:UK9fsWbWqwIQkMCz1CP+v5pGbsGoWAw6g4AyvMpm1EM=
 github.com/Arceliar/phony v0.0.0-20220903101357-530938a4b13d/go.mod h1:BCnxhRf47C/dy/e/D2pmB8NkB3dQVIrkD98b220rx5Q=
 github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
@@ -12,6 +10,8 @@ github.com/BurntSushi/toml v1.4.1-0.20240526193622-a339e1f7089c h1:pxW6RcqyfI9/k
 github.com/BurntSushi/toml v1.4.1-0.20240526193622-a339e1f7089c/go.mod h1:ukJfTF/6rtPPRCnwkur4qwRxa8vTRFBF0uk2lLoLwho=
 github.com/andybalholm/brotli v1.2.8 h1:H9F6r7RNwzSRsx/lytpIYkbjNFMt2yNBwsJ2+0gpx78=
 github.com/andybalholm/brotli v1.2.8/go.mod h1:rzTDkvFWvIrjDXZHkuS16NPggd91W3kUSvPlQ1pLaKY=
+github.com/arngory/ironwood v0.0.0-20261121063706-f70babd98f13 h1:ho72uFtXHRj5ni9/YfjXTa8TbfSjQPpuoy96Xx5+Q3c=
+github.com/arngory/ironwood v0.0.0-20261121063706-f70babd98f13/go.mod h1:+4Nkaq0kqo0xK/XGawV7wVyj2D2LZeLJOzozZp7yhdM=
 github.com/arngory/sing-box v1.14.5-0.20261102040805-34eaa8c9c5a9 h1:jx7VbuAu1ibVInj/x5amj2qG7LwAOBkT/du8hB/0cIc=
 github.com/arngory/sing-box v1.14.5-0.20261102040805-34eaa8c9c5a9/go.mod h1:PtwjfzE+TEhHf0J+6rYE9Y5l7T5/Yc00+F2t9jaFaNM=
 github.com/arngory/sing-box/third_party/masterdnsvpn v0.0.0-20261106212949-f0eadfa3e71c h1:mnh81fyVpy5MILlM8tEpiC9Gdcpv68ZGsF09/HJHozo=

@@ -63,7 +63,7 @@ func FuzzDNSQuery(f *testing.F) {
 				checkReply(t, "apex", reply, 4096)
 			}
 		}
-		if reply, isProbe := probe.answer(query, name, end, z, netip.MustParseAddr("192.0.2.1"), pad); isProbe && reply != nil {
+		if reply, isProbe, _ := probe.answer(query, name, end, z, netip.MustParseAddr("192.0.2.1"), pad); isProbe && reply != nil {
 			checkReply(t, "probe", reply, 1232)
 		}
 	})

@@ -246,11 +246,14 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 			}
 		}
 		if f.probe != nil && f.probeZones[zone] {
-			if reply, probe := f.probe.answer(query, name, questionEnd, zone, client.Addr(), f.padZones[zone]); probe {
-				if reply != nil {
+			if reply, probe, overLabel := f.probe.answer(query, name, questionEnd, zone, client.Addr(), f.padZones[zone]); probe {
+				switch {
+				case reply != nil:
 					f.stats.probes.Add(1)
 					conn.WriteToUDPAddrPort(reply, client)
-				} else {
+				case overLabel:
+					f.stats.probesOverLabel.Add(1)
+				default:
 					f.stats.probesOverRate.Add(1)
 				}
 				f.log.Debugf("dnsprobe from %s: %d bytes", client.Addr(), len(reply))
