@@ -70,7 +70,8 @@ func ask(t *testing.T, p *dnsProbe, zone, label string, qtype uint16, edns int, 
 	if !ok {
 		t.Fatal("query does not parse")
 	}
-	return p.answer(q, name, end, zone, netip.MustParseAddr(src), false)
+	reply, probe, _ = p.answer(q, name, end, zone, netip.MustParseAddr(src), false)
+	return reply, probe
 }
 
 // The spec's example (raycontrol docs/spec/dnsprobe-v1.md §7).
@@ -273,11 +274,38 @@ func TestProbeLabelAnswers(t *testing.T) {
 		}
 		return answered
 	}
-	if n := count(label, 0); n != probeAnswersSmall {
-		t.Fatalf("a small probe's label from 20 sources: %d answered, want %d", n, probeAnswersSmall)
+	if n := count(label, 0); n != probeAnswers {
+		t.Fatalf("a small probe's label from 20 sources: %d answered, want %d", n, probeAnswers)
 	}
 	if n := count(probeLabel(key, zone, true, minute, [8]byte{2}), 1); n != probeAnswersLarge {
 		t.Fatalf("a large probe's label from 20 sources: %d answered, want %d", n, probeAnswersLarge)
+	}
+	// Large is the answer: a large probe's retry with no room for the
+	// large answer (EDNS 512, no OPT: a resolver's downgrade, second
+	// review) still gets the small one, at a small one's cost, up to all
+	// of the label's answers; the global bucket pays for large ones only.
+	large := probeLabel(key, zone, true, minute, [8]byte{4})
+	for j := range probeAnswersLarge {
+		if reply, _ := ask(t, p, zone, large, 16, 1232, netip.AddrFrom4([4]byte{10, 4, byte(j), 1}).String()); len(reply) < probeLarge {
+			t.Fatalf("large answer %d: %d bytes", j, len(reply))
+		}
+	}
+	global := p.global.tokens
+	for j := range probeAnswers - probeAnswersLarge {
+		edns := 512
+		if j%2 == 1 {
+			edns = 0
+		}
+		reply, _ := ask(t, p, zone, large, 16, edns, netip.AddrFrom4([4]byte{10, 5, byte(j), 1}).String())
+		if reply == nil || len(reply) > 512 {
+			t.Fatalf("a downgraded retry %d (EDNS %d): %d bytes", j, edns, len(reply))
+		}
+	}
+	if p.global.tokens < global {
+		t.Fatalf("small answers to a large probe spent the global bucket: %v, then %v", global, p.global.tokens)
+	}
+	if reply, _ := ask(t, p, zone, large, 16, 512, "10.6.0.1"); reply != nil {
+		t.Fatal("past all of the label's answers")
 	}
 	// A query that does not parse takes no answer of its label.
 	garbled := probeLabel(key, zone, false, minute, [8]byte{3})
@@ -287,10 +315,10 @@ func TestProbeLabelAnswers(t *testing.T) {
 	if !ok {
 		t.Fatal("the question does not parse")
 	}
-	if reply, ok := p.answer(q, name, end, zone, netip.MustParseAddr("10.9.0.1"), false); ok || reply != nil {
+	if reply, ok, _ := p.answer(q, name, end, zone, netip.MustParseAddr("10.9.0.1"), false); ok || reply != nil {
 		t.Fatalf("a query cut short: probe %v, answered %v", ok, reply != nil)
 	}
-	if n := count(garbled, 2); n != probeAnswersSmall {
+	if n := count(garbled, 2); n != probeAnswers {
 		t.Fatalf("after one cut short: %d answered", n)
 	}
 	// Its count goes on into the next generation, the label still valid.
@@ -321,10 +349,11 @@ func TestProbeLabelAnswers(t *testing.T) {
 	for j := range probeLabelsMax + 10 {
 		var l [probeLabelBytes]byte
 		binary.BigEndian.PutUint64(l[:], uint64(j))
-		p.allowLabel(l, netip.AddrFrom4([4]byte{12, byte(j >> 16), byte(j >> 8), 1}), 0, false, now)
+		// A /24 a label: no source bucket refuses one.
+		p.allowLabel(l, netip.AddrFrom4([4]byte{byte(20 + j>>16), byte(j >> 8), byte(j), 1}), false, now)
 	}
-	if len(p.labels)+len(p.olderLabels) > 2*probeLabelsMax {
-		t.Fatalf("%d labels kept", len(p.labels)+len(p.olderLabels))
+	if n := len(p.labels) + len(p.olderLabels); n > 2*probeLabelsMax || n <= probeLabelsMax || len(p.labels) > probeLabelsMax {
+		t.Fatalf("%d labels kept, %d in the new generation", n, len(p.labels))
 	}
 }
 
@@ -352,7 +381,7 @@ func TestProbePad(t *testing.T) {
 		l := probeLabel(key, zone, c.large, minute, [8]byte{byte(i + 1)})
 		q := probeQuery(l+"."+zone, 16, c.edns)
 		name, end, _ := queryName(q)
-		reply, probe := p.answer(q, name, end, zone, netip.MustParseAddr("198.51.100.7"), true)
+		reply, probe, _ := p.answer(q, name, end, zone, netip.MustParseAddr("198.51.100.7"), true)
 		if !probe || reply == nil {
 			t.Fatalf("%d: not answered", i)
 		}

@@ -249,7 +249,7 @@ func TestAnswersCopyDO(t *testing.T) {
 	l := probeLabel(key, "t.example.com", false, uint32(time.Now().Unix()/60), [8]byte{1})
 	q := withDO(probeQuery(l+".t.example.com", 16, 1232))
 	name, end, _ := queryName(q)
-	if reply, probe := p.answer(q, name, end, "t.example.com", netip.MustParseAddr("198.51.100.7"), false); !probe || optTTL(t, reply)&0x8000 == 0 {
+	if reply, probe, _ := p.answer(q, name, end, "t.example.com", netip.MustParseAddr("198.51.100.7"), false); !probe || optTTL(t, reply)&0x8000 == 0 {
 		t.Fatalf("probe: DO not copied")
 	}
 	q, end = pendingQuery(t, 0x0104, 1232)
