@@ -4,6 +4,8 @@ package nikoserver
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -193,15 +195,29 @@ func runHysteriaWith(ctx context.Context, c *BackendConfig, conn *packetConn, lo
 	// smaller and leave the front at 1280 like every other QUIC on it. Path
 	// MTU discovery then counts only what came through, the salt included.
 	quicOptions := hysteriaQUICOptions(salamander != "")
-	// Connection IDs with the backend's label, if it has one. Without
-	// salamander the server sends stateless resets: a packet for an ID of
-	// its own it has not issued yet gets none (aheadFilter).
+	// Connection IDs with the backend's label, if it has one. With them
+	// the server sends stateless resets under a key from the label's, the
+	// same in the next process, under salamander too: a client whose
+	// connection the server dropped (it slept past the idle timeout, the
+	// backend restarted) gets a reset at its next packet and reconnects at
+	// once, where it waited out its own idle timeout, 60 s for Niko, with
+	// no internet meanwhile. The front passes the backend only packets
+	// with its label, so a prober's packets still get nothing. A packet
+	// for an ID of its own it has not issued yet gets no reset
+	// (aheadFilter, under salamander below it).
 	var connIDs squic.ConnectionIDGenerator
+	var resetKey *squic.StatelessResetKey
+	var obfsFilter func(net.PacketConn) net.PacketConn
 	var serveConn net.PacketConn = conn
 	if gen := hysteriaCIDs(c.Options, log); gen != nil {
 		connIDs = sagernetCIDs{gen}
+		if k, err := hysteriaResetKey(c.Options); err == nil {
+			resetKey = k
+		}
 		if salamander == "" {
 			serveConn = aheadFilter{conn, gen}
+		} else if resetKey != nil {
+			obfsFilter = func(pc net.PacketConn) net.PacketConn { return aheadObfsFilter{pc, gen} }
 		}
 	}
 	service, err := hysteria2.NewService[*hy2User](hysteria2.ServiceOptions{
@@ -212,6 +228,8 @@ func runHysteriaWith(ctx context.Context, c *BackendConfig, conn *packetConn, lo
 		// connection from a spoofed source aimed its download at anyone
 		// (the front pins a new address by the label, or by an Initial).
 		PathValidation:     true,
+		StatelessResetKey:  resetKey,
+		ObfsConnFilter:     obfsFilter,
 		ConnectionHook:     connectionHook(users, &live),
 		Context:            ctx,
 		Logger:             nopLogger(),
@@ -275,6 +293,41 @@ func hysteriaCIDs(o BackendOptions, log *Logger) *cidGenerator {
 	}
 	log.Infof("connection IDs with label %d (quic-cid-route-v1)", o.CIDLabel)
 	return g
+}
+
+// hysteriaResetKey is the key of the server's stateless resets: from the
+// key of the backend's label, so that a process after this one makes the
+// same tokens for this one's IDs (quic-go's token of an ID is
+// HMAC-SHA256(key, ID)); a process of its own key would send resets its
+// clients drop. The label's key is the backend's, not the node's secret.
+func hysteriaResetKey(o BackendOptions) (*squic.StatelessResetKey, error) {
+	key, err := readHexKey(o.CIDKeyFile, 16)
+	if err != nil {
+		return nil, err
+	}
+	m := hmac.New(sha256.New, key)
+	m.Write([]byte("niko-server hysteria2 stateless reset v1"))
+	var k squic.StatelessResetKey
+	copy(k[:], m.Sum(nil))
+	return &k, nil
+}
+
+// aheadObfsFilter is aheadFilter under an obfuscation, where the packets
+// are plain QUIC; it drops a short header with any ID but one of the
+// server's own it issued (cidGenerator.dropUnlabelled): the port stays
+// silent to probes whatever the front passes.
+type aheadObfsFilter struct {
+	net.PacketConn
+	gen *cidGenerator
+}
+
+func (f aheadObfsFilter) ReadFrom(b []byte) (int, net.Addr, error) {
+	for {
+		n, addr, err := f.PacketConn.ReadFrom(b)
+		if err != nil || !f.gen.dropUnlabelled(b[:n]) {
+			return n, addr, err
+		}
+	}
 }
 
 // aheadFilter drops a client's short-header packet for an ID of the
