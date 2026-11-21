@@ -62,10 +62,14 @@ var hyLimitDefaults = hyLimitNumbers{
 }
 
 const (
-	// A pair of UDP as conntrack keeps it: 30 s after the last packet sent
-	// without an answer, 120 s after the last packet either way with one.
+	// A pair of UDP as conntrack keeps it (linux:nf_conntrack_proto_udp.c,
+	// nf_conntrack_udp_packet): 30 s after its last packet, and 120 s once
+	// answered and still live past 2 s from its first, a stream. A lookup
+	// (a query, its answer) is 30 s: counted 120, a user's pairs ran out
+	// at some 8 lookups a second, and the node dropped its DNS.
 	pairAnswered   = 120 * time.Second
 	pairUnanswered = 30 * time.Second
+	pairStreamAt   = 2 * time.Second
 	// ageEvery: a user's pairs are aged this often at most.
 	ageEvery = time.Second
 	// The process's ceiling of pairs: a quarter of nf_conntrack_max, read
@@ -433,20 +437,24 @@ type udpSlot struct {
 	aged  time.Time
 }
 
-// pairTimes are a pair's last packet sent, last either way (monoAt), and
-// whether an answer came.
+// pairTimes are a pair's first packet, last sent, last either way
+// (monoAt), and whether an answer came.
 type pairTimes struct {
-	sent, any int64
-	answered  bool
+	first, sent, any int64
+	answered         bool
 }
 
 // end is when conntrack lets the pair go: 30 s after the last packet sent
-// while unanswered, 120 s after the last either way once answered.
+// while unanswered; once answered, 30 s after the last packet either way,
+// 120 s if that one came past 2 s from the first.
 func (p pairTimes) end() int64 {
-	if p.answered {
+	if !p.answered {
+		return p.sent + int64(pairUnanswered)
+	}
+	if p.any > p.first+int64(pairStreamAt) {
 		return p.any + int64(pairAnswered)
 	}
-	return p.sent + int64(pairUnanswered)
+	return p.any + int64(pairUnanswered)
 }
 
 // udpTake gives a UDP session its place. At the user's limit the quietest
@@ -577,7 +585,7 @@ func (s *udpSlot) mayReach(ap netip.AddrPort, m int64) bool {
 		return false
 	}
 	s.mu.Lock()
-	s.peers[ap] = pairTimes{sent: m, any: m}
+	s.peers[ap] = pairTimes{first: m, sent: m, any: m}
 	s.mu.Unlock()
 	return true
 }
