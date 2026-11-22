@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/netip"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -128,22 +129,39 @@ func TestNekoServerYggdrasilPQ(t *testing.T) {
 	}
 }
 
-// tLog is a Logger's writer into the test's log.
+// tLog is a Logger's writer into the test's log, until the test's cleanup:
+// the node's and the client's goroutines outlive the subtest, and a Logf
+// after it ended races with testing's own state (go test -race).
 type tLog struct {
-	t   *testing.T
-	who string
+	t      *testing.T
+	who    string
+	mu     sync.Mutex
+	closed bool
 }
 
-func (w tLog) Write(b []byte) (int, error) {
-	w.t.Helper()
-	w.t.Logf("%s: %s", w.who, strings.TrimRight(string(b), "\n"))
+func newTLog(t *testing.T, who string) *tLog {
+	w := &tLog{t: t, who: who}
+	t.Cleanup(func() {
+		w.mu.Lock()
+		w.closed = true
+		w.mu.Unlock()
+	})
+	return w
+}
+
+func (w *tLog) Write(b []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.closed {
+		w.t.Logf("%s: %s", w.who, strings.TrimRight(string(b), "\n"))
+	}
 	return len(b), nil
 }
 
 func testYggPQPair(t *testing.T, nodeMode string, clientPQ *core.PQSessions, want string, higher bool) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	yggNodeLog = tLog{t, "node"}
+	yggNodeLog = newTLog(t, "node")
 	defer func() { yggNodeLog = io.Discard }()
 	began := time.Now()
 	phase := func(what string) { t.Logf("%v %s", time.Since(began).Round(10*time.Millisecond), what) }
@@ -165,7 +183,7 @@ func testYggPQPair(t *testing.T, nodeMode string, clientPQ *core.PQSessions, wan
 		opts = append(opts, *clientPQ)
 	}
 	n.setUsers(t, public)
-	client, err := core.New(cert, yggLog{NewLogger("warn", tLog{t, "client"})}, opts...)
+	client, err := core.New(cert, yggLog{NewLogger("warn", newTLog(t, "client"))}, opts...)
 	if err != nil {
 		t.Fatal(err)
 	}
