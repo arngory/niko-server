@@ -645,9 +645,23 @@ func (l *oneConn) Addr() net.Addr { return l.conn.LocalAddr() }
 // guards matters little here. A late FIN of the client's, our ACK lost,
 // gets an RST in LAST-ACK, where the client has all of the reply and our
 // FIN. An old segment taken into a new connection needs the client's
-// port again, a segment of the old one still in the mesh past a second,
-// and the new random ISN's window around its sequence number.
+// port again and a segment of the old one still in the mesh past a
+// second; and, ISNs being a hash of the 4-tuple plus a 64 ns clock
+// (gVisor's connect.go:223-248, Linux's alike, RFC 6528), the old one to
+// have carried more than the clock's 15.6 MB a second since it began,
+// the new window being where its sequence numbers had got to. gVisor has
+// no PAWS (rcv.go:564); a client with timestamps has (protocol review).
+// What such a segment would corrupt is inner's AEAD stream: it breaks.
 const yggTimeWait = time.Second
+
+// yggFinWait2 is how long an exit's endpoint, closed by the node, waits in
+// FIN-WAIT-2 for the client's FIN, against gVisor's 60 s: one user's
+// exits ended every 5 s would hold the ring (yggExitsClosing) to
+// themselves. The wait is the orphan's only (rcv.go:301-309, Close): the
+// node's half-close with the client's way open has none, and a client
+// that half-closes first meets CLOSE-WAIT, not this. Data the client
+// sends here gets an RST: the node has closed both ways.
+var yggFinWait2 = 10 * time.Second // a var for the tests
 
 // yggNetstack is a gVisor stack on the node's mesh address; rwc carries its
 // packets to and from the mesh until ctx ends.
@@ -660,6 +674,8 @@ func yggNetstack(ctx context.Context, rwc io.ReadWriter, address netip.Addr, mtu
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &sack)
 	tw := tcpip.TCPTimeWaitTimeoutOption(yggTimeWait)
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &tw)
+	fw2 := tcpip.TCPLingerTimeoutOption(yggFinWait2)
+	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &fw2)
 	ep := channel.New(1024, mtu, "")
 	if err := s.CreateNIC(1, ep); err != nil {
 		s.Close()
@@ -877,7 +893,7 @@ func (c *yggExitCount) drop(keep func([32]byte) bool) int {
 // default), and a download after it is no shorter for it (second review).
 // The node bounds it all the same: after the client's FIN, inner's way
 // ends once it is silent yggExitHalfIdle.
-const yggExitLinger = 5 * time.Second
+var yggExitLinger = 5 * time.Second // a var for the tests
 
 // yggExitStall: an exit whose client takes nothing of what waits for it
 // that long ends (yggExit.Write). yggExitDrain: how long an exit's place
@@ -975,6 +991,21 @@ func yggCopy(dst io.Writer, src io.Reader) error {
 	return err
 }
 
+// readErr reads r, keeping its error but EOF: yggCopy's error is then
+// the reader's when err is set, else the writer's.
+type readErr struct {
+	r   io.Reader
+	err error
+}
+
+func (r *readErr) Read(b []byte) (int, error) {
+	n, err := r.r.Read(b)
+	if err != nil && err != io.EOF {
+		r.err = err
+	}
+	return n, err
+}
+
 // idleAfterFIN reads inner's way: once the client has half-closed (fin),
 // each read has yggExitHalfIdle to come.
 type idleAfterFIN struct {
@@ -1013,7 +1044,19 @@ func exitToInner(e *yggExit, inner string, log *Logger) {
 	up, down := make(chan struct{}), make(chan struct{})
 	go func() {
 		defer close(up)
-		if yggCopy(uc, e) != nil {
+		r := &readErr{r: e}
+		if yggCopy(uc, r) != nil {
+			if r.err == nil {
+				// Inner took no more of the client's way (EPIPE: it closed
+				// with the client's bytes unread): its reply may still be
+				// on its way, and down reads it whole. Closing uc here cut
+				// it, a reset to the client, when inner was quick to write
+				// all and close (one full run in three of main a39bb08,
+				// TestYggExitInnerResetWhole). What the client sends more
+				// goes nowhere, to its end or yggExitLinger's.
+				_ = yggCopy(io.Discard, e)
+				return
+			}
 			_ = uc.Close() // the client reset: all goes
 			return
 		}

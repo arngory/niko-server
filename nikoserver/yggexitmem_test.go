@@ -3,6 +3,7 @@ package nikoserver
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -313,43 +314,95 @@ func TestYggExitBuffersKeptWhileSent(t *testing.T) {
 	}
 }
 
+// waiting is how many of the node's endpoints wait in TIME-WAIT or
+// FIN-WAIT-2, and their remote ports.
+func (r *exitRig) waiting() (int, map[uint16]bool) {
+	ports := map[uint16]bool{}
+	for _, ep := range r.ns.RegisteredEndpoints() {
+		if e, ok := ep.(*tcp.Endpoint); ok && (e.EndpointState() == tcp.StateTimeWait || e.EndpointState() == tcp.StateFinWait2) {
+			ports[e.Info().(*stack.TransportEndpointInfo).ID.RemotePort] = true
+		}
+	}
+	return len(ports), ports
+}
+
 // Exits the node closes first leave their endpoints in TIME-WAIT for
 // yggTimeWait, at most yggExitsClosing of them (protocol review: 60 s each,
 // outside every count; and a client picking a port again waited it out).
+// An endpoint waits in the ring or with its exit still counted, on its way
+// there: the bound is the ring's and the exits' (protocol review, B2: a
+// margin of 2 failed 7 of 40 runs under load).
 func TestYggExitTimeWait(t *testing.T) {
 	setVar(t, &yggExitsClosing, 16)
 	r := newExitRig(t, func(c net.Conn) {
 		_, _ = c.Write([]byte("bye"))
 		c.Close()
 	}, nil)
-	waiting := func() int {
-		n := 0
-		for _, ep := range r.ns.RegisteredEndpoints() {
-			if e, ok := ep.(*tcp.Endpoint); ok && (e.EndpointState() == tcp.StateTimeWait || e.EndpointState() == tcp.StateFinWait2) {
-				n++
-			}
-		}
-		return n
-	}
-	most := 0
 	for range 200 {
 		c := r.dial(t)
 		if _, err := io.Copy(io.Discard, c); err != nil {
 			t.Fatal(err)
 		}
 		c.Close()
-		most = max(most, waiting())
+		counted := r.total() // first: it only falls, no exit coming now
+		if n, _ := r.waiting(); n > yggExitsClosing+counted {
+			t.Fatalf("%d endpoints in TIME-WAIT or FIN-WAIT-2, %d exits counted", n, counted)
+		}
+		r.open.mu.Lock()
+		ring := len(r.open.ending)
+		r.open.mu.Unlock()
+		if ring > yggExitsClosing {
+			t.Fatalf("%d in the ring", ring)
+		}
 	}
-	if most > yggExitsClosing+2 { // and the last ones, on their way to the ring
-		t.Fatalf("%d endpoints in TIME-WAIT or FIN-WAIT-2", most)
-	}
-	if !waitFor(3*time.Second, func() bool { return waiting() == 0 }) { // yggTimeWait, 1 s
-		t.Fatalf("%d endpoints still waiting after 3 s", waiting())
+	if !waitFor(3*time.Second, func() bool { n, _ := r.waiting(); return n == 0 }) { // yggTimeWait, 1 s
+		n, _ := r.waiting()
+		t.Fatalf("%d endpoints still waiting after 3 s", n)
 	}
 }
 
-// The budget comes from the cgroup's memory.max, the least up the tree,
-// else MemTotal.
+// Exits whose clients keep their way open once the node has closed both
+// wait in FIN-WAIT-2 for yggFinWait2, in the ring: past its bound the
+// oldest is reset, not the newest.
+func TestYggExitFinWait2(t *testing.T) {
+	setVar(t, &yggExitsClosing, 4)
+	setVar(t, &yggExitLinger, 100*time.Millisecond)
+	setVar(t, &yggFinWait2, 4*time.Second)
+	r := newExitRig(t, func(c net.Conn) {
+		_, _ = c.Write([]byte("bye"))
+		c.Close()
+	}, nil)
+	var ports []uint16
+	for range 10 {
+		c := r.dial(t)
+		if b, err := io.ReadAll(c); err != nil || string(b) != "bye" {
+			t.Fatalf("read %q: %v", b, err)
+		}
+		ports = append(ports, uint16(c.LocalAddr().(*net.TCPAddr).Port)) // and no FIN
+		if !waitFor(2*time.Second, func() bool { return r.total() == 0 }) {
+			t.Fatal("the exit stayed")
+		}
+	}
+	start := time.Now()
+	n, waits := r.waiting()
+	if n != yggExitsClosing {
+		t.Fatalf("%d endpoints in FIN-WAIT-2, want %d", n, yggExitsClosing)
+	}
+	for _, p := range ports[len(ports)-yggExitsClosing:] {
+		if !waits[p] {
+			t.Fatalf("the newest %v not all waiting: %v", ports[len(ports)-yggExitsClosing:], waits)
+		}
+	}
+	if !waitFor(yggFinWait2+2*time.Second, func() bool { n, _ := r.waiting(); return n == 0 }) {
+		t.Fatal("FIN-WAIT-2 past yggFinWait2")
+	}
+	if d := time.Since(start); d < yggFinWait2/4 {
+		t.Fatalf("closed after %v", d)
+	}
+}
+
+// The budget comes from the cgroup's limit, the least up the tree, v2's
+// memory.max or v1's memory.limit_in_bytes, else MemTotal.
 func TestHostMemory(t *testing.T) {
 	dir := t.TempDir()
 	write := func(name, s string) string {
@@ -373,6 +426,21 @@ func TestHostMemory(t *testing.T) {
 	if got := hostMemory(self, root, meminfo); got != 512<<20 {
 		t.Fatalf("a parent's memory.max: %d", got)
 	}
+	// cgroup v1: the memory hierarchy's limit, "unlimited" above MemTotal;
+	// a container's own cgroup mounted as the root.
+	v1 := write("cgroup1", "4:memory:/docker/abc\n3:cpu,cpuacct:/docker/abc\n0::/\n")
+	write("fs/memory/memory.limit_in_bytes", "9223372036854771712\n")
+	if got := hostMemory(v1, root, meminfo); got != 2048000<<10 {
+		t.Fatalf("v1, unlimited: %d", got)
+	}
+	write("fs/memory/memory.limit_in_bytes", "1073741824\n")
+	if got := hostMemory(v1, root, meminfo); got != 1<<30 {
+		t.Fatalf("v1, the container's root: %d", got)
+	}
+	write("fs/memory/docker/abc/memory.limit_in_bytes", "268435456\n")
+	if got := hostMemory(v1, root, meminfo); got != 256<<20 {
+		t.Fatalf("v1, its own cgroup: %d", got)
+	}
 	if got := hostMemory(filepath.Join(dir, "none"), root, filepath.Join(dir, "none")); got != 0 {
 		t.Fatalf("nothing known: %d", got)
 	}
@@ -380,5 +448,268 @@ func TestHostMemory(t *testing.T) {
 		if got := exitBudgetFor(mem); got != want {
 			t.Fatalf("budget for %d: %d, want %d", mem, got, want)
 		}
+	}
+}
+
+// holer drops, for each client port armed, its first data segment to the
+// node from then on, and every retransmission of it until the hole's
+// deadline: a hole the node waits on, segments past it held.
+type holer struct {
+	mu    sync.Mutex
+	armed map[uint16]time.Time
+	hole  map[uint16]uint32
+}
+
+func newHoler() *holer { return &holer{armed: map[uint16]time.Time{}, hole: map[uint16]uint32{}} }
+
+func (h *holer) arm(c net.Conn, until time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.armed[uint16(c.LocalAddr().(*net.TCPAddr).Port)] = until
+}
+
+// patient lets r's client retransmit a hole's segment past gVisor's 15
+// times: SACKs at the rig's RTT had it lose the hole and the connection
+// in 0.25 s, in one run of four.
+func (r *exitRig) patient(t *testing.T) {
+	retries := tcpip.TCPMaxRetriesOption(1 << 20)
+	if err := r.cs.SetTransportProtocolOption(tcp.ProtocolNumber, &retries); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (h *holer) wrap(out chan<- []byte) chan<- []byte {
+	in := make(chan []byte, 1<<14)
+	go func() {
+		for pkt := range in {
+			// IPv6, TCP, to the node 200::1, with data.
+			if len(pkt) >= 60 && pkt[6] == 6 && pkt[24] == 2 && pkt[39] == 1 && len(pkt) > 40+int(pkt[52]>>4)*4 {
+				port, seq := binary.BigEndian.Uint16(pkt[40:]), binary.BigEndian.Uint32(pkt[44:])
+				h.mu.Lock()
+				until, armed := h.armed[port]
+				s, holed := h.hole[port]
+				if armed && !holed {
+					h.hole[port], s, holed = seq, seq, true
+				}
+				drop := holed && seq == s && time.Now().Before(until)
+				h.mu.Unlock()
+				if drop {
+					continue
+				}
+			}
+			out <- pkt
+		}
+	}()
+	return in
+}
+
+// The node's receive buffers past their floors, and the most any holds
+// past its buffer (gVisor's own count, as giveBack reads it).
+func (r *exitRig) heldPast() (most int64) {
+	for _, ep := range r.ns.RegisteredEndpoints() {
+		if e, ok := ep.(*tcp.Endpoint); ok && e.EndpointState() == tcp.StateEstablished {
+			held, _ := rcvMemUsed(e)
+			most = max(most, int64(held)-e.SocketOptions().GetReceiveBufferSize())
+		}
+	}
+	return most
+}
+
+// An exit whose upload has a hole keeps its receive buffer while it holds
+// segments past the hole (protocol review, B1: given back by its in-order
+// queue alone, 8 such exits held 9.7 MiB against 2 MiB charged).
+func TestYggExitBuffersHeldPastHole(t *testing.T) {
+	const budget, n = 16 << 20, 6 // a user's share: 2 MiB
+	setVar(t, &exitRigMTU, 1280)
+	h := newHoler()
+	setVar(t, &exitRigMangle, h.wrap)
+	r := newExitRig(t, func(c net.Conn) {
+		defer c.Close()
+		_, _ = io.Copy(io.Discard, c)
+	}, nil)
+	r.open.mu.Lock()
+	r.open.budget = budget
+	r.open.mu.Unlock()
+	r.patient(t)
+	b := make([]byte, 64<<10)
+	for range n {
+		c := r.dial(t)
+		for range 64 { // 4 MiB fast: the receive buffer grows
+			if _, err := c.Write(b); err != nil {
+				t.Fatal(err)
+			}
+		}
+		h.arm(c, time.Now().Add(time.Hour))
+		go func() {
+			_ = c.SetWriteDeadline(time.Now().Add(30 * time.Second))
+			for {
+				if _, err := c.Write(b); err != nil {
+					return
+				}
+			}
+		}()
+		time.Sleep(yggExitIdle + 300*time.Millisecond) // idle: the next exit's sweep finds it
+	}
+	all, _ := r.grown()
+	if most := r.heldPast(); most > 64<<10 {
+		t.Fatalf("an exit holds %d KiB past its receive buffer; %d KiB charged in all", most>>10, all>>10)
+	}
+}
+
+// A hole filled after the exit has idled is let in: a receive buffer given
+// back below what is held past a hole would drop the hole's segment for
+// ever.
+func TestYggExitBuffersHoleFills(t *testing.T) {
+	const budget = 16 << 20 // a user's share: 2 MiB
+	setVar(t, &exitRigMTU, 1280)
+	h := newHoler()
+	setVar(t, &exitRigMangle, h.wrap)
+	got := make(chan int64, 2)
+	r := newExitRig(t, func(c net.Conn) {
+		defer c.Close()
+		n, _ := io.Copy(io.Discard, c)
+		got <- n
+	}, nil)
+	r.open.mu.Lock()
+	r.open.budget = budget
+	r.open.mu.Unlock()
+	r.patient(t)
+	b := make([]byte, 64<<10)
+	first := r.dial(t)
+	for range 64 {
+		if _, err := first.Write(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.arm(first, time.Now().Add(2*yggExitIdle+time.Second))
+	for range 8 { // 512 KiB past the hole
+		if _, err := first.Write(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := first.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(yggExitIdle + 300*time.Millisecond)
+	second := r.dial(t) // its growth short: a sweep
+	for range 64 {
+		if _, err := second.Write(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case n := <-got:
+		if n != 72*64<<10 {
+			t.Fatalf("inner got %d of %d", n, 72*64<<10)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatalf("the holed upload never ended; it holds %d KiB past its buffer", r.heldPast()>>10)
+	}
+}
+
+// What exits grew comes back whole once they have ended, however they
+// end: closed, dropped with their key, reset by the client, given back,
+// reset out of the ring.
+func TestYggExitBuffersAllBack(t *testing.T) {
+	const budget = 16 << 20 // a user's share: 2 MiB
+	setVar(t, &yggExitsClosing, 2)
+	hold := make(chan struct{})
+	r, _ := usersRig(t, 2, func(c net.Conn) {
+		defer c.Close()
+		b := make([]byte, 4)
+		if _, err := io.ReadFull(c, b); err != nil {
+			return
+		}
+		switch string(b) {
+		case "bye.": // the node closes first: TIME-WAIT, the ring
+			_, _ = c.Write([]byte("bye"))
+			return
+		case "idle":
+			_ = writeN(c, 8<<20)
+			<-hold
+		default: // and upload, to the client's end
+			_ = writeN(c, 8<<20)
+			_, _ = io.Copy(io.Discard, c)
+		}
+	})
+	r.open.mu.Lock()
+	r.open.budget = budget
+	r.open.mu.Unlock()
+	open := func(u int, req string) *gonet.TCPConn {
+		c := r.dialAs(t, u)
+		if _, err := c.Write([]byte(req)); err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	idle := open(0, "idle") // grows, then idles: given back
+	if _, err := io.CopyN(io.Discard, idle, 8<<20); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(yggExitIdle + 200*time.Millisecond)
+	normal := open(0, "norm")
+	if _, err := io.CopyN(io.Discard, normal, 8<<20); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := normal.Write(make([]byte, 4<<20)); err != nil {
+		t.Fatal(err)
+	}
+	normal.Close()
+	reset := open(0, "rset")
+	if _, err := io.CopyN(io.Discard, reset, 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	reset.Close() // what is unread resets
+	dropped := open(1, "drop")
+	if _, err := io.CopyN(io.Discard, dropped, 2<<20); err != nil {
+		t.Fatal(err)
+	}
+	for range 6 {
+		c := open(0, "bye.")
+		if _, err := io.Copy(io.Discard, c); err != nil {
+			t.Fatal(err)
+		}
+		c.Close()
+	}
+	r.open.drop(func(key [32]byte) bool { return key != [32]byte{3, 101} })
+	close(hold)
+	idle.Close()
+	if !waitFor(5*time.Second, func() bool {
+		all, _ := r.grown()
+		return r.total() == 0 && all == 0
+	}) {
+		all, _ := r.grown()
+		t.Fatalf("%d exits, %d bytes grown, after all ended", r.total(), all)
+	}
+	r.open.mu.Lock()
+	defer r.open.mu.Unlock()
+	if len(r.open.grownBy) != 0 {
+		t.Fatalf("grown by user: %v", r.open.grownBy)
+	}
+}
+
+// rcvMemUsed reads gVisor's count on the version go.mod pins: what an
+// upload inner does not read holds, up to the buffer and a segment.
+func TestYggRcvMemUsed(t *testing.T) {
+	if rcvMemOffset == 0 {
+		t.Fatal("gVisor's Endpoint has no rcvMemUsed: receive buffers are never given back")
+	}
+	hold := make(chan struct{})
+	t.Cleanup(func() { close(hold) })
+	r := newExitRig(t, func(c net.Conn) { <-hold; c.Close() }, nil)
+	c := r.dial(t)
+	go func() { _, _ = c.Write(make([]byte, 8<<20)) }()
+	var held, size int64
+	waitFor(2*time.Second, func() bool {
+		for _, ep := range r.ns.RegisteredEndpoints() {
+			if e, ok := ep.(*tcp.Endpoint); ok && e.EndpointState() == tcp.StateEstablished {
+				h, _ := rcvMemUsed(e)
+				held, size = int64(h), e.SocketOptions().GetReceiveBufferSize()
+			}
+		}
+		return held >= size/2
+	})
+	if held < size/2 || held > size+65536+4096 {
+		t.Fatalf("held %d with a receive buffer of %d", held, size)
 	}
 }

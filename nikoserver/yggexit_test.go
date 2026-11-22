@@ -71,11 +71,13 @@ type exitRig struct {
 }
 
 // exitRigMTU is the rig's links' MTU (the node's mesh has 1280),
-// exitRigDelay their delay each way, exitRigLog the node's log.
+// exitRigDelay their delay each way, exitRigMangle what each way's
+// packets go through, exitRigLog the node's log.
 var (
-	exitRigMTU   uint32 = 65535
-	exitRigDelay time.Duration
-	exitRigLog   = NewLogger("error", io.Discard)
+	exitRigMTU    uint32 = 65535
+	exitRigDelay  time.Duration
+	exitRigMangle func(chan<- []byte) chan<- []byte
+	exitRigLog    = NewLogger("error", io.Discard)
 )
 
 func newExitRig(t *testing.T, serve func(net.Conn), allowed func(src netip.Addr) (yggExitSource, bool)) *exitRig {
@@ -86,6 +88,9 @@ func newExitRig(t *testing.T, serve func(net.Conn), allowed func(src netip.Addr)
 	toNode, toClient := chan<- []byte(a), chan<- []byte(b)
 	if exitRigDelay > 0 {
 		toNode, toClient = delayed(a, exitRigDelay), delayed(b, exitRigDelay)
+	}
+	if exitRigMangle != nil {
+		toNode, toClient = exitRigMangle(toNode), exitRigMangle(toClient)
 	}
 	r := &exitRig{into: a, node: netip.MustParseAddr("200::1"), client: netip.MustParseAddr("201::2"), open: newYggExitCount()}
 	var err error
@@ -492,6 +497,47 @@ func TestYggExitInnerResetWhole(t *testing.T) {
 			t.Fatalf("after %d of %d bytes: %v", got, size, err)
 		}
 		time.Sleep(time.Millisecond) // slow
+	}
+	if got != size {
+		t.Fatalf("%d of %d bytes", got, size)
+	}
+}
+
+// Inner that closes while the client still uploads, its reply written,
+// has its reply reach the client whole: the client's way failing to inner
+// does not cut inner's way (one full run of three on main a39bb08 failed
+// TestYggExitInnerResetWhole so, its 64 KiB not yet all written to inner).
+func TestYggExitInnerGoneReplyWhole(t *testing.T) {
+	const size = 256 << 10
+	r := newExitRig(t, func(c net.Conn) {
+		defer c.Close()
+		if _, err := c.Read(make([]byte, 1)); err != nil {
+			return
+		}
+		_ = writeN(c, size)
+	}, nil)
+	smallWindow(t, r)
+	c := r.dial(t)
+	go func() { // uploads to its end, inner gone or not
+		b := make([]byte, 16<<10)
+		for {
+			if _, err := c.Write(b); err != nil {
+				return
+			}
+		}
+	}()
+	b := make([]byte, 16<<10)
+	got := 0
+	for {
+		n, err := c.Read(b)
+		got += n
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("after %d of %d bytes: %v", got, size, err)
+		}
+		time.Sleep(time.Millisecond)
 	}
 	if got != size {
 		t.Fatalf("%d of %d bytes", got, size)

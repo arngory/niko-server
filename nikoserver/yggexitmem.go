@@ -7,11 +7,15 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
+	"github.com/sagernet/gvisor/pkg/atomicbitops"
 	"github.com/sagernet/gvisor/pkg/tcpip"
 	"github.com/sagernet/gvisor/pkg/tcpip/transport/tcp"
 	"github.com/sagernet/gvisor/pkg/waiter"
@@ -25,9 +29,10 @@ import (
 // gVisor's own tuning would grow them (growSend, received), each byte
 // past a floor taken from the node's budget (yggExitBudget) within its
 // user's share of it, yggExitShares-th. When either is short the exits
-// idle yggExitIdle give back what they grew (giveBack). So the exits'
-// buffers hold at most the budget plus their floors, yggExitsMax of them
-// at most: a node with few exits open has the windows it had.
+// idle yggExitIdle give back what they grew (giveBack). So gVisor counts
+// the exits' buffers at most at the budget plus their floors, yggExitsMax
+// of them at most (the heap under received segments up to twice that,
+// their pool chunks), and a node with few exits open has its windows.
 const (
 	// The send floor is above where gVisor's tuning starts at the mesh's
 	// MTU (10 segments of 1220 bytes, twice); the receive floor is the
@@ -41,16 +46,20 @@ const (
 )
 
 // yggExitBudget is the default budget: a quarter of the memory the
-// process may have (its cgroup's memory.max, else the host's MemTotal),
-// within 64 MiB and 4 GiB.
+// process may have (its cgroup's limit, else the host's MemTotal), within
+// 64 MiB and 4 GiB.
 var yggExitBudget = sync.OnceValue(func() int64 {
 	return exitBudgetFor(hostMemory("/proc/self/cgroup", "/sys/fs/cgroup", "/proc/meminfo"))
 })
 
 func exitBudgetFor(mem int64) int64 { return min(max(mem/4, 64<<20), 4<<30) }
 
-// hostMemory is the least of MemTotal and the memory.max of the cgroup
-// v2 the process is in and of its parents; 0 when none is known.
+// hostMemory is the least of MemTotal and the limits of the cgroup the
+// process is in and of its parents: memory.max in v2 (root), and
+// memory.limit_in_bytes in v1's memory hierarchy (root/memory), whose
+// "unlimited" is above any MemTotal. 0 when none is known. A container's
+// own cgroup mounted as the hierarchy's root is read there, its path
+// from /proc/self/cgroup not found under the mount.
 func hostMemory(self, root, meminfo string) int64 {
 	var mem int64
 	least := func(n int64) {
@@ -58,20 +67,26 @@ func hostMemory(self, root, meminfo string) int64 {
 			mem = n
 		}
 	}
+	limits := func(dir, mount, file string) {
+		for dir = path.Clean("/" + dir); ; dir = path.Dir(dir) {
+			if b, err := os.ReadFile(path.Join(mount, dir, file)); err == nil {
+				n, _ := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64) // "max": 0
+				least(n)
+			}
+			if dir == "/" {
+				return
+			}
+		}
+	}
 	if b, err := os.ReadFile(self); err == nil {
 		for line := range strings.SplitSeq(string(b), "\n") {
-			dir, ok := strings.CutPrefix(line, "0::")
-			if !ok {
-				continue
-			}
-			for dir = path.Clean("/" + dir); ; dir = path.Dir(dir) {
-				if b, err := os.ReadFile(path.Join(root, dir, "memory.max")); err == nil {
-					n, _ := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64) // "max": 0
-					least(n)
-				}
-				if dir == "/" {
-					break
-				}
+			f := strings.SplitN(line, ":", 3)
+			switch {
+			case len(f) < 3:
+			case f[0] == "0" && f[1] == "":
+				limits(f[2], root, "memory.max")
+			case slices.Contains(strings.Split(f[1], ","), "memory"):
+				limits(f[2], path.Join(root, "memory"), "memory.limit_in_bytes")
 			}
 		}
 	}
@@ -109,10 +124,12 @@ func (c *yggExitCount) grow(e *yggExit, want int64) int64 {
 	var idle []*yggExit
 	now := time.Now()
 	if got < want && now.Sub(c.reclaimed) >= 100*time.Millisecond {
+		// Short of the user's share only, only its exits' help.
+		mine := node >= want
 		c.reclaimed = now
 		for _, conns := range c.conns {
 			for conn := range conns {
-				if x, ok := conn.(*yggExit); ok && x != e {
+				if x, ok := conn.(*yggExit); ok && x != e && (!mine || x.who.user == e.who.user) {
 					idle = append(idle, x)
 				}
 			}
@@ -202,6 +219,29 @@ func (e *yggExit) buffers(mtu uint32) {
 // floor's memory holds less than that in segments (under -race no upload
 // grew it), so a quarter of it, or an initial window.
 func (e *yggExit) firstCopied() int64 { return min(tcp.InitialCwnd*e.mss, yggExitRecvFloor/4) }
+
+// rcvMemOffset is where gVisor's Endpoint keeps rcvMemUsed, the memory of
+// every received segment it holds, queued, in order or out of it, which
+// its enqueue admits against the receive buffer. gVisor exports no
+// out-of-order size, so rcvMemUsed reads it in place, for the version
+// go.mod pins (TestYggRcvMemUsed); 0, the field gone: never read.
+var rcvMemOffset = func() uintptr {
+	f, ok := reflect.TypeFor[tcp.Endpoint]().FieldByName("rcvMemUsed")
+	if !ok || f.Type != reflect.TypeFor[atomicbitops.Int32]() {
+		return 0
+	}
+	return f.Offset
+}()
+
+// rcvMemUsed is the memory ep's received segments hold; false when it
+// cannot be read, and then the receive buffer is never given back.
+func rcvMemUsed(ep tcpip.Endpoint) (int32, bool) {
+	e, ok := ep.(*tcp.Endpoint)
+	if !ok || rcvMemOffset == 0 {
+		return 0, false
+	}
+	return (*atomicbitops.Int32)(unsafe.Add(unsafe.Pointer(e), rcvMemOffset)).Load(), true
+}
 
 // srtt is the endpoint's smoothed RTT, or a second when it has none: a
 // longer interval only grows the receive buffer sooner.
@@ -293,9 +333,12 @@ func (e *yggExit) growRecv(want int64) {
 }
 
 // giveBack, when e has been idle yggExitIdle each way, brings its
-// buffers back to their floors: the receive one when nothing waits to be
-// read, the send one when what waits to be acked fits in its floor. Only
-// what neither its reader nor its writer holds.
+// buffers back to their floors: the receive one when the endpoint holds
+// nothing received, the send one when what waits to be acked fits in its
+// floor. Only what neither its reader nor its writer holds. Not the
+// receive one by its in-order queue alone (protocol review, B1): segments
+// past a hole stay held, up to 3/4 of the size they came in under
+// (rcv.go:504), and below them the hole's own segment is not let in.
 func (e *yggExit) giveBack(now time.Time) {
 	if !e.bmu.TryLock() {
 		return
@@ -307,12 +350,17 @@ func (e *yggExit) giveBack(now time.Time) {
 	idle := now.Add(-yggExitIdle).UnixNano()
 	ops := e.ep.SocketOptions()
 	var n int64
-	if e.rcv > yggExitRecvFloor && e.lastRead.Load() <= idle {
-		if q, err := e.ep.GetSockOptInt(tcpip.ReceiveQueueSizeOption); err == nil && q == 0 {
-			ops.SetReceiveBufferSize(yggExitRecvFloor, true)
+	if held, ok := rcvMemUsed(e.ep); ok && held == 0 && e.rcv > yggExitRecvFloor && e.lastRead.Load() <= idle {
+		// Nothing received held, in order or not: past the floor gVisor
+		// then admits nothing more (segment_queue.go:49-57), and a segment
+		// let in as the size changed shows here after.
+		ops.SetReceiveBufferSize(yggExitRecvFloor, true)
+		if held, _ := rcvMemUsed(e.ep); held <= yggExitRecvFloor {
 			n += e.rcv - yggExitRecvFloor
 			e.rcv, e.copied, e.reading = yggExitRecvFloor, 0, false
 			e.prevCopied = e.firstCopied()
+		} else {
+			ops.SetReceiveBufferSize(e.rcv, true)
 		}
 	}
 	if e.snd > yggExitSendFloor && e.lastWrite.Load() <= idle && e.wmu.TryLock() {
@@ -334,9 +382,10 @@ func (e *yggExit) giveBack(now time.Time) {
 var errExitStalled = errors.New("the client took nothing for yggExitStall")
 
 // Write writes inner's way to the client, as gonet's Write does, but grows
-// the send buffer when it is full (growSend), and each wait for room has
-// yggExitStall: a blocked write gets room once the client has acked half
-// the buffer (up to 2 MiB). A client that takes nothing ends the exit,
+// the send buffer when it is full (growSend). Each call has yggExitStall
+// from its first wait for room to finish (a call is 16 KiB at most, the
+// copy's buffer): a blocked write gets room once the client has acked
+// half the buffer (up to 2 MiB). A client that takes nothing ends the exit,
 // once more waits for it than the buffer holds; one that takes 2.3 KiB/s
 // does not (fifth review: 5 min cut audio paced at 32-48 kbit/s). Not
 // TCP's user timeout: gVisor's runs from the first retransmission until
