@@ -94,7 +94,7 @@ replace github.com/sagernet/sing-box => github.com/arngory/sing-box v1.14.5-0.20
 
 replace masterdnsvpn-go => github.com/arngory/sing-box/third_party/masterdnsvpn v0.0.0-20261106212949-f0eadfa3e71c
 
-replace github.com/yggdrasil-network/yggdrasil-go => github.com/arngory/yggdrasil-go v0.5.16-0.20261108201637-5afe92f15200
+replace github.com/yggdrasil-network/yggdrasil-go => github.com/arngory/yggdrasil-go v0.5.16-0.20261122062030-3936bba2bc93
 
 // ironwood from the fork (de48fd0 on upstream's 0712ecc): a repeated session
 // init gets its first ack again, while nothing came over the session, so the
@@ -109,8 +109,12 @@ replace github.com/yggdrasil-network/yggdrasil-go => github.com/arngory/yggdrasi
 // longer opens again (arngory/ironwood#2); a peer's init keeps the replay
 // state of the keys that stay receive keys, and a re-init no longer opens
 // again what the peer sent before it, as upstream did (arngory/ironwood#3).
-// The wire is the same.
-replace github.com/Arceliar/ironwood => github.com/arngory/ironwood v0.0.0-20261121231825-de48fd05dcfe
+// The wire is the same. From the fork's pq-sessions (e8b9800 on de48fd0):
+// ironwood's hybrid post-quantum sessions, off unless options.pq turns them
+// on; off, what the node sends of its own is as above (its replies to PQ
+// packets are pq-sessions', core.PQSessions). yggdrasil-go from the fork's
+// pq-sessions too (3936bba on 5afe92f): core.PQSessions.
+replace github.com/Arceliar/ironwood => github.com/arngory/ironwood v0.0.0-20261122061954-e8b980021fcc
 
 replace github.com/sagernet/sing-quic => ./third_party/sing-quic
 

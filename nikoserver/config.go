@@ -197,6 +197,12 @@ type BackendOptions struct {
 	// largest frame, 131070 bytes, at least); absent
 	// 20, 0 nothing relayed.
 	LANRelayMbps *int `json:"lan_relay_mbps,omitempty"`
+	// PQ (yggdrasil, v0.19.0): ironwood's hybrid post-quantum sessions
+	// (arngory/ironwood pq-sessions). "off" (absent): classic sessions only,
+	// as before; "answer": the node starts none itself and answers the PQ
+	// sessions its peers start; "on": it starts them too. A peer without
+	// them talks to the node in classic sessions in every mode.
+	PQ string `json:"pq,omitempty"`
 	// hy2-*: a name that leads to an address on the node, TCP and UDP (the
 	// channel probes of raycontrol, probe-v1); nothing else of the node is
 	// reachable.
@@ -774,6 +780,11 @@ func (c *BackendConfig) validate() []ConfigError {
 		if c.Options.lanRelayMbps() < 0 {
 			e.add("options.lan_relay_mbps", "not below 0 (0: nothing relayed between a group's devices)")
 		}
+		switch c.Options.PQ {
+		case "", "off", "answer", "on":
+		default:
+			e.add("options.pq", "%q: off, answer or on", c.Options.PQ)
+		}
 	case "":
 		e.add("kind", "missing")
 	default:
@@ -819,6 +830,9 @@ func (c *BackendConfig) validate() []ConfigError {
 	}
 	if c.Kind != "yggdrasil" && c.Options.LANRelayMbps != nil {
 		e.add("options.lan_relay_mbps", "a Yggdrasil option")
+	}
+	if c.Kind != "yggdrasil" && c.Options.PQ != "" {
+		e.add("options.pq", "a Yggdrasil option")
 	}
 	if c.Options.AuthScanHMACs < 0 {
 		e.add("options.auth_scan_hmacs", "not below 0")
