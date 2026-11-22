@@ -115,7 +115,7 @@ replace github.com/yggdrasil-network/yggdrasil-go => github.com/arngory/yggdrasi
 // From the forks' main lines now: ironwood main e8dbf9c (arngory/ironwood#4,
 // the tree of cf9739c, the pq-sessions commit v0.19.0 pinned), yggdrasil-go
 // niko 4f11eeb (arngory/yggdrasil-go#4, core.PQSessions).
-replace github.com/Arceliar/ironwood => github.com/arngory/ironwood v0.0.0-20261122102305-e5f3fe7971f2
+replace github.com/Arceliar/ironwood => github.com/arngory/ironwood v0.0.0-20261122113848-2f07fa3bbcdd
 
 replace github.com/sagernet/sing-quic => ./third_party/sing-quic
 
