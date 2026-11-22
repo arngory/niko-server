@@ -112,10 +112,14 @@ replace github.com/yggdrasil-network/yggdrasil-go => github.com/arngory/yggdrasi
 // The wire is the same. Since v0.19.0, ironwood's hybrid post-quantum
 // sessions, off unless options.pq turns them on; off, what the node sends of
 // its own is as above (its replies to PQ packets are core.PQSessions').
-// From the forks' main lines now: ironwood main e8dbf9c (arngory/ironwood#4,
-// the tree of cf9739c, the pq-sessions commit v0.19.0 pinned), yggdrasil-go
-// niko 4f11eeb (arngory/yggdrasil-go#4, core.PQSessions).
-replace github.com/Arceliar/ironwood => github.com/arngory/ironwood v0.0.0-20261122113848-2f07fa3bbcdd
+// From the forks' main lines now: ironwood main 15d2d67 (arngory/ironwood#5,
+// on e8dbf9c, the tree of cf9739c that v0.19.0 pinned: of two ends, the one
+// with the higher key starts the PQ upgrade itself when the other, an answer
+// only node, does not; a lost answer to our PQInfo is asked again; the
+// classic session takes the peer's traffic for 3 s after the switch, so a
+// window of data in flight is not lost), yggdrasil-go niko 4f11eeb
+// (arngory/yggdrasil-go#4, core.PQSessions).
+replace github.com/Arceliar/ironwood => github.com/arngory/ironwood v0.0.0-20261122120922-15d2d6776ffd
 
 replace github.com/sagernet/sing-quic => ./third_party/sing-quic
 
