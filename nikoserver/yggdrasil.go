@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -126,6 +127,7 @@ func runYggdrasil(ctx context.Context, c *BackendConfig, log *Logger) error {
 		// a session to the node (raycontrol lan-v1 §2.1).
 		core.DebugPrivacy(true),
 	}
+	setup = append(setup, yggPQ(c.Options.PQ)...)
 	for _, peer := range c.Options.Peers {
 		setup = append(setup, core.Peer{URI: peer})
 	}
@@ -163,8 +165,12 @@ func runYggdrasil(ctx context.Context, c *BackendConfig, log *Logger) error {
 		<-ctx.Done()
 		ln.Close()
 	}()
-	log.Infof("yggdrasil backend on %s: address %s, public key %s, exit ports %v",
-		c.Socket, address, hex.EncodeToString(node.PublicKey()), c.Options.ExitPorts)
+	pq := c.Options.PQ
+	if pq == "" {
+		pq = "off"
+	}
+	log.Infof("yggdrasil backend on %s: address %s, public key %s, exit ports %v, PQ sessions %s",
+		c.Socket, address, hex.EncodeToString(node.PublicKey()), c.Options.ExitPorts, pq)
 	l := &yggLinks{tls: tlsConfig, users: users, node: [32]byte(node.PublicKey()), dir: dir, log: log,
 		public: len(c.Options.Peers) > 0}
 	started := time.Now()
@@ -1007,18 +1013,57 @@ func exitToInner(e *yggExit, inner string, log *Logger) {
 	}
 }
 
+// yggPQ is the core's option for options.pq. Off: none, the core's
+// sessions are upstream's classic ones. No key is required to be PQ: a
+// client without PQ sessions still reaches the node. On a node only
+// clients connect to, answer and on differ little: the clients start the
+// sessions (TestNekoServerYggdrasilPQ sees no difference).
+func yggPQ(mode string) []core.SetupOption {
+	switch mode {
+	case "answer":
+		return []core.SetupOption{core.PQSessions{AnswerOnly: true}}
+	case "on":
+		return []core.SetupOption{core.PQSessions{}}
+	}
+	return nil
+}
+
 // yggLog takes the core's lines: its per-link lines (with addresses) only
 // at debug.
 type yggLog struct{ l *Logger }
 
-func (y yggLog) Printf(f string, a ...any) { y.l.Debugf(f, a...) }
-func (y yggLog) Println(a ...any)          { y.l.Debugf("%s", fmt.Sprint(a...)) }
-func (y yggLog) Infof(f string, a ...any)  { y.l.Debugf(f, a...) }
-func (y yggLog) Infoln(a ...any)           { y.l.Debugf("%s", fmt.Sprint(a...)) }
-func (y yggLog) Warnf(f string, a ...any)  { y.l.Warnf(f, a...) }
-func (y yggLog) Warnln(a ...any)           { y.l.Warnf("%s", fmt.Sprint(a...)) }
-func (y yggLog) Errorf(f string, a ...any) { y.l.Errorf(f, a...) }
-func (y yggLog) Errorln(a ...any)          { y.l.Errorf("%s", fmt.Sprint(a...)) }
-func (y yggLog) Debugf(f string, a ...any) { y.l.Debugf(f, a...) }
-func (y yggLog) Debugln(a ...any)          { y.l.Debugf("%s", fmt.Sprint(a...)) }
+// yggKeyHex is a run of hex as long as a key's prefix (ironwood's PQ lines
+// give the first 8 bytes of the peer's key, %x) or longer: the core's lines
+// go to the journal without those with a letter in them, as no user's key
+// goes there (lan-v1 §4.3). Runs of digits alone, times and counts, stay
+// (as Niko's RedactLog, arngory/niko#123).
+var yggKeyHex = regexp.MustCompile(`[0-9a-fA-F]{16,}`)
+
+func yggRedact(line string) string {
+	return yggKeyHex.ReplaceAllStringFunc(line, func(run string) string {
+		if strings.IndexFunc(run, func(r rune) bool { return r > '9' }) < 0 {
+			return run
+		}
+		return "<key>"
+	})
+}
+
+// line logs at level (Logger's: 0 debug to 3 error), the keys left out
+func (y yggLog) line(level int, tag, f string, a ...any) {
+	if level < y.l.level {
+		return
+	}
+	y.l.logf(level, tag, "%s", yggRedact(fmt.Sprintf(f, a...)))
+}
+
+func (y yggLog) Printf(f string, a ...any) { y.line(0, "DEBUG", f, a...) }
+func (y yggLog) Println(a ...any)          { y.line(0, "DEBUG", "%s", fmt.Sprint(a...)) }
+func (y yggLog) Infof(f string, a ...any)  { y.line(0, "DEBUG", f, a...) }
+func (y yggLog) Infoln(a ...any)           { y.line(0, "DEBUG", "%s", fmt.Sprint(a...)) }
+func (y yggLog) Warnf(f string, a ...any)  { y.line(2, "WARN", f, a...) }
+func (y yggLog) Warnln(a ...any)           { y.line(2, "WARN", "%s", fmt.Sprint(a...)) }
+func (y yggLog) Errorf(f string, a ...any) { y.line(3, "ERROR", f, a...) }
+func (y yggLog) Errorln(a ...any)          { y.line(3, "ERROR", "%s", fmt.Sprint(a...)) }
+func (y yggLog) Debugf(f string, a ...any) { y.line(0, "DEBUG", f, a...) }
+func (y yggLog) Debugln(a ...any)          { y.line(0, "DEBUG", "%s", fmt.Sprint(a...)) }
 func (y yggLog) Traceln(...any)            {}
