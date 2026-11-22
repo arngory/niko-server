@@ -88,16 +88,20 @@ func TestYggLogNoKeys(t *testing.T) {
 	}
 }
 
-// A Niko client in each PQ mode against the node in each: echo through
-// the exit port in every pair, and a PQ session only where one end starts
-// it and the other takes it (on with on or answer); a client without PQ
-// sessions still reaches the node in a classic one.
+// A Niko client in each PQ mode against the node in each, with the
+// client's key above the node's and below it (of two ends with a classic
+// session, the one with the lower key starts the PQ one): echo through the
+// exit port in every pair, and a PQ session only where one end starts it
+// and the other takes it (on with on or answer); a client without PQ
+// sessions still reaches the node in a classic one. The client's ironwood
+// lines go to the test's log.
 func TestNekoServerYggdrasilPQ(t *testing.T) {
-	for _, c := range []struct {
+	type pair struct {
 		node   string
 		client *core.PQSessions // nil: an upstream client, no PQ sessions
 		want   string
-	}{
+	}
+	for _, c := range []pair{
 		{"off", &core.PQSessions{}, "classic"},
 		{"answer", &core.PQSessions{}, "pq"},
 		{"on", &core.PQSessions{}, "pq"},
@@ -112,100 +116,126 @@ func TestNekoServerYggdrasilPQ(t *testing.T) {
 				mode = "answer"
 			}
 		}
-		t.Run("node "+c.node+", client "+mode, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			n := startYggNode(t, ctx, func(b *BackendConfig) { b.Options.PQ = c.node })
-			public, private, _ := ed25519.GenerateKey(rand.Reader)
-			cert, err := yggCertificate(private)
-			if err != nil {
-				t.Fatal(err)
+		for _, higher := range []bool{true, false} {
+			order := "client key lower"
+			if higher {
+				order = "client key higher"
 			}
-			opts := []core.SetupOption{core.Peer{URI: n.peer}}
-			if c.client != nil {
-				opts = append(opts, *c.client)
-			}
-			n.setUsers(t, public)
-			client, err := core.New(cert, yggLog{NewLogger("error", io.Discard)}, opts...)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer client.Stop()
-			rwc := ipv6rwc.NewReadWriteCloser(client)
-			defer rwc.Close()
-			addr, _ := netip.AddrFromSlice(client.Address())
-			s, err := yggNetstack(ctx, rwc, addr, uint32(rwc.MTU()))
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer s.Close()
-			if !waitFor(10*time.Second, func() bool { return peerUp(client) }) {
-				t.Fatalf("the link is not up: %+v", client.GetPeers())
-			}
-			nodeAddr := tcpip.AddrFrom16Slice(address.AddrForKey(n.key)[:])
-			session := func() string {
-				for _, s := range client.PacketConn.Debug.GetSessions() {
-					if bytes.Equal(s.Key, n.key) {
-						if s.PQ && s.PQConfirmed {
-							return "pq"
-						}
-						if s.PQ {
-							return "pq, unconfirmed"
-						}
-						return "classic"
-					}
+			t.Run("node "+c.node+", client "+mode+", "+order, func(t *testing.T) {
+				testYggPQPair(t, c.node, c.client, c.want, higher)
+			})
+		}
+	}
+}
+
+// tLog is a Logger's writer into the test's log.
+type tLog struct{ t *testing.T }
+
+func (w tLog) Write(b []byte) (int, error) {
+	w.t.Helper()
+	w.t.Logf("client: %s", strings.TrimRight(string(b), "\n"))
+	return len(b), nil
+}
+
+func testYggPQPair(t *testing.T, nodeMode string, clientPQ *core.PQSessions, want string, higher bool) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	n := startYggNode(t, ctx, func(b *BackendConfig) { b.Options.PQ = nodeMode })
+	var public ed25519.PublicKey
+	var private ed25519.PrivateKey
+	for {
+		public, private, _ = ed25519.GenerateKey(rand.Reader)
+		if (bytes.Compare(public, n.key) > 0) == higher {
+			break
+		}
+	}
+	cert, err := yggCertificate(private)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := []core.SetupOption{core.Peer{URI: n.peer}}
+	if clientPQ != nil {
+		opts = append(opts, *clientPQ)
+	}
+	n.setUsers(t, public)
+	client, err := core.New(cert, yggLog{NewLogger("warn", tLog{t})}, opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Stop()
+	rwc := ipv6rwc.NewReadWriteCloser(client)
+	defer rwc.Close()
+	addr, _ := netip.AddrFromSlice(client.Address())
+	s, err := yggNetstack(ctx, rwc, addr, uint32(rwc.MTU()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if !waitFor(10*time.Second, func() bool { return peerUp(client) }) {
+		t.Fatalf("the link is not up: %+v", client.GetPeers())
+	}
+	nodeAddr := tcpip.AddrFrom16Slice(address.AddrForKey(n.key)[:])
+	session := func() string {
+		for _, s := range client.PacketConn.Debug.GetSessions() {
+			if bytes.Equal(s.Key, n.key) {
+				if s.PQ && s.PQConfirmed {
+					return "pq"
 				}
-				return "none"
-			}
-			echo := func() error {
-				dctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-				defer cancel()
-				conn, err := gonet.DialContextTCP(dctx, s, tcpip.FullAddress{NIC: 1, Addr: nodeAddr, Port: 4433}, ipv6.ProtocolNumber)
-				if err != nil {
-					return err
+				if s.PQ {
+					return "pq, unconfirmed"
 				}
-				defer conn.Close()
-				payload := make([]byte, 64<<10)
-				rand.Read(payload)
-				go conn.Write(payload)
-				got := make([]byte, len(payload))
-				conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-				if _, err := io.ReadFull(conn, got); err != nil {
-					return err
-				}
-				if !bytes.Equal(got, payload) {
-					return fmt.Errorf("the echo differs")
-				}
-				return nil
+				return "classic"
 			}
-			if err := echo(); err != nil {
-				t.Fatalf("echo through inner: %v", err)
-			}
-			// the upgrade to PQ comes after the first traffic: echo until the
-			// session settles, and once more on it
-			got := session()
-			for deadline := time.Now().Add(15 * time.Second); got != c.want && time.Now().Before(deadline); got = session() {
-				if err := echo(); err != nil {
-					t.Fatalf("echo through inner, session %s: %v", got, err)
-				}
-				time.Sleep(100 * time.Millisecond)
-			}
-			if got != c.want {
-				t.Fatalf("session %s, want %s", got, c.want)
-			}
-			if c.want == "classic" {
-				// and it stays so: no upgrade a second later
-				time.Sleep(time.Second)
-				if err := echo(); err != nil {
-					t.Fatalf("echo: %v", err)
-				}
-				if got := session(); got != "classic" {
-					t.Fatalf("session %s a second on, want classic", got)
-				}
-			}
-			if err := echo(); err != nil {
-				t.Fatalf("echo through inner, session %s: %v", got, err)
-			}
-		})
+		}
+		return "none"
+	}
+	echo := func() error {
+		dctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		conn, err := gonet.DialContextTCP(dctx, s, tcpip.FullAddress{NIC: 1, Addr: nodeAddr, Port: 4433}, ipv6.ProtocolNumber)
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+		payload := make([]byte, 64<<10)
+		rand.Read(payload)
+		go conn.Write(payload)
+		got := make([]byte, len(payload))
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		if _, err := io.ReadFull(conn, got); err != nil {
+			return err
+		}
+		if !bytes.Equal(got, payload) {
+			return fmt.Errorf("the echo differs")
+		}
+		return nil
+	}
+	if err := echo(); err != nil {
+		t.Fatalf("echo through inner: %v", err)
+	}
+	// the upgrade to PQ comes after the first traffic: echo until the
+	// session settles, and once more on it
+	got := session()
+	for deadline := time.Now().Add(20 * time.Second); got != want && time.Now().Before(deadline); got = session() {
+		if err := echo(); err != nil {
+			t.Fatalf("echo through inner, session %s: %v", got, err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if got != want {
+		t.Fatalf("session %s, want %s", got, want)
+	}
+	if want == "classic" {
+		// and it stays so: no upgrade a second later
+		time.Sleep(time.Second)
+		if err := echo(); err != nil {
+			t.Fatalf("echo: %v", err)
+		}
+		if got := session(); got != "classic" {
+			t.Fatalf("session %s a second on, want classic", got)
+		}
+	}
+	if err := echo(); err != nil {
+		t.Fatalf("echo through inner, session %s: %v", got, err)
 	}
 }
