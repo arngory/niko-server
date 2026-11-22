@@ -15,10 +15,16 @@ import (
 	"github.com/quic-go/quic-go/http3"
 )
 
+// answered is answeredFrom's verdict alone.
+func (f *udpFront) answered(link *backendLink, key flowKey, payload []byte, now time.Time) bool {
+	ok, _ := f.answeredFrom(link, key, payload, now)
+	return ok
+}
+
 // ingest is serve's decision for a datagram without the sockets: a pinned
 // flow's backend, or a classified one, pinned.
 func ingest(f *udpFront, key flowKey, d []byte, now time.Time) *backendLink {
-	if link := f.pinned(key, d, now); link != nil {
+	if link := f.pinned(key, d, netip.Addr{}, now); link != nil {
 		return link
 	}
 	if link, packets := f.classify(key, d, now); link != nil {
@@ -26,7 +32,7 @@ func ingest(f *udpFront, key flowKey, d []byte, now time.Time) *backendLink {
 		for _, p := range packets {
 			sent += len(p)
 		}
-		f.pin(key, link, d, sent, now)
+		f.pin(key, link, d, sent, netip.Addr{}, now)
 		return link
 	}
 	return nil
@@ -244,10 +250,10 @@ func TestUDPFrontConfirmedLabel(t *testing.T) {
 	front, _ := cidFront(t, true)
 	now := time.Now()
 	key := flowKey{client: netip.MustParseAddrPort("192.0.2.30:40000"), local: netip.MustParseAddrPort("127.0.0.1:443")}
-	front.pin(key, front.links["a"], shortPacket(cidID(cidSecret, 1, 1), 1200), 1200, now)
+	front.pin(key, front.links["a"], shortPacket(cidID(cidSecret, 1, 1), 1200), 1200, netip.Addr{}, now)
 	fl := front.flows[key]
 	for i := range 64 {
-		front.pinned(key, handshakePacket(cidID(cidSecret, 1, uint64(7+i)), 1200), now)
+		front.pinned(key, handshakePacket(cidID(cidSecret, 1, uint64(7+i)), 1200), netip.Addr{}, now)
 	}
 	if !fl.listed {
 		t.Fatal("packets to IDs with the flow's label confirmed it")
@@ -266,8 +272,8 @@ func TestUDPFrontFlowDetails(t *testing.T) {
 	key := func(i int) flowKey {
 		return flowKey{client: netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 0, 2, byte(i)}), 40000), local: netip.MustParseAddrPort("127.0.0.1:443")}
 	}
-	front.pin(key(1), link, nil, 0, now)
-	front.pin(key(1), link, nil, 0, now)
+	front.pin(key(1), link, nil, 0, netip.Addr{}, now)
+	front.pin(key(1), link, nil, 0, netip.Addr{}, now)
 	if len(front.flows) != 1 || front.unconfirmed.n != 1 {
 		t.Fatal("a key pinned twice")
 	}
@@ -277,7 +283,7 @@ func TestUDPFrontFlowDetails(t *testing.T) {
 	front.answered(nil, key(1), serverInitial(nil, later), now)
 	var id [cidLen]byte
 	copy(id[:], later)
-	front.pinned(key(1), shortPacket(id, 1200), now)
+	front.pinned(key(1), shortPacket(id, 1200), netip.Addr{}, now)
 	if !fl.listed {
 		t.Fatal("a later answer's ID confirmed the flow")
 	}
@@ -285,27 +291,27 @@ func TestUDPFrontFlowDetails(t *testing.T) {
 	long := handshakePacket(id, 1200)
 	long[5] = 9
 	copy(long[6:], first)
-	front.pinned(key(1), long, now)
+	front.pinned(key(1), long, netip.Addr{}, now)
 	// A packet without the fixed bit that carries the first ID.
 	copy(id[:], first)
 	nofixed := shortPacket(id, 1200)
 	nofixed[0] &= 0x3f
-	front.pinned(key(1), nofixed, now)
+	front.pinned(key(1), nofixed, netip.Addr{}, now)
 	if !fl.listed {
 		t.Fatal("a packet to another ID length, or without the fixed bit, confirmed the flow")
 	}
-	front.pinned(key(1), shortPacket(id, 1200), now)
+	front.pinned(key(1), shortPacket(id, 1200), netip.Addr{}, now)
 	if fl.listed {
 		t.Fatal("the first answer's ID did not confirm the flow")
 	}
 	front.unpin(key(1))
-	front.pin(key(1), link, nil, 0, now)
+	front.pin(key(1), link, nil, 0, netip.Addr{}, now)
 	// In use, the oldest flow is not the one to go: 1 is used last.
 	for i := 2; i <= 4; i++ {
-		front.pin(key(i), link, nil, 0, now)
+		front.pin(key(i), link, nil, 0, netip.Addr{}, now)
 	}
-	front.pinned(key(1), nofixed, now)
-	front.pin(key(5), link, nil, 0, now)
+	front.pinned(key(1), nofixed, netip.Addr{}, now)
+	front.pin(key(5), link, nil, 0, netip.Addr{}, now)
 	if front.flows[key(1)] == nil || front.flows[key(2)] != nil {
 		t.Fatal("a flow in use went before an idle one")
 	}
@@ -331,27 +337,27 @@ func TestUDPFrontServerCIDChecks(t *testing.T) {
 	other[0] ^= 1
 	for _, others := range []int{maxServerCIDChecks - 1, maxServerCIDChecks} {
 		front, link := desyncFront(t)
-		front.pin(key, link, handshakePacket(client, 1200), 1200, now)
+		front.pin(key, link, handshakePacket(client, 1200), 1200, netip.Addr{}, now)
 		fl := front.flows[key]
 		front.answered(nil, key, serverInitial(client[:], server[:]), now)
 		for range 2 * maxServerCIDChecks {
-			front.pinned(key, handshakePacket(client, 1200), now)
+			front.pinned(key, handshakePacket(client, 1200), netip.Addr{}, now)
 		}
 		for range others {
-			front.pinned(key, shortPacket(other, 1200), now)
+			front.pinned(key, shortPacket(other, 1200), netip.Addr{}, now)
 		}
-		front.pinned(key, shortPacket(server, 1200), now)
+		front.pinned(key, shortPacket(server, 1200), netip.Addr{}, now)
 		if fl.listed != (others == maxServerCIDChecks) {
 			t.Fatalf("%d datagrams to other IDs: listed %v", others, fl.listed)
 		}
 		checkFlows(t, front)
 	}
 	front, link := desyncFront(t)
-	front.pin(key, link, handshakePacket(client, 1200), 1200, now)
+	front.pin(key, link, handshakePacket(client, 1200), 1200, netip.Addr{}, now)
 	fl := front.flows[key]
 	front.answered(nil, key, serverInitial(client[:], client[:]), now)
-	front.pinned(key, shortPacket(client, 1200), now)
-	front.pinned(key, handshakePacket(client, 1200), now)
+	front.pinned(key, shortPacket(client, 1200), netip.Addr{}, now)
+	front.pinned(key, handshakePacket(client, 1200), netip.Addr{}, now)
 	if !fl.listed || !fl.answered || fl.serverLen != 0 {
 		t.Fatalf("an answer naming the client's own ID: listed %v, server ID %x", fl.listed, fl.serverCID[:fl.serverLen])
 	}
@@ -462,7 +468,7 @@ func TestUDPFrontPathProbes(t *testing.T) {
 	var id [cidLen]byte
 	probe := shortPacket(id, quicProbeSize)
 	a := front.links["a"]
-	front.pin(key(1), a, shortPacket(cidID(cidSecret, 1, 1), 100), 100, now) // 100 bytes in
+	front.pin(key(1), a, shortPacket(cidID(cidSecret, 1, 1), 100), 100, netip.Addr{}, now) // 100 bytes in
 	fl := front.flows[key(1)]
 	if !front.answered(a, key(1), probe, now) || !fl.freeProbe {
 		t.Fatal("the first probe past 3x was not free")
@@ -475,7 +481,7 @@ func TestUDPFrontPathProbes(t *testing.T) {
 			t.Fatalf("an answer of %d bytes (not a probe) was held", len(other))
 		}
 	}
-	front.pinned(key(1), shortPacket(id, 1200), now) // a PATH_RESPONSE: 1300 in, 3900 out
+	front.pinned(key(1), shortPacket(id, 1200), netip.Addr{}, now) // a PATH_RESPONSE: 1300 in, 3900 out
 	if !front.answered(a, key(1), probe, now) || !front.answered(a, key(1), probe, now) || front.answered(a, key(1), probe, now) {
 		t.Fatalf("for 1300 in, %d out: not two more probes and no third", fl.sent)
 	}
@@ -485,7 +491,7 @@ func TestUDPFrontPathProbes(t *testing.T) {
 	}
 	// The backend's long headers among its first countedAnswers datagrams
 	// count with the probes, after a short header (0.5-RTT data) too.
-	front.pin(key(2), a, handshakePacket(id, 1200), 2400, now) // a first flight of two: 7200 out
+	front.pin(key(2), a, handshakePacket(id, 1200), 2400, netip.Addr{}, now) // a first flight of two: 7200 out
 	f2 := front.flows[key(2)]
 	front.answered(a, key(2), handshakePacket(id, 2400), now)
 	front.answered(a, key(2), shortPacket(id, 100), now)
@@ -505,7 +511,7 @@ func TestUDPFrontPathProbes(t *testing.T) {
 	// after a short one.
 	s := front.links["s"]
 	initial := serverInitial(nil, nil)[:minInitialDatagram] // a long header typed Initial
-	front.pin(key(7), s, obfuscate(password, initial), 1208, now)
+	front.pin(key(7), s, obfuscate(password, initial), 1208, netip.Addr{}, now)
 	f7 := front.flows[key(7)]
 	if f7 == nil || f7.route == nil {
 		t.Fatal("not pinned under salamander")
@@ -517,9 +523,9 @@ func TestUDPFrontPathProbes(t *testing.T) {
 		t.Fatalf("under salamander: %d counted of %d answers", f7.sent, countedAnswers+1)
 	}
 	was := f7.sent
-	front.pinned(key(7), obfuscate(password, shortPacket(id, 1300)), now)
+	front.pinned(key(7), obfuscate(password, shortPacket(id, 1300)), netip.Addr{}, now)
 	front.answered(s, key(7), obfuscate(password, handshakePacket(id, 1300)), now)
-	front.pinned(key(7), obfuscate(password, handshakePacket(id, 1200)), now)
+	front.pinned(key(7), obfuscate(password, handshakePacket(id, 1200)), netip.Addr{}, now)
 	front.answered(s, key(7), obfuscate(password, handshakePacket(id, 1300)), now)
 	if f7.sent != was+1308 {
 		t.Fatalf("after the client's new handshake: %d counted, %d before", f7.sent, was)
@@ -530,11 +536,11 @@ func TestUDPFrontPathProbes(t *testing.T) {
 	port := func(p uint16) flowKey {
 		return flowKey{client: netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 0, 2, 5}), p), local: netip.MustParseAddrPort("127.0.0.1:443")}
 	}
-	front.pin(port(1), a, shortPacket(cidID(cidSecret, 1, 1), 100), 100, now)
+	front.pin(port(1), a, shortPacket(cidID(cidSecret, 1, 1), 100), 100, netip.Addr{}, now)
 	for range 4 {
-		front.pinned(port(1), shortPacket(id, 1200), now)
+		front.pinned(port(1), shortPacket(id, 1200), netip.Addr{}, now)
 	}
-	front.pin(port(2), a, shortPacket(cidID(cidSecret, 1, 2), 50), 50, now)
+	front.pin(port(2), a, shortPacket(cidID(cidSecret, 1, 2), 50), 50, netip.Addr{}, now)
 	if !front.answered(a, port(2), probe, now) || front.freeProbes.sources[sourcePrefix(port(2).client.Addr(), 64)] != nil {
 		t.Fatal("a new port of a source that sent 4950 bytes: its probe held, or a free one taken")
 	}
@@ -546,8 +552,8 @@ func TestUDPFrontPathProbes(t *testing.T) {
 	flight := func(p uint16) flowKey {
 		return flowKey{client: netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 0, 2, 6}), p), local: netip.MustParseAddrPort("127.0.0.1:443")}
 	}
-	front.pin(flight(1), a, handshakePacket(id, 1200), 2400, now)
-	front.pin(flight(2), a, shortPacket(cidID(cidSecret, 1, 3), 50), 50, now)
+	front.pin(flight(1), a, handshakePacket(id, 1200), 2400, netip.Addr{}, now)
+	front.pin(flight(2), a, shortPacket(cidID(cidSecret, 1, 3), 50), 50, netip.Addr{}, now)
 	if !front.answered(a, flight(2), probe, now) || front.freeProbes.sources[sourcePrefix(flight(2).client.Addr(), 64)] != nil {
 		t.Fatal("a new port of a source whose first flight was 2400 bytes: its probe held, or a free one taken")
 	}
@@ -557,7 +563,7 @@ func TestUDPFrontPathProbes(t *testing.T) {
 	}
 	for i := range freeProbeBurst + 1 {
 		k := from(uint16(50000 + i))
-		front.pin(k, a, shortPacket(cidID(cidSecret, 1, 1), 100), 100, now)
+		front.pin(k, a, shortPacket(cidID(cidSecret, 1, 1), 100), 100, netip.Addr{}, now)
 		if front.answered(a, k, probe, now) != (i < freeProbeBurst) {
 			t.Fatalf("free probe %d of a source", i+1)
 		}
@@ -572,7 +578,7 @@ func TestUDPFrontPathProbes(t *testing.T) {
 	if front.answered(s, key(9), obfuscate(password, probe), now) || !front.answered(s, key(9), probe, now) {
 		t.Fatal("to no flow of a salamander link: its probe went, or a plain datagram of 1200 bytes was held")
 	}
-	front.pin(key(4), s, obfuscate(password, shortPacket(cidID(cidSecret, 3, 1), 100)), 108, now)
+	front.pin(key(4), s, obfuscate(password, shortPacket(cidID(cidSecret, 3, 1), 100)), 108, netip.Addr{}, now)
 	if front.flows[key(4)] == nil || front.flows[key(4)].route == nil {
 		t.Fatal("not pinned under salamander")
 	}
@@ -679,27 +685,27 @@ func TestUDPFrontClientIDs(t *testing.T) {
 	copy(third[:], "third-id")
 	copy(server[:], "serverid")
 	front, link := desyncFront(t)
-	front.pin(key, link, handshakePacket(first, 1200), 1200, now)
+	front.pin(key, link, handshakePacket(first, 1200), 1200, netip.Addr{}, now)
 	fl := front.flows[key]
-	front.pinned(key, handshakePacket(second, 1200), now)
+	front.pinned(key, handshakePacket(second, 1200), netip.Addr{}, now)
 	front.answered(nil, key, serverInitial(second[:], second[:]), now)
-	front.pinned(key, shortPacket(second, 1200), now)
+	front.pinned(key, shortPacket(second, 1200), netip.Addr{}, now)
 	if !fl.listed || fl.serverLen != 0 {
 		t.Fatalf("a refusal naming the second ID: listed %v, server ID %x", fl.listed, fl.serverCID[:fl.serverLen])
 	}
 	front, link = desyncFront(t)
-	front.pin(key, link, handshakePacket(first, 1200), 1200, now)
+	front.pin(key, link, handshakePacket(first, 1200), 1200, netip.Addr{}, now)
 	fl = front.flows[key]
-	front.pinned(key, handshakePacket(second, 1200), now)
-	front.pinned(key, handshakePacket(third, 1200), now)
+	front.pinned(key, handshakePacket(second, 1200), netip.Addr{}, now)
+	front.pinned(key, handshakePacket(third, 1200), netip.Addr{}, now)
 	front.answered(nil, key, serverInitial(first[:], server[:]), now)
-	front.pinned(key, shortPacket(server, 1200), now)
+	front.pinned(key, shortPacket(server, 1200), netip.Addr{}, now)
 	if !fl.listed {
 		t.Fatal("a flow of three IDs of the client's was confirmed")
 	}
 	// A probe held does not take the place of the first answer.
 	front, link = desyncFront(t)
-	front.pin(key, link, shortPacket(server, 100), 100, now)
+	front.pin(key, link, shortPacket(server, 100), 100, netip.Addr{}, now)
 	fl = front.flows[key]
 	fl.freeProbe = true
 	if front.answered(nil, key, shortPacket(server, quicProbeSize), now) || fl.answered {
@@ -720,9 +726,9 @@ func TestUDPFrontConfirmedPerSource(t *testing.T) {
 	copy(server[:], "serverid")
 	confirm := func(client string) *udpFlow {
 		key := flowKey{client: netip.MustParseAddrPort(client), local: local}
-		front.pin(key, link, nil, 0, now)
+		front.pin(key, link, nil, 0, netip.Addr{}, now)
 		front.answered(nil, key, serverInitial(nil, server[:]), now)
-		front.pinned(key, shortPacket(server, 1200), now)
+		front.pinned(key, shortPacket(server, 1200), netip.Addr{}, now)
 		return front.flows[key]
 	}
 	if confirm("192.0.2.60:1").listed || confirm("192.0.2.60:2").listed {
@@ -739,10 +745,10 @@ func TestUDPFrontConfirmedPerSource(t *testing.T) {
 	}
 	refused := flowKey{client: netip.MustParseAddrPort("192.0.2.60:3"), local: local}
 	for range 2 * maxServerCIDChecks { // refused, not spent
-		front.pinned(refused, shortPacket(server, 1200), now)
+		front.pinned(refused, shortPacket(server, 1200), netip.Addr{}, now)
 	}
 	front.unpin(flowKey{client: netip.MustParseAddrPort("192.0.2.60:1"), local: local})
-	front.pinned(refused, shortPacket(server, 1200), now)
+	front.pinned(refused, shortPacket(server, 1200), netip.Addr{}, now)
 	if front.flows[refused].listed {
 		t.Fatal("a flow refused at the cap was not confirmed once a place was free")
 	}
@@ -771,7 +777,7 @@ func TestUDPFrontFreeProbesTotal(t *testing.T) {
 	free := 0
 	for i := range freeProbeTotalBurst + 64 {
 		key := flowKey{client: netip.AddrPortFrom(netip.AddrFrom4([4]byte{10, 0, byte(i >> 8), byte(i)}), 40000), local: netip.MustParseAddrPort("127.0.0.1:443")}
-		front.pin(key, a, shortPacket(cidID(cidSecret, 1, 1), 100), 100, now)
+		front.pin(key, a, shortPacket(cidID(cidSecret, 1, 1), 100), 100, netip.Addr{}, now)
 		if front.answered(a, key, shortPacket(id, quicProbeSize), now) {
 			free++
 		}
@@ -794,12 +800,12 @@ func TestUDPFrontConfirmedSilent(t *testing.T) {
 	other[0] ^= 1
 	confirm := func(client string) (flowKey, *udpFlow) {
 		key := flowKey{client: netip.MustParseAddrPort(client), local: netip.MustParseAddrPort("127.0.0.1:443")}
-		front.pin(key, link, nil, 0, now)
+		front.pin(key, link, nil, 0, netip.Addr{}, now)
 		front.answered(nil, key, serverInitial(nil, server[:]), now)
 		for range maxServerCIDChecks - 1 {
-			front.pinned(key, shortPacket(other, 1200), now)
+			front.pinned(key, shortPacket(other, 1200), netip.Addr{}, now)
 		}
-		front.pinned(key, shortPacket(server, 1200), now)
+		front.pinned(key, shortPacket(server, 1200), netip.Addr{}, now)
 		return key, front.flows[key]
 	}
 	silentKey, silent := confirm("192.0.2.70:1")
@@ -808,11 +814,11 @@ func TestUDPFrontConfirmedSilent(t *testing.T) {
 		t.Fatal("not confirmed")
 	}
 	later := now.Add(front.idle/2 + time.Second)
-	front.pinned(silentKey, shortPacket(server, 100), later)
-	front.pinned(answeredKey, shortPacket(server, 100), later)
+	front.pinned(silentKey, shortPacket(server, 100), netip.Addr{}, later)
+	front.pinned(answeredKey, shortPacket(server, 100), netip.Addr{}, later)
 	front.answered(nil, answeredKey, shortPacket(server, 100), later)
 	busy := flowKey{client: netip.MustParseAddrPort("192.0.2.72:1"), local: netip.MustParseAddrPort("127.0.0.1:443")}
-	front.pin(busy, link, nil, 0, later) // listed, in use: after the silent one
+	front.pin(busy, link, nil, 0, netip.Addr{}, later) // listed, in use: after the silent one
 	front.expire(later)
 	if !silent.listed || answered.listed {
 		t.Fatalf("after idle/2: the silent backend's flow listed %v, the answered one's %v", silent.listed, answered.listed)
@@ -822,15 +828,15 @@ func TestUDPFrontConfirmedSilent(t *testing.T) {
 		t.Fatal("listed again, but not the first to go")
 	}
 	// Its client alone confirms nothing while the backend is silent.
-	front.pinned(silentKey, shortPacket(server, 100), later)
+	front.pinned(silentKey, shortPacket(server, 100), netip.Addr{}, later)
 	if !silent.listed {
 		t.Fatal("confirmed anew by its client alone")
 	}
 	// Once the backend answers, its checks start again: one to another
 	// ID, then the server's.
 	front.answered(nil, silentKey, shortPacket(server, 100), later)
-	front.pinned(silentKey, shortPacket(other, 100), later)
-	front.pinned(silentKey, shortPacket(server, 100), later)
+	front.pinned(silentKey, shortPacket(other, 100), netip.Addr{}, later)
+	front.pinned(silentKey, shortPacket(server, 100), netip.Addr{}, later)
 	if silent.listed {
 		t.Fatal("not confirmed anew")
 	}
@@ -847,12 +853,12 @@ func TestUDPFrontConfirmedSilent(t *testing.T) {
 		{"an answer since the client's last datagram", time.Second, 0, time.Second + half + 5*time.Second},
 	} {
 		front.unconfirm(silent)
-		front.pinned(silentKey, shortPacket(other, 100), later)
+		front.pinned(silentKey, shortPacket(other, 100), netip.Addr{}, later)
 		front.answered(nil, silentKey, shortPacket(server, 100), later.Add(c.answer))
 		if c.between > 0 {
-			front.pinned(silentKey, shortPacket(other, 100), later.Add(c.between))
+			front.pinned(silentKey, shortPacket(other, 100), netip.Addr{}, later.Add(c.between))
 		}
-		front.pinned(silentKey, shortPacket(server, 100), later.Add(c.at))
+		front.pinned(silentKey, shortPacket(server, 100), netip.Addr{}, later.Add(c.at))
 		if silent.listed {
 			t.Fatalf("%s: not confirmed", c.name)
 		}
@@ -860,8 +866,8 @@ func TestUDPFrontConfirmedSilent(t *testing.T) {
 	}
 	// One more than idle/2 old, the client's last datagram after it: not.
 	front.unconfirm(silent)
-	front.pinned(silentKey, shortPacket(other, 100), later.Add(2*time.Second))
-	front.pinned(silentKey, shortPacket(server, 100), later.Add(2*time.Second+half+time.Second))
+	front.pinned(silentKey, shortPacket(other, 100), netip.Addr{}, later.Add(2*time.Second))
+	front.pinned(silentKey, shortPacket(server, 100), netip.Addr{}, later.Add(2*time.Second+half+time.Second))
 	if !silent.listed {
 		t.Fatal("confirmed with the backend silent past idle/2")
 	}
@@ -875,8 +881,8 @@ func TestUDPFrontClockBack(t *testing.T) {
 	front, link := desyncFront(t)
 	now := time.Now()
 	key := flowKey{client: netip.MustParseAddrPort("192.0.2.80:1"), local: netip.MustParseAddrPort("127.0.0.1:443")}
-	front.pin(key, link, nil, 0, now)
-	front.pinned(key, shortPacket([cidLen]byte{}, 100), now.Add(time.Second))
+	front.pin(key, link, nil, 0, netip.Addr{}, now)
+	front.pinned(key, shortPacket([cidLen]byte{}, 100), netip.Addr{}, now.Add(time.Second))
 	front.answered(nil, key, shortPacket([cidLen]byte{}, 100), now.Add(time.Second))
 	front.unconfirmed.remove(front.flows[key])
 	front.confirmed[sourcePrefix(key.client.Addr(), 48)]++
@@ -923,17 +929,17 @@ func TestUDPFrontBusySource(t *testing.T) {
 	from := func(port int) flowKey {
 		return flowKey{client: netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 0, 2, 90}), uint16(port)), local: netip.MustParseAddrPort("127.0.0.1:443")}
 	}
-	front.pin(from(1), a, shortPacket(cidID(cidSecret, 1, 1), 1200), 1200, now)
+	front.pin(from(1), a, shortPacket(cidID(cidSecret, 1, 1), 1200), 1200, netip.Addr{}, now)
 	for range 1000 {
-		front.pinned(from(1), shortPacket(id, 1200), now) // 1.2 MB in
+		front.pinned(from(1), shortPacket(id, 1200), netip.Addr{}, now) // 1.2 MB in
 	}
 	went := 0
 	for i := range 200 {
 		k := from(100 + i)
 		if i%2 == 0 {
-			front.pin(k, a, shortPacket(cidID(cidSecret, 1, uint64(2+i)), 50), 50, now)
+			front.pin(k, a, shortPacket(cidID(cidSecret, 1, uint64(2+i)), 50), 50, netip.Addr{}, now)
 		} else {
-			front.pin(k, a, handshakePacket(id, 1200), 1200, now)
+			front.pin(k, a, handshakePacket(id, 1200), 1200, netip.Addr{}, now)
 			for range 3 {
 				front.answered(a, k, probe, now) // its own 3x
 			}
@@ -948,7 +954,7 @@ func TestUDPFrontBusySource(t *testing.T) {
 	// The total share empty: a source's free probe neither goes nor is taken.
 	front.allFreeProbes = tokenBucket{tokens: 0, last: now}
 	k := flowKey{client: netip.MustParseAddrPort("192.0.2.91:1"), local: netip.MustParseAddrPort("127.0.0.1:443")}
-	front.pin(k, a, shortPacket(cidID(cidSecret, 1, 999), 50), 50, now)
+	front.pin(k, a, shortPacket(cidID(cidSecret, 1, 999), 50), 50, netip.Addr{}, now)
 	if front.answered(a, k, probe, now) {
 		t.Fatal("a free probe went with the total share empty")
 	}

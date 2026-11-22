@@ -92,34 +92,34 @@ func TestPendingQueries(t *testing.T) {
 	q, end := pendingQuery(t, 0x4242, 1232)
 	a := pendingAnswer(t, q, 900)
 
-	if _, ok := p.take(client, a); ok {
+	if _, _, ok := p.take(client, a); ok {
 		t.Fatal("an answer no query waits for")
 	}
 	// A resolver's retry: two queries, two answers.
-	p.add(client, q, end)
-	p.add(client, q, end)
+	p.add(client, q, end, netip.Addr{})
+	p.add(client, q, end, netip.Addr{})
 	for i := range 2 {
-		if size, ok := p.take(client, a); !ok || size != 1232 {
+		if size, _, ok := p.take(client, a); !ok || size != 1232 {
 			t.Fatalf("answer %d: %d %v", i, size, ok)
 		}
 	}
-	if _, ok := p.take(client, a); ok {
+	if _, _, ok := p.take(client, a); ok {
 		t.Fatal("a third answer to two queries")
 	}
 	// Another client, the same ID: not its query.
-	p.add(client, q, end)
-	if _, ok := p.take(netip.MustParseAddrPort("198.51.100.8:5353"), a); ok {
+	p.add(client, q, end, netip.Addr{})
+	if _, _, ok := p.take(netip.MustParseAddrPort("198.51.100.8:5353"), a); ok {
 		t.Fatal("an answer for another client")
 	}
 	// The previous generation still counts; two later, gone.
 	now = now.Add(pendingGeneration + time.Second)
-	p.add(netip.MustParseAddrPort("198.51.100.9:1"), q, end) // turns the generations over
-	if _, ok := p.take(client, a); !ok {
+	p.add(netip.MustParseAddrPort("198.51.100.9:1"), q, end, netip.Addr{}) // turns the generations over
+	if _, _, ok := p.take(client, a); !ok {
 		t.Fatal("an answer within the second generation dropped")
 	}
-	p.add(client, q, end)
+	p.add(client, q, end, netip.Addr{})
 	now = now.Add(2*pendingGeneration + time.Second)
-	if _, ok := p.take(client, a); ok {
+	if _, _, ok := p.take(client, a); ok {
 		t.Fatal("an answer after two generations")
 	}
 }
@@ -191,7 +191,7 @@ func TestFrontAnswerSize(t *testing.T) {
 	} {
 		q, end := pendingQuery(t, 7, c.edns)
 		a := pendingAnswer(t, q, c.size)
-		f.pending.add(client, q, end)
+		f.pending.add(client, q, end, netip.Addr{})
 		f.answer(client, local, a)
 		got := read()
 		switch {
