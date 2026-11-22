@@ -129,17 +129,24 @@ func TestNekoServerYggdrasilPQ(t *testing.T) {
 }
 
 // tLog is a Logger's writer into the test's log.
-type tLog struct{ t *testing.T }
+type tLog struct {
+	t   *testing.T
+	who string
+}
 
 func (w tLog) Write(b []byte) (int, error) {
 	w.t.Helper()
-	w.t.Logf("client: %s", strings.TrimRight(string(b), "\n"))
+	w.t.Logf("%s: %s", w.who, strings.TrimRight(string(b), "\n"))
 	return len(b), nil
 }
 
 func testYggPQPair(t *testing.T, nodeMode string, clientPQ *core.PQSessions, want string, higher bool) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	yggNodeLog = tLog{t, "node"}
+	defer func() { yggNodeLog = io.Discard }()
+	began := time.Now()
+	phase := func(what string) { t.Logf("%v %s", time.Since(began).Round(10*time.Millisecond), what) }
 	n := startYggNode(t, ctx, func(b *BackendConfig) { b.Options.PQ = nodeMode })
 	var public ed25519.PublicKey
 	var private ed25519.PrivateKey
@@ -158,7 +165,7 @@ func testYggPQPair(t *testing.T, nodeMode string, clientPQ *core.PQSessions, wan
 		opts = append(opts, *clientPQ)
 	}
 	n.setUsers(t, public)
-	client, err := core.New(cert, yggLog{NewLogger("warn", tLog{t})}, opts...)
+	client, err := core.New(cert, yggLog{NewLogger("warn", tLog{t, "client"})}, opts...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,6 +181,7 @@ func testYggPQPair(t *testing.T, nodeMode string, clientPQ *core.PQSessions, wan
 	if !waitFor(10*time.Second, func() bool { return peerUp(client) }) {
 		t.Fatalf("the link is not up: %+v", client.GetPeers())
 	}
+	phase("link up")
 	nodeAddr := tcpip.AddrFrom16Slice(address.AddrForKey(n.key)[:])
 	session := func() string {
 		for _, s := range client.PacketConn.Debug.GetSessions() {
@@ -210,9 +218,12 @@ func testYggPQPair(t *testing.T, nodeMode string, clientPQ *core.PQSessions, wan
 		}
 		return nil
 	}
+	phase("first echo")
 	if err := echo(); err != nil {
+		phase("first echo failed, session " + session())
 		t.Fatalf("echo through inner: %v", err)
 	}
+	phase("first echo done, session " + session())
 	// the upgrade to PQ comes after the first traffic: echo until the
 	// session settles, and once more on it
 	got := session()
