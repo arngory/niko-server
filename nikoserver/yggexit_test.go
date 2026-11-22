@@ -38,6 +38,28 @@ func (p pktPipe) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
+// delayed is out with each packet delivered d after it was sent, in order.
+func delayed(out chan<- []byte, d time.Duration) chan<- []byte {
+	type timed struct {
+		at  time.Time
+		pkt []byte
+	}
+	in, mid := make(chan []byte, 1<<16), make(chan timed, 1<<16)
+	go func() {
+		for pkt := range in {
+			mid <- timed{time.Now().Add(d), pkt}
+		}
+		close(mid)
+	}()
+	go func() {
+		for p := range mid {
+			time.Sleep(time.Until(p.at))
+			out <- p.pkt
+		}
+	}()
+	return in
+}
+
 // exitRig is a node's exits on one netstack (ns), a client on another
 // (cs), and inner as serve says, on a unix socket; into carries packets to
 // the node, from any source.
@@ -48,18 +70,30 @@ type exitRig struct {
 	open         *yggExitCount
 }
 
+// exitRigMTU is the rig's links' MTU (the node's mesh has 1280),
+// exitRigDelay their delay each way, exitRigLog the node's log.
+var (
+	exitRigMTU   uint32 = 65535
+	exitRigDelay time.Duration
+	exitRigLog   = NewLogger("error", io.Discard)
+)
+
 func newExitRig(t *testing.T, serve func(net.Conn), allowed func(src netip.Addr) (yggExitSource, bool)) *exitRig {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	a, b := make(chan []byte, 1024), make(chan []byte, 1024)
+	toNode, toClient := chan<- []byte(a), chan<- []byte(b)
+	if exitRigDelay > 0 {
+		toNode, toClient = delayed(a, exitRigDelay), delayed(b, exitRigDelay)
+	}
 	r := &exitRig{into: a, node: netip.MustParseAddr("200::1"), client: netip.MustParseAddr("201::2"), open: newYggExitCount()}
 	var err error
-	if r.ns, err = yggNetstack(ctx, pktPipe{in: a, out: b}, r.node, 65535); err != nil {
+	if r.ns, err = yggNetstack(ctx, pktPipe{in: a, out: toClient}, r.node, exitRigMTU); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(r.ns.Close)
-	if r.cs, err = yggNetstack(ctx, pktPipe{in: b, out: a}, r.client, 65535); err != nil {
+	if r.cs, err = yggNetstack(ctx, pktPipe{in: b, out: toNode}, r.client, exitRigMTU); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(r.cs.Close)
@@ -83,7 +117,7 @@ func newExitRig(t *testing.T, serve func(net.Conn), allowed func(src netip.Addr)
 		allowed = func(src netip.Addr) (yggExitSource, bool) { return who, src == r.client }
 	}
 	t.Cleanup(func() { r.open.drop(func([32]byte) bool { return false }) })
-	serveExits(r.ns, map[uint16]bool{443: true}, inner, allowed, r.open, NewLogger("error", io.Discard))
+	serveExits(r.ns, map[uint16]bool{443: true}, inner, allowed, r.open, exitRigLog)
 	return r
 }
 
