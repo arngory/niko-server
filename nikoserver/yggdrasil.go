@@ -636,6 +636,33 @@ func (l *oneConn) Accept() (net.Conn, error) {
 func (l *oneConn) Close() error   { return nil }
 func (l *oneConn) Addr() net.Addr { return l.conn.LocalAddr() }
 
+// yggTimeWait is how long an exit's endpoint stays in TIME-WAIT, where
+// the node closed first, against gVisor's 60 s (RFC 9293 asks 2 MSL,
+// MUST-13). gVisor takes a SYN to a 4-tuple in TIME-WAIT to a listening
+// endpoint only (MAY-2), never to the forwarder: a client that picked
+// the port again waited out the rest unanswered (protocol review: 241 of
+// 5000 short exits in a row, 2705 endpoints in TIME-WAIT). What it
+// guards matters little here. A late FIN of the client's, our ACK lost,
+// gets an RST in LAST-ACK, where the client has all of the reply and our
+// FIN. An old segment taken into a new connection needs the client's
+// port again and a segment of the old one still in the mesh past a
+// second; and, ISNs being a hash of the 4-tuple plus a 64 ns clock
+// (gVisor's connect.go:223-248, Linux's alike, RFC 6528), the old one to
+// have carried more than the clock's 15.6 MB a second since it began,
+// the new window being where its sequence numbers had got to. gVisor has
+// no PAWS (rcv.go:564); a client with timestamps has (protocol review).
+// What such a segment would corrupt is inner's AEAD stream: it breaks.
+const yggTimeWait = time.Second
+
+// yggFinWait2 is how long an exit's endpoint, closed by the node, waits in
+// FIN-WAIT-2 for the client's FIN, against gVisor's 60 s: one user's
+// exits ended every 5 s would hold the ring (yggExitsClosing) to
+// themselves. The wait is the orphan's only (rcv.go:301-309, Close): the
+// node's half-close with the client's way open has none, and a client
+// that half-closes first meets CLOSE-WAIT, not this. Data the client
+// sends here gets an RST: the node has closed both ways.
+var yggFinWait2 = 10 * time.Second // a var for the tests
+
 // yggNetstack is a gVisor stack on the node's mesh address; rwc carries its
 // packets to and from the mesh until ctx ends.
 func yggNetstack(ctx context.Context, rwc io.ReadWriter, address netip.Addr, mtu uint32) (*stack.Stack, error) {
@@ -645,6 +672,10 @@ func yggNetstack(ctx context.Context, rwc io.ReadWriter, address netip.Addr, mtu
 	})
 	sack := tcpip.TCPSACKEnabled(true)
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &sack)
+	tw := tcpip.TCPTimeWaitTimeoutOption(yggTimeWait)
+	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &tw)
+	fw2 := tcpip.TCPLingerTimeoutOption(yggFinWait2)
+	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &fw2)
 	ep := channel.New(1024, mtu, "")
 	if err := s.CreateNIC(1, ep); err != nil {
 		s.Close()
@@ -693,6 +724,15 @@ func serveExits(s *stack.Stack, exits map[uint16]bool, inner string, allowed fun
 	// Room for every exit's handshake and the refused in between: past it
 	// the forwarder would drop a SYN unanswered, not RST it (third review:
 	// 16 users' handshakes held a new one's dial 5 s, 127 s a round).
+	// The tests' vars are read here, on the caller's goroutine, not by
+	// exits a test before still running.
+	open.mu.Lock()
+	open.log, open.closingMax, open.linger = log, yggExitsClosing, yggExitLinger
+	open.mu.Unlock()
+	if rcvMemOffset == 0 {
+		log.Warnf("gVisor's count of received memory not found: exits' receive buffers are never given back")
+	}
+	mtu := s.NICInfo()[1].MTU
 	fwd := tcp.NewForwarder(s, 0, yggExitsMax+1024, func(r *tcp.ForwarderRequest) {
 		if !exits[r.ID().LocalPort] {
 			r.Complete(true)
@@ -718,7 +758,8 @@ func serveExits(s *stack.Stack, exits map[uint16]bool, inner string, allowed fun
 		idle, interval := tcpip.KeepaliveIdleOption(time.Minute), tcpip.KeepaliveIntervalOption(15*time.Second)
 		_ = ep.SetSockOpt(&idle)
 		_ = ep.SetSockOpt(&interval)
-		exit := &yggExit{c: gonet.NewTCPConn(&wq, ep), ep: ep}
+		exit := &yggExit{c: gonet.NewTCPConn(&wq, ep), ep: ep, wq: &wq, who: who, open: open}
+		exit.buffers(mtu)
 		open.hold(who.key, exit)
 		// The key may have left the file since allowed: set swaps the
 		// addresses, then drops the exits held, so one of the two sees it.
@@ -731,6 +772,7 @@ func serveExits(s *stack.Stack, exits map[uint16]bool, inner string, allowed fun
 			defer open.done(who, exit)
 			exitToInner(exit, inner, log)
 			yggExitDrained(ep)
+			open.closing(ep)
 		}()
 	})
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, fwd.HandlePacket)
@@ -749,7 +791,8 @@ const (
 )
 
 // yggExitCount counts the exits, and holds them by key to close those of a
-// key gone (drop).
+// key gone (drop); and their buffers past their floors, in all and by
+// user, within budget (yggexitmem.go).
 type yggExitCount struct {
 	mu      sync.Mutex
 	total   int
@@ -757,10 +800,25 @@ type yggExitCount struct {
 	shaking map[string]int
 	// conns are the exits by key, and whether drop has closed them.
 	conns map[[32]byte]map[io.Closer]bool
+
+	budget, grown          int64
+	grownBy                map[string]int64
+	warnedNode, warnedUser bool
+	reclaimed              time.Time
+	reclaimedBy            map[string]time.Time
+	log                    *Logger
+	// ending are the endpoints of exits ended, waiting to close (closing).
+	ending     []tcpip.Endpoint
+	endingLeft int
+	// closingMax and linger are yggExitsClosing and yggExitLinger, as
+	// newYggExitCount and then serveExits found them.
+	closingMax int
+	linger     time.Duration
 }
 
 func newYggExitCount() *yggExitCount {
-	return &yggExitCount{byUser: map[string]int{}, shaking: map[string]int{}, conns: map[[32]byte]map[io.Closer]bool{}}
+	return &yggExitCount{byUser: map[string]int{}, shaking: map[string]int{}, conns: map[[32]byte]map[io.Closer]bool{},
+		budget: yggExitBudget(), grownBy: map[string]int64{}, reclaimedBy: map[string]time.Time{}, closingMax: yggExitsClosing, linger: yggExitLinger}
 }
 
 // take counts an exit of who, its handshake to do (shook), if the bounds
@@ -796,13 +854,18 @@ func (c *yggExitCount) hold(key [32]byte, conn io.Closer) {
 	c.conns[key][conn] = false
 }
 
-// done frees an exit's place, and forgets conn when it was held.
+// done frees an exit's place and what its buffers grew, and forgets conn
+// when it was held.
 func (c *yggExitCount) done(who yggExitSource, conn io.Closer) {
+	if e, ok := conn.(*yggExit); ok {
+		e.ended()
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.total--
 	if c.byUser[who.user]--; c.byUser[who.user] <= 0 {
 		delete(c.byUser, who.user)
+		delete(c.reclaimedBy, who.user)
 	}
 	if conn != nil {
 		delete(c.conns[who.key], conn)
@@ -841,10 +904,10 @@ func (c *yggExitCount) drop(keep func([32]byte) bool) int {
 // default), and a download after it is no shorter for it (second review).
 // The node bounds it all the same: after the client's FIN, inner's way
 // ends once it is silent yggExitHalfIdle.
-const yggExitLinger = 5 * time.Second
+var yggExitLinger = 5 * time.Second // a var for the tests, read by serveExits
 
 // yggExitStall: an exit whose client takes nothing of what waits for it
-// that long ends (stallWriter). yggExitDrain: how long an exit's place
+// that long ends (yggExit.Write). yggExitDrain: how long an exit's place
 // stays at most once it has ended, while its endpoint still sends
 // (yggExitDrained).
 var (
@@ -882,9 +945,25 @@ func yggExitDrained(ep tcpip.Endpoint) {
 type yggExit struct {
 	c      *gonet.TCPConn
 	ep     tcpip.Endpoint
+	wq     *waiter.Queue
+	who    yggExitSource
+	open   *yggExitCount
 	mu     sync.Mutex
 	uc     net.Conn
 	closed bool
+
+	// The buffers (yggexitmem.go). wmu is the writer's, held in Write, and
+	// sendDone once it has ended; bmu holds the rest but the two times.
+	wmu                 sync.Mutex
+	sendDone            bool
+	bmu                 sync.Mutex
+	mss, snd, rcv       int64
+	done                bool // all given back
+	reading             bool // since the floor (received)
+	copied, prevCopied  int64
+	measured            time.Time
+	rtt                 time.Duration
+	lastRead, lastWrite atomic.Int64
 }
 
 func (e *yggExit) Close() error {
@@ -923,21 +1002,19 @@ func yggCopy(dst io.Writer, src io.Reader) error {
 	return err
 }
 
-// stallWriter writes inner's way to the client: each write has
-// yggExitStall to find room in the send buffer, which a blocked write
-// gets once the client has acked half of it (up to 2 MiB: gVisor grows it
-// with the window while the client is the bottleneck, to 4 MiB within the
-// first few MiB of a download). A client that takes nothing ends the exit,
-// once more waits for it than the buffer holds; one that takes 2.3 KiB/s
-// does not (fifth review: 5 min cut audio paced at 32-48 kbit/s). Not TCP's
-// user timeout: gVisor's runs from the first retransmission until all
-// sent is acked, and it cut a download that went on through a path's
-// losses (the fourth review's fix, tried here).
-type stallWriter struct{ c *gonet.TCPConn }
+// readErr reads r, keeping its error but EOF: yggCopy's error is then
+// the reader's when err is set, else the writer's.
+type readErr struct {
+	r   io.Reader
+	err error
+}
 
-func (w stallWriter) Write(b []byte) (int, error) {
-	_ = w.c.SetWriteDeadline(time.Now().Add(yggExitStall))
-	return w.c.Write(b)
+func (r *readErr) Read(b []byte) (int, error) {
+	n, err := r.r.Read(b)
+	if err != nil && err != io.EOF {
+		r.err = err
+	}
+	return n, err
 }
 
 // idleAfterFIN reads inner's way: once the client has half-closed (fin),
@@ -978,7 +1055,25 @@ func exitToInner(e *yggExit, inner string, log *Logger) {
 	up, down := make(chan struct{}), make(chan struct{})
 	go func() {
 		defer close(up)
-		if yggCopy(uc, c) != nil {
+		r := &readErr{r: e}
+		if yggCopy(uc, r) != nil {
+			if r.err == nil {
+				// Inner took no more of the client's way (EPIPE: it closed
+				// with the client's bytes unread): its reply may still be
+				// on its way, and down reads it whole. Closing uc here cut
+				// it, a reset to the client, when inner was quick to write
+				// all and close (one full run in three of main a39bb08,
+				// TestYggExitInnerResetWhole). As after the client's FIN,
+				// inner's way then has yggExitHalfIdle a read: an inner
+				// that shut its reading and holds on silent held the exit
+				// for good (protocol review). What the client sends more
+				// goes nowhere, to its end or yggExitLinger's, read past
+				// the exit (e) so as not to grow its buffer for it.
+				fin.Store(true)
+				_ = uc.SetReadDeadline(time.Now().Add(yggExitHalfIdle))
+				_ = yggCopy(io.Discard, c)
+				return
+			}
 			_ = uc.Close() // the client reset: all goes
 			return
 		}
@@ -990,7 +1085,9 @@ func exitToInner(e *yggExit, inner string, log *Logger) {
 	}()
 	go func() {
 		defer close(down)
-		if yggCopy(stallWriter{c}, idleAfterFIN{uc, &fin}) != nil {
+		err := yggCopy(e, idleAfterFIN{uc, &fin})
+		e.writerDone()
+		if err != nil {
 			// Inner reset or silent yggExitHalfIdle, or the client stalled:
 			// a reset tells the client its reply was cut, where a FIN
 			// reads as its end.
@@ -1004,7 +1101,7 @@ func exitToInner(e *yggExit, inner string, log *Logger) {
 	case <-up:
 		<-down
 	case <-down:
-		t := time.AfterFunc(yggExitLinger, func() {
+		t := time.AfterFunc(e.open.linger, func() {
 			_ = c.Close()
 			_ = uc.Close()
 		})

@@ -38,6 +38,28 @@ func (p pktPipe) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
+// delayed is out with each packet delivered d after it was sent, in order.
+func delayed(out chan<- []byte, d time.Duration) chan<- []byte {
+	type timed struct {
+		at  time.Time
+		pkt []byte
+	}
+	in, mid := make(chan []byte, 1<<16), make(chan timed, 1<<16)
+	go func() {
+		for pkt := range in {
+			mid <- timed{time.Now().Add(d), pkt}
+		}
+		close(mid)
+	}()
+	go func() {
+		for p := range mid {
+			time.Sleep(time.Until(p.at))
+			out <- p.pkt
+		}
+	}()
+	return in
+}
+
 // exitRig is a node's exits on one netstack (ns), a client on another
 // (cs), and inner as serve says, on a unix socket; into carries packets to
 // the node, from any source.
@@ -48,18 +70,35 @@ type exitRig struct {
 	open         *yggExitCount
 }
 
+// exitRigMTU is the rig's links' MTU (the node's mesh has 1280),
+// exitRigDelay their delay each way, exitRigMangle what each way's
+// packets go through, exitRigLog the node's log.
+var (
+	exitRigMTU    uint32 = 65535
+	exitRigDelay  time.Duration
+	exitRigMangle func(chan<- []byte) chan<- []byte
+	exitRigLog    = NewLogger("error", io.Discard)
+)
+
 func newExitRig(t *testing.T, serve func(net.Conn), allowed func(src netip.Addr) (yggExitSource, bool)) *exitRig {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	a, b := make(chan []byte, 1024), make(chan []byte, 1024)
+	toNode, toClient := chan<- []byte(a), chan<- []byte(b)
+	if exitRigDelay > 0 {
+		toNode, toClient = delayed(a, exitRigDelay), delayed(b, exitRigDelay)
+	}
+	if exitRigMangle != nil {
+		toNode, toClient = exitRigMangle(toNode), exitRigMangle(toClient)
+	}
 	r := &exitRig{into: a, node: netip.MustParseAddr("200::1"), client: netip.MustParseAddr("201::2"), open: newYggExitCount()}
 	var err error
-	if r.ns, err = yggNetstack(ctx, pktPipe{in: a, out: b}, r.node, 65535); err != nil {
+	if r.ns, err = yggNetstack(ctx, pktPipe{in: a, out: toClient}, r.node, exitRigMTU); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(r.ns.Close)
-	if r.cs, err = yggNetstack(ctx, pktPipe{in: b, out: a}, r.client, 65535); err != nil {
+	if r.cs, err = yggNetstack(ctx, pktPipe{in: b, out: toNode}, r.client, exitRigMTU); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(r.cs.Close)
@@ -83,7 +122,13 @@ func newExitRig(t *testing.T, serve func(net.Conn), allowed func(src netip.Addr)
 		allowed = func(src netip.Addr) (yggExitSource, bool) { return who, src == r.client }
 	}
 	t.Cleanup(func() { r.open.drop(func([32]byte) bool { return false }) })
-	serveExits(r.ns, map[uint16]bool{443: true}, inner, allowed, r.open, NewLogger("error", io.Discard))
+	over := yggExitOverReleased.Load()
+	t.Cleanup(func() {
+		if n := yggExitOverReleased.Load() - over; n > 0 {
+			t.Errorf("%d releases past what was grown", n)
+		}
+	})
+	serveExits(r.ns, map[uint16]bool{443: true}, inner, allowed, r.open, exitRigLog)
 	return r
 }
 
@@ -461,6 +506,75 @@ func TestYggExitInnerResetWhole(t *testing.T) {
 	}
 	if got != size {
 		t.Fatalf("%d of %d bytes", got, size)
+	}
+}
+
+// Inner that closes while the client still uploads, its reply written,
+// has its reply reach the client whole: the client's way failing to inner
+// does not cut inner's way (one full run of three on main a39bb08 failed
+// TestYggExitInnerResetWhole so, its 64 KiB not yet all written to inner).
+func TestYggExitInnerGoneReplyWhole(t *testing.T) {
+	const size = 256 << 10
+	r := newExitRig(t, func(c net.Conn) {
+		defer c.Close()
+		if _, err := c.Read(make([]byte, 1)); err != nil {
+			return
+		}
+		_ = writeN(c, size)
+	}, nil)
+	smallWindow(t, r)
+	c := r.dial(t)
+	go func() { // uploads to its end, inner gone or not
+		b := make([]byte, 16<<10)
+		for {
+			if _, err := c.Write(b); err != nil {
+				return
+			}
+		}
+	}()
+	b := make([]byte, 16<<10)
+	got := 0
+	for {
+		n, err := c.Read(b)
+		got += n
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("after %d of %d bytes: %v", got, size, err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got != size {
+		t.Fatalf("%d of %d bytes", got, size)
+	}
+}
+
+// Inner that shuts its reading and then holds on, silent, loses the exit
+// once it has been silent yggExitHalfIdle, as after the client's FIN
+// (protocol review: the client's way failing to inner left inner's way
+// with no deadline, the exit held for as long as the client stayed).
+func TestYggExitInnerShutsReading(t *testing.T) {
+	setVar(t, &yggExitHalfIdle, 500*time.Millisecond)
+	setVar(t, &yggExitLinger, 100*time.Millisecond)
+	hold := make(chan struct{})
+	t.Cleanup(func() { close(hold) })
+	r := newExitRig(t, func(c net.Conn) {
+		defer c.Close()
+		_ = c.(*net.UnixConn).CloseRead()
+		<-hold
+	}, nil)
+	c := r.dial(t)
+	start := time.Now()
+	b := make([]byte, 16<<10)
+	for time.Since(start) < 2*time.Second { // past the half-idle, uploading
+		if _, err := c.Write(b); err != nil {
+			break
+		}
+	}
+	_ = c.CloseWrite()
+	if !waitFor(2*time.Second, func() bool { return r.total() == 0 }) {
+		t.Fatalf("the exit stayed %v, inner silent", time.Since(start))
 	}
 }
 
