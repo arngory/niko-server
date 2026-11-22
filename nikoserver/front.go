@@ -240,7 +240,7 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 		if zone == "" {
 			// not one of our zones: no open resolver here
 			f.stats.refused.Add(1)
-			writeFrom(conn, refused(query, questionEnd), client, dst)
+			f.reply(conn, refused(query, questionEnd), client, dst)
 			continue
 		}
 		f.stats.queries[zone].Add(1)
@@ -248,7 +248,7 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 		if a := f.apex[zone]; a != nil && name == zone {
 			if reply, ok := a.answer(query); ok {
 				f.stats.apex.Add(1)
-				writeFrom(conn, reply, client, dst)
+				f.reply(conn, reply, client, dst)
 				continue
 			}
 		}
@@ -257,7 +257,7 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 				switch {
 				case reply != nil:
 					f.stats.probes.Add(1)
-					writeFrom(conn, reply, client, dst)
+					f.reply(conn, reply, client, dst)
 				case overLabel:
 					f.stats.probesOverLabel.Add(1)
 				default:
@@ -286,7 +286,7 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 				default:
 					f.stats.untagged.Add(1)
 				}
-				writeFrom(conn, nodata(query, questionEnd), client, dst)
+				f.reply(conn, nodata(query, questionEnd), client, dst)
 				continue
 			}
 		}
@@ -314,6 +314,15 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 			continue
 		}
 		f.stats.forwarded.Add(1)
+	}
+}
+
+// reply sends the front's own answer to a query (refused, apex, probe,
+// NODATA) from dst; one that fails is counted with the answers dropped (an
+// address moved off the host, a full socket buffer).
+func (f *dnsFront) reply(conn *net.UDPConn, b []byte, client netip.AddrPort, dst netip.Addr) {
+	if _, err := writeFrom(conn, b, client, dst); err != nil {
+		f.stats.dropped.Add(1)
 	}
 }
 

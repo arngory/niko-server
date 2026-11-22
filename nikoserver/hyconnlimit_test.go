@@ -1297,7 +1297,18 @@ func TestHysteriaConnLimitFileFIFO(t *testing.T) {
 	// The watch goes on: a user taken out of the users file is revoked.
 	writeHy2Users(t, node.users, "u6", "pw-6")
 	syscall.Kill(os.Getpid(), syscall.SIGHUP)
-	if !waitFor(5*time.Second, func() bool { _, err := openStream(t, ctx, node.client(t, ctx, "pw-6"), target); return err == nil }) {
+	// Until the reload is in, the new user's stream is refused at the dial:
+	// waited for, not a failure (openStream fails the test on a dial error).
+	client6 := node.client(t, ctx, "pw-6")
+	if !waitFor(5*time.Second, func() bool {
+		conn, err := client6.DialConn(ctx, M.ParseSocksaddr(target))
+		if err != nil {
+			return false
+		}
+		conn.Close()
+		_, err = openStream(t, ctx, client6, target)
+		return err == nil
+	}) {
 		t.Fatal("the users file was not read again")
 	}
 }

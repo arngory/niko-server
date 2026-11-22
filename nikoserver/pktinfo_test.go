@@ -194,19 +194,28 @@ func TestPktinfoNoAllocations(t *testing.T) {
 	from := client.LocalAddr().(*net.UDPAddr).AddrPort()
 	buf, oob, back := make([]byte, 512), make([]byte, pktinfoRoom), make([]byte, 512)
 	msg := []byte("datagram")
+	var failed string // a panic inside AllocsPerRun would end the whole binary
 	allocs := testing.AllocsPerRun(200, func() {
+		if failed != "" {
+			return
+		}
 		client.WriteToUDPAddrPort(msg, to)
 		n, src, dst, err := readDst(conn, buf, oob)
 		if err != nil || dst != to.Addr() || src != from {
-			panic(fmt.Sprintf("read %d %v %v %v", n, src, dst, err))
+			failed = fmt.Sprintf("read %d %v %v %v", n, src, dst, err)
+			return
 		}
 		if _, err := writeFrom(conn, buf[:n], src, dst); err != nil {
-			panic(err)
+			failed = fmt.Sprintf("write: %v", err)
+			return
 		}
 		if _, got, err := client.ReadFromUDPAddrPort(back); err != nil || got != to {
-			panic(fmt.Sprintf("the reply from %v (%v)", got, err))
+			failed = fmt.Sprintf("the reply from %v (%v)", got, err)
 		}
 	})
+	if failed != "" {
+		t.Fatal(failed)
+	}
 	if allocs != 0 {
 		t.Fatalf("%v allocations a datagram", allocs)
 	}
@@ -298,5 +307,31 @@ func TestPktinfoCmsg(t *testing.T) {
 	}
 	if got := pktinfoDst(nil); got.IsValid() {
 		t.Errorf("nothing: %s", got)
+	}
+}
+
+// A source the kernel will not send from (not an address of the host)
+// gets the reply from the address routing picks, as before PKTINFO.
+func TestPktinfoForeignSource(t *testing.T) {
+	port := wildcardPort(t, true)
+	conn, err := listenDNS(context.Background(), "udp4", netip.AddrPortFrom(netip.IPv4Unspecified(), port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	client, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	to := client.LocalAddr().(*net.UDPAddr).AddrPort()
+	if _, err := writeFrom(conn, []byte("reply"), to, netip.MustParseAddr("192.0.2.1")); err != nil {
+		t.Fatalf("a foreign source: %v", err)
+	}
+	client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	b := make([]byte, 16)
+	n, from, err := client.ReadFromUDPAddrPort(b)
+	if err != nil || string(b[:n]) != "reply" || from.Addr() != netip.MustParseAddr("127.0.0.1") {
+		t.Fatalf("got %q from %v (%v)", b[:n], from, err)
 	}
 }

@@ -3,6 +3,7 @@
 package nikoserver
 
 import (
+	"errors"
 	"net"
 	"net/netip"
 	"unsafe"
@@ -106,13 +107,21 @@ func pktinfoDst(oob []byte) netip.Addr {
 }
 
 // writeFrom sends b to client from src (pktinfoDst's); an invalid src from
-// the address routing picks, as WriteToUDPAddrPort.
+// the address routing picks, as WriteToUDPAddrPort. A source the kernel
+// will not send from goes once more from what routing picks, as before
+// PKTINFO: an IPv6 range routed to lo rather than assigned, with
+// ip_nonlocal_bind off (EINVAL), or an address gone from the host since
+// the query (ENETUNREACH on IPv4, EADDRNOTAVAIL). The reply may still
+// reach a lenient client; none would.
 func writeFrom(conn *net.UDPConn, b []byte, client netip.AddrPort, src netip.Addr) (int, error) {
 	if !src.IsValid() {
 		return conn.WriteToUDPAddrPort(b, client)
 	}
 	var oob [pktinfoRoom]byte
 	n, _, err := conn.WriteMsgUDPAddrPort(b, pktinfoCmsg(oob[:], src), client)
+	if errors.Is(err, unix.EINVAL) || errors.Is(err, unix.EADDRNOTAVAIL) || errors.Is(err, unix.ENETUNREACH) {
+		return conn.WriteToUDPAddrPort(b, client)
+	}
 	return n, err
 }
 
