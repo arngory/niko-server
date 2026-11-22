@@ -101,6 +101,10 @@ func writeYggUsers(t *testing.T, path string, keys ...ed25519.PublicKey) {
 	}
 }
 
+// yggNodeLog takes the log of the backends startYggNode starts: none
+// unless a test says.
+var yggNodeLog io.Writer = io.Discard
+
 // yggNode is a Yggdrasil backend behind tcpmux, as on a node, with no
 // users yet; it stops with ctx.
 type yggNode struct {
@@ -117,7 +121,7 @@ func startYggNode(t *testing.T, ctx context.Context, opts ...func(*BackendConfig
 	t.Helper()
 	dir := t.TempDir()
 	uid := os.Getuid()
-	log := NewLogger("warn", io.Discard)
+	log := NewLogger("warn", yggNodeLog)
 
 	cert := selfSigned(t, "y.example.com")
 	keyDER, _ := x509.MarshalPKCS8PrivateKey(cert.PrivateKey)
