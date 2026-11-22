@@ -724,8 +724,10 @@ func serveExits(s *stack.Stack, exits map[uint16]bool, inner string, allowed fun
 	// Room for every exit's handshake and the refused in between: past it
 	// the forwarder would drop a SYN unanswered, not RST it (third review:
 	// 16 users' handshakes held a new one's dial 5 s, 127 s a round).
+	// The tests' vars are read here, on the caller's goroutine, not by
+	// exits a test before still running.
 	open.mu.Lock()
-	open.log = log
+	open.log, open.closingMax, open.linger = log, yggExitsClosing, yggExitLinger
 	open.mu.Unlock()
 	mtu := s.NICInfo()[1].MTU
 	fwd := tcp.NewForwarder(s, 0, yggExitsMax+1024, func(r *tcp.ForwarderRequest) {
@@ -804,11 +806,15 @@ type yggExitCount struct {
 	// ending are the endpoints of exits ended, waiting to close (closing).
 	ending     []tcpip.Endpoint
 	endingLeft int
+	// closingMax and linger are yggExitsClosing and yggExitLinger, as
+	// newYggExitCount and then serveExits found them.
+	closingMax int
+	linger     time.Duration
 }
 
 func newYggExitCount() *yggExitCount {
 	return &yggExitCount{byUser: map[string]int{}, shaking: map[string]int{}, conns: map[[32]byte]map[io.Closer]bool{},
-		budget: yggExitBudget(), grownBy: map[string]int64{}}
+		budget: yggExitBudget(), grownBy: map[string]int64{}, closingMax: yggExitsClosing, linger: yggExitLinger}
 }
 
 // take counts an exit of who, its handshake to do (shook), if the bounds
@@ -893,7 +899,7 @@ func (c *yggExitCount) drop(keep func([32]byte) bool) int {
 // default), and a download after it is no shorter for it (second review).
 // The node bounds it all the same: after the client's FIN, inner's way
 // ends once it is silent yggExitHalfIdle.
-var yggExitLinger = 5 * time.Second // a var for the tests
+var yggExitLinger = 5 * time.Second // a var for the tests, read by serveExits
 
 // yggExitStall: an exit whose client takes nothing of what waits for it
 // that long ends (yggExit.Write). yggExitDrain: how long an exit's place
@@ -1084,7 +1090,7 @@ func exitToInner(e *yggExit, inner string, log *Logger) {
 	case <-up:
 		<-down
 	case <-down:
-		t := time.AfterFunc(yggExitLinger, func() {
+		t := time.AfterFunc(e.open.linger, func() {
 			_ = c.Close()
 			_ = uc.Close()
 		})

@@ -162,7 +162,7 @@ func (c *yggExitCount) release(user string, n int64) {
 // yggExitsClosing bounds the endpoints of exits ended that wait in
 // FIN-WAIT-2 or TIME-WAIT, outside every count: past it the oldest is
 // reset (closing). TIME-WAIT itself lasts yggTimeWait.
-var yggExitsClosing = yggExitsMax // a var for the tests
+var yggExitsClosing = yggExitsMax // a var for the tests, read by serveExits
 
 // closing keeps ep, an exit's endpoint drained, while it waits to close.
 func (c *yggExitCount) closing(ep tcpip.Endpoint) {
@@ -176,7 +176,7 @@ func (c *yggExitCount) closing(ep tcpip.Endpoint) {
 	c.mu.Lock()
 	// Those closed go when as many again have come as were left the last
 	// time, or at the bound: they hold no more than the waiting.
-	if len(c.ending) >= min(max(64, 2*c.endingLeft), yggExitsClosing) {
+	if len(c.ending) >= min(max(64, 2*c.endingLeft), c.closingMax) {
 		keep := c.ending[:0]
 		for _, x := range c.ending {
 			if waits(x) {
@@ -187,7 +187,7 @@ func (c *yggExitCount) closing(ep tcpip.Endpoint) {
 		c.ending, c.endingLeft = keep, len(keep)
 	}
 	var oldest tcpip.Endpoint
-	if len(c.ending) >= yggExitsClosing {
+	if len(c.ending) >= c.closingMax {
 		oldest = c.ending[0]
 		copy(c.ending, c.ending[1:])
 		c.ending[len(c.ending)-1] = nil
