@@ -70,17 +70,20 @@ func TestYggLogNoKeys(t *testing.T) {
 	l := yggLog{NewLogger("info", &out)}
 	key := make([]byte, 32)
 	rand.Read(key)
+	key[0] = 0xab // a letter in every run: one of digits alone would stay
 	l.Warnf("PQ: %x answers no PQ init under its ML-KEM key number %d", key[:8], 3)
 	l.Errorf("link with %s: %v", hex.EncodeToString(key), io.EOF)
 	l.Warnln("key", hex.EncodeToString(key[:16]))
-	l.Debugf("PQ: %x", key[:8]) // below info: not written
+	l.Debugf("PQ: %x", key[:8])                             // below info: not written
+	l.Warnf("refused until %d", int64(1795000000123456789)) // digits alone: a time, kept
 	got := out.String()
 	for _, k := range []string{hex.EncodeToString(key[:8]), hex.EncodeToString(key[:4])} {
 		if strings.Contains(got, k) {
 			t.Fatalf("a key in the log: %q", got)
 		}
 	}
-	if strings.Count(got, "\n") != 3 || strings.Count(got, "<key>") != 3 || !strings.Contains(got, "key number 3") {
+	if strings.Count(got, "\n") != 4 || strings.Count(got, "<key>") != 3 || !strings.Contains(got, "key number 3") ||
+		!strings.Contains(got, "until 1795000000123456789") {
 		t.Fatalf("log: %q", got)
 	}
 }

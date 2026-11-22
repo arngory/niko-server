@@ -1034,15 +1034,26 @@ type yggLog struct{ l *Logger }
 
 // yggKeyHex is a run of hex as long as a key's prefix (ironwood's PQ lines
 // give the first 8 bytes of the peer's key, %x) or longer: the core's lines
-// go to the journal without them, as no user's key goes there (lan-v1 §4.3).
+// go to the journal without those with a letter in them, as no user's key
+// goes there (lan-v1 §4.3). Runs of digits alone, times and counts, stay
+// (as Niko's RedactLog, arngory/niko#123).
 var yggKeyHex = regexp.MustCompile(`[0-9a-fA-F]{16,}`)
+
+func yggRedact(line string) string {
+	return yggKeyHex.ReplaceAllStringFunc(line, func(run string) string {
+		if strings.IndexFunc(run, func(r rune) bool { return r > '9' }) < 0 {
+			return run
+		}
+		return "<key>"
+	})
+}
 
 // line logs at level (Logger's: 0 debug to 3 error), the keys left out
 func (y yggLog) line(level int, tag, f string, a ...any) {
 	if level < y.l.level {
 		return
 	}
-	y.l.logf(level, tag, "%s", yggKeyHex.ReplaceAllLiteralString(fmt.Sprintf(f, a...), "<key>"))
+	y.l.logf(level, tag, "%s", yggRedact(fmt.Sprintf(f, a...)))
 }
 
 func (y yggLog) Printf(f string, a ...any) { y.line(0, "DEBUG", f, a...) }
