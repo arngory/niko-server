@@ -36,6 +36,10 @@ type pendingKey struct {
 type pendingEntry struct {
 	size uint16 // the requester's
 	n    uint16 // queries with this key still waiting (a resolver's retry has the same)
+	// dst: where the query came to on a wildcard socket, the source of
+	// its answer (pktinfo.go); invalid: the socket's own. Of two waiting
+	// with one key, the later's.
+	dst netip.Addr
 }
 
 const (
@@ -60,8 +64,8 @@ func (p *pendingQueries) age(now time.Time) {
 	}
 }
 
-// add notes a query from client that goes to a backend.
-func (p *pendingQueries) add(client netip.AddrPort, query []byte, questionEnd int) {
+// add notes a query from client to dst that goes to a backend.
+func (p *pendingQueries) add(client netip.AddrPort, query []byte, questionEnd int, dst netip.Addr) {
 	k := pendingKey{client, binary.BigEndian.Uint16(query)}
 	size := uint16(requesterSize(query, questionEnd))
 	p.mu.Lock()
@@ -74,17 +78,18 @@ func (p *pendingQueries) add(client netip.AddrPort, query []byte, questionEnd in
 		}
 	}
 	e.size = max(e.size, size)
+	e.dst = dst
 	if e.n < 1<<16-1 {
 		e.n++
 	}
 	p.cur[k] = e
 }
 
-// take finds the query an answer is for: the requester's size, and false
-// when none waits.
-func (p *pendingQueries) take(client netip.AddrPort, answer []byte) (int, bool) {
+// take finds the query an answer is for: the requester's size and where
+// the query came to, and false when none waits.
+func (p *pendingQueries) take(client netip.AddrPort, answer []byte) (int, netip.Addr, bool) {
 	if len(answer) < 12 {
-		return 0, false
+		return 0, netip.Addr{}, false
 	}
 	k := pendingKey{client, binary.BigEndian.Uint16(answer)}
 	p.mu.Lock()
@@ -95,7 +100,7 @@ func (p *pendingQueries) take(client netip.AddrPort, answer []byte) (int, bool) 
 	if !ok {
 		gen = p.prev
 		if e, ok = gen[k]; !ok {
-			return 0, false
+			return 0, netip.Addr{}, false
 		}
 	}
 	if e.n--; e.n == 0 {
@@ -103,7 +108,7 @@ func (p *pendingQueries) take(client netip.AddrPort, answer []byte) (int, bool) 
 	} else {
 		gen[k] = e
 	}
-	return int(e.size), true
+	return int(e.size), e.dst, true
 }
 
 // maxBackendAnswer is the most a backend's answer may be over UDP whatever

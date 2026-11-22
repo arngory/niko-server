@@ -40,6 +40,9 @@ type udpFront struct {
 	salamander []salamanderRoute
 	links      map[string]*backendLink
 	sockets    map[netip.AddrPort]*net.UDPConn
+	// pktinfo: the sockets on a wildcard that read each datagram's
+	// destination (pktinfoOn); a flow's answers go from its (udpFlow.dst).
+	pktinfo map[netip.AddrPort]bool
 	// byLabel are the backends of plain QUIC with a label, each with its
 	// label's key; a salamander backend's is its route's. None: no routing
 	// by connection ID.
@@ -166,6 +169,11 @@ type udpFlow struct {
 	// handshake's, which a source gets whether or not it reads them).
 	fromClient, sent uint32
 	budget           *sourceBudget // its source's, the same counted for all its flows
+	// dst: where the client's last datagram came to on a wildcard socket,
+	// the source of the backend's answers (pktinfo.go); invalid: the
+	// socket's own address. The backends' local names the socket, as
+	// before (docs/IPC.md): one keeps one local per client.
+	dst netip.Addr
 }
 
 // addSat is a + n, at most the bound of a uint32.
@@ -397,7 +405,7 @@ const (
 
 func newUDPFront(c *FrontUDP, backends map[string]BackendRef, log *Logger) (*udpFront, error) {
 	f := &udpFront{log: log, idle: 60 * time.Second, byName: map[string]*backendLink{}, links: map[string]*backendLink{},
-		sockets: map[netip.AddrPort]*net.UDPConn{}, flows: map[flowKey]*udpFlow{}, pending: map[flowKey]*pendingFlow{},
+		sockets: map[netip.AddrPort]*net.UDPConn{}, pktinfo: map[netip.AddrPort]bool{}, flows: map[flowKey]*udpFlow{}, pending: map[flowKey]*pendingFlow{},
 		maxFlows: maxUDPFlows, confirmed: map[netip.Prefix]int32{}, maxConfirmed: maxConfirmedPerSource,
 		budgets: map[uint64]*sourceBudget{}, epoch: time.Now()}
 	if d, err := time.ParseDuration(c.Idle); err == nil && d > 0 {
@@ -487,6 +495,7 @@ func (f *udpFront) listen(addrs []string) error {
 		_ = conn.SetWriteBuffer(8 << 20)
 		probeMTU(conn, addr.Addr().Is4())
 		f.sockets[addr] = conn
+		f.pktinfo[addr] = pktinfoOn(conn, addr, f.log)
 	}
 	return nil
 }
@@ -547,8 +556,12 @@ func (f *udpFront) expire(now time.Time) {
 func (f *udpFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 	buffer := make([]byte, maxDatagram)
 	message := make([]byte, 0, packetHeader+maxDatagram)
+	var oob []byte // a wildcard's: where each datagram came to (pktinfo.go)
+	if f.pktinfo[local] {
+		oob = make([]byte, pktinfoRoom)
+	}
 	for {
-		n, client, err := conn.ReadFromUDPAddrPort(buffer)
+		n, client, dst, err := readDst(conn, buffer, oob)
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return nil
@@ -564,7 +577,7 @@ func (f *udpFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 		datagram := buffer[:n]
 		now := time.Now()
 
-		if link := f.pinned(key, datagram, now); link != nil {
+		if link := f.pinned(key, datagram, dst, now); link != nil {
 			link.send(encodePacket(message, client, local, datagram))
 			continue
 		}
@@ -576,7 +589,7 @@ func (f *udpFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 		for _, p := range packets {
 			sent += len(p)
 		}
-		f.pin(key, link, datagram, sent, now)
+		f.pin(key, link, datagram, sent, dst, now)
 		for _, p := range packets {
 			link.send(encodePacket(message, client, local, p))
 		}
@@ -821,13 +834,16 @@ func (f *udpFront) dropPending(key flowKey) {
 	delete(f.pending, key)
 }
 
-// answer sends a backend's datagram from the local address the flow came to.
+// answer sends a backend's datagram from the local address the flow came
+// to: the socket's, or on a wildcard the client's last datagram's
+// destination. Without a flow, from the address routing picks.
 func (f *udpFront) answer(link *backendLink, client, local netip.AddrPort, payload []byte) {
+	key := flowKey{client, local}
 	conn := f.sockets[local]
 	if conn == nil {
 		for addr, candidate := range f.sockets {
 			if addr.Addr().Is4() == client.Addr().Unmap().Is4() {
-				conn = candidate
+				conn, local = candidate, addr
 				break
 			}
 		}
@@ -835,8 +851,11 @@ func (f *udpFront) answer(link *backendLink, client, local netip.AddrPort, paylo
 	if conn == nil {
 		return
 	}
-	if f.answered(link, flowKey{client, local}, payload, time.Now()) {
-		_, _ = conn.WriteToUDPAddrPort(payload, client)
+	if ok, src := f.answeredFrom(link, key, payload, time.Now()); ok {
+		if !f.pktinfo[local] {
+			src = netip.Addr{}
+		}
+		_, _ = writeFrom(conn, payload, client, src)
 	}
 }
 
@@ -845,13 +864,14 @@ func (f *udpFront) answer(link *backendLink, client, local netip.AddrPort, paylo
 // client chose before the first answer, is confirmed by a datagram to the
 // connection ID that answer named, and moves to the end of the list: a
 // flow in use is not the oldest.
-func (f *udpFront) pinned(key flowKey, d []byte, now time.Time) *backendLink {
+func (f *udpFront) pinned(key flowKey, d []byte, dst netip.Addr, now time.Time) *backendLink {
 	f.access.Lock()
 	defer f.access.Unlock()
 	fl := f.flows[key]
 	if fl == nil {
 		return nil
 	}
+	fl.dst = dst
 	prev := fl.last
 	fl.last = f.clock(now)
 	fl.fromClient = addSat(fl.fromClient, len(d))
@@ -938,7 +958,7 @@ func (f *udpFront) uncount(key flowKey) {
 // the table full the least recently used flow not confirmed yet goes; if
 // every flow is confirmed, this one is not pinned (its datagrams classify
 // one by one).
-func (f *udpFront) pin(key flowKey, link *backendLink, d []byte, sent int, now time.Time) {
+func (f *udpFront) pin(key flowKey, link *backendLink, d []byte, sent int, dst netip.Addr, now time.Time) {
 	f.access.Lock()
 	defer f.access.Unlock()
 	if f.flows[key] != nil {
@@ -958,7 +978,7 @@ func (f *udpFront) pin(key flowKey, link *backendLink, d []byte, sent int, now t
 	}
 	b.flows++
 	b.fromClient += uint64(sent)
-	fl := &udpFlow{link: link, last: f.clock(now), key: key, fromClient: addSat(0, sent), budget: b}
+	fl := &udpFlow{link: link, last: f.clock(now), key: key, fromClient: addSat(0, sent), budget: b, dst: dst}
 	fl.backendAt = fl.last
 	if r := f.salamanderFor(link, d); r != nil {
 		fl.route = r.flow
@@ -985,7 +1005,7 @@ func (f *udpFront) unpin(key flowKey) {
 	delete(f.flows, key)
 }
 
-// answered takes the time of a backend's answer on a flow and reports
+// answeredFrom takes the time of a backend's answer on a flow and reports
 // whether it goes to the client. A path probe (isPathProbe) goes within
 // three times what the flow's client sent, the backend's long headers
 // among its first countedAnswers datagrams (a handshake and its
@@ -995,13 +1015,14 @@ func (f *udpFront) unpin(key flowKey) {
 // to a flow not confirmed yet it reads the server's connection ID, a long
 // header's Source Connection ID, which the client sends to once it has the
 // answer: unless it is one the client chose (a refusal names it, quic-go's
-// sendError), which proves nothing.
-func (f *udpFront) answered(link *backendLink, key flowKey, payload []byte, now time.Time) bool {
+// sendError), which proves nothing. It names the flow's source too
+// (udpFlow.dst).
+func (f *udpFront) answeredFrom(link *backendLink, key flowKey, payload []byte, now time.Time) (bool, netip.Addr) {
 	f.access.Lock()
 	defer f.access.Unlock()
 	fl := f.flows[key]
 	if fl == nil {
-		return !f.linkProbe(link, payload)
+		return !f.linkProbe(link, payload), netip.Addr{}
 	}
 	fl.last = f.clock(now)
 	fl.backendAt = fl.last
@@ -1009,7 +1030,7 @@ func (f *udpFront) answered(link *backendLink, key flowKey, payload []byte, now 
 	switch {
 	case isPathProbe(fl.password(), payload):
 		if uint64(fl.sent)+uint64(n) > 3*uint64(fl.fromClient) && !f.freeProbe(fl, now) {
-			return false
+			return false, netip.Addr{}
 		}
 		fl.sent = addSat(fl.sent, n)
 		b.sent += uint64(n)
@@ -1028,7 +1049,7 @@ func (f *udpFront) answered(link *backendLink, key flowKey, payload []byte, now 
 	if fl.listed && !fl.answered {
 		f.serverID(fl, payload)
 	}
-	return true
+	return true, fl.dst
 }
 
 // freeProbe reports whether a flow's probe past its 3x goes (it takes it):

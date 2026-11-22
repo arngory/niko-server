@@ -87,7 +87,7 @@ func listenDNS(ctx context.Context, network string, addr netip.AddrPort) (*net.U
 
 func runDNSFront(ctx context.Context, c *FrontConfig, log *Logger) error {
 	front := &dnsFront{log: log, zoneBackend: make(map[string]*backendLink), sockets: make(map[netip.AddrPort]*net.UDPConn),
-		probeZones: map[string]bool{}, padZones: map[string]bool{}, apex: map[string]*apexZone{}, tagged: map[string]*taggedZone{}}
+		pktinfo: map[netip.AddrPort]bool{}, probeZones: map[string]bool{}, padZones: map[string]bool{}, apex: map[string]*apexZone{}, tagged: map[string]*taggedZone{}}
 	if c.DNS.ProbeKeyFile != "" {
 		// Without the key the front answers no probes, and goes on: the
 		// tunnels, TCP and UDP 443 must not stop for a resolver check.
@@ -113,6 +113,8 @@ func runDNSFront(ctx context.Context, c *FrontConfig, log *Logger) error {
 		conn.SetReadBuffer(4 << 20)
 		conn.SetWriteBuffer(4 << 20)
 		front.sockets[addr] = conn
+		// a wildcard's replies go from the address each query came to (pktinfo.go)
+		front.pktinfo[addr] = pktinfoOn(conn, addr, log)
 	}
 
 	// the links answer through the front's sockets: built complete before they run
@@ -194,7 +196,8 @@ type dnsFront struct {
 	zones       []string
 	zoneBackend map[string]*backendLink
 	sockets     map[netip.AddrPort]*net.UDPConn
-	pending     pendingQueries // what the backends' answers are for
+	pktinfo     map[netip.AddrPort]bool // the sockets on a wildcard that read each query's destination (pktinfoOn)
+	pending     pendingQueries          // what the backends' answers are for, and where their queries came to
 	stats       *dnsFrontStats
 	tagged      map[string]*taggedZone // zones whose queries carry a device's tag (slipstream)
 	seenEarly   atomic.Uint64          // their memories' generations started early
@@ -211,8 +214,12 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 	message := make([]byte, 0, packetHeader+deviceSize+maxDatagram)
 	rebuilt := make([]byte, 0, maxDNSQuery) // a tagged zone's query as its backend gets it
 	raw := make([]byte, 0, maxNameText)     // its name decoded
+	var oob []byte                          // a wildcard's: where each query came to, the source of its reply
+	if f.pktinfo[local] {
+		oob = make([]byte, pktinfoRoom)
+	}
 	for {
-		n, client, err := conn.ReadFromUDPAddrPort(buffer)
+		n, client, dst, err := readDst(conn, buffer, oob)
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return nil
@@ -233,7 +240,7 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 		if zone == "" {
 			// not one of our zones: no open resolver here
 			f.stats.refused.Add(1)
-			conn.WriteToUDPAddrPort(refused(query, questionEnd), client)
+			writeFrom(conn, refused(query, questionEnd), client, dst)
 			continue
 		}
 		f.stats.queries[zone].Add(1)
@@ -241,7 +248,7 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 		if a := f.apex[zone]; a != nil && name == zone {
 			if reply, ok := a.answer(query); ok {
 				f.stats.apex.Add(1)
-				conn.WriteToUDPAddrPort(reply, client)
+				writeFrom(conn, reply, client, dst)
 				continue
 			}
 		}
@@ -250,7 +257,7 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 				switch {
 				case reply != nil:
 					f.stats.probes.Add(1)
-					conn.WriteToUDPAddrPort(reply, client)
+					writeFrom(conn, reply, client, dst)
 				case overLabel:
 					f.stats.probesOverLabel.Add(1)
 				default:
@@ -279,14 +286,18 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 				default:
 					f.stats.untagged.Add(1)
 				}
-				conn.WriteToUDPAddrPort(nodata(query, questionEnd), client)
+				writeFrom(conn, nodata(query, questionEnd), client, dst)
 				continue
 			}
 		}
 		// Waiting before the send: the backend's answer can come back
 		// before this goroutine runs again. The requester's size is the
-		// query's as it came.
-		f.pending.add(client, query, questionEnd)
+		// query's as it came, and so is the address it came to: the
+		// answer's source. The backend's answer names local, the socket,
+		// back (docs/IPC.md), not dst: the wire stays as it was, and the
+		// backend keeps one local per client, which a resolver asking two
+		// of the host's addresses from one port would mix up.
+		f.pending.add(client, query, questionEnd, dst)
 		link := f.zoneBackend[zone]
 		var msg []byte
 		if t != nil && link.ref.Devices {
@@ -311,11 +322,11 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 // backend (1024 each way, up to 64 MiB each).
 const maxDNSQuery = 4096
 
-// answer sends a backend's answer from the socket the query came in on:
-// only to a query that waits for it, and within its requester's size
-// (pendingQueries).
+// answer sends a backend's answer from the socket the query came in on,
+// and on a wildcard from the address it came to: only to a query that
+// waits for it, and within its requester's size (pendingQueries).
 func (f *dnsFront) answer(client, local netip.AddrPort, payload []byte) {
-	size, ok := f.pending.take(client, payload)
+	size, src, ok := f.pending.take(client, payload)
 	if !ok {
 		f.stats.unmatched.Add(1)
 		f.log.Debugf("an answer to %s no query waits for: dropped", client)
@@ -333,7 +344,7 @@ func (f *dnsFront) answer(client, local netip.AddrPort, payload []byte) {
 	if conn == nil {
 		for addr, candidate := range f.sockets {
 			if addr.Addr().Is4() == client.Addr().Is4() {
-				conn = candidate
+				conn, local = candidate, addr
 				break
 			}
 		}
@@ -342,7 +353,10 @@ func (f *dnsFront) answer(client, local netip.AddrPort, payload []byte) {
 		f.stats.dropped.Add(1)
 		return
 	}
-	if _, err := conn.WriteToUDPAddrPort(payload, client); err != nil {
+	if !f.pktinfo[local] {
+		src = netip.Addr{} // bound to one address: its own
+	}
+	if _, err := writeFrom(conn, payload, client, src); err != nil {
 		f.stats.dropped.Add(1)
 		return
 	}
