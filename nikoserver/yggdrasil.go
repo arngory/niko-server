@@ -729,6 +729,9 @@ func serveExits(s *stack.Stack, exits map[uint16]bool, inner string, allowed fun
 	open.mu.Lock()
 	open.log, open.closingMax, open.linger = log, yggExitsClosing, yggExitLinger
 	open.mu.Unlock()
+	if rcvMemOffset == 0 {
+		log.Warnf("gVisor's count of received memory not found: exits' receive buffers are never given back")
+	}
 	mtu := s.NICInfo()[1].MTU
 	fwd := tcp.NewForwarder(s, 0, yggExitsMax+1024, func(r *tcp.ForwarderRequest) {
 		if !exits[r.ID().LocalPort] {
@@ -802,6 +805,7 @@ type yggExitCount struct {
 	grownBy                map[string]int64
 	warnedNode, warnedUser bool
 	reclaimed              time.Time
+	reclaimedBy            map[string]time.Time
 	log                    *Logger
 	// ending are the endpoints of exits ended, waiting to close (closing).
 	ending     []tcpip.Endpoint
@@ -814,7 +818,7 @@ type yggExitCount struct {
 
 func newYggExitCount() *yggExitCount {
 	return &yggExitCount{byUser: map[string]int{}, shaking: map[string]int{}, conns: map[[32]byte]map[io.Closer]bool{},
-		budget: yggExitBudget(), grownBy: map[string]int64{}, closingMax: yggExitsClosing, linger: yggExitLinger}
+		budget: yggExitBudget(), grownBy: map[string]int64{}, reclaimedBy: map[string]time.Time{}, closingMax: yggExitsClosing, linger: yggExitLinger}
 }
 
 // take counts an exit of who, its handshake to do (shook), if the bounds
@@ -861,6 +865,7 @@ func (c *yggExitCount) done(who yggExitSource, conn io.Closer) {
 	c.total--
 	if c.byUser[who.user]--; c.byUser[who.user] <= 0 {
 		delete(c.byUser, who.user)
+		delete(c.reclaimedBy, who.user)
 	}
 	if conn != nil {
 		delete(c.conns[who.key], conn)
@@ -1058,9 +1063,15 @@ func exitToInner(e *yggExit, inner string, log *Logger) {
 				// on its way, and down reads it whole. Closing uc here cut
 				// it, a reset to the client, when inner was quick to write
 				// all and close (one full run in three of main a39bb08,
-				// TestYggExitInnerResetWhole). What the client sends more
-				// goes nowhere, to its end or yggExitLinger's.
-				_ = yggCopy(io.Discard, e)
+				// TestYggExitInnerResetWhole). As after the client's FIN,
+				// inner's way then has yggExitHalfIdle a read: an inner
+				// that shut its reading and holds on silent held the exit
+				// for good (protocol review). What the client sends more
+				// goes nowhere, to its end or yggExitLinger's, read past
+				// the exit (e) so as not to grow its buffer for it.
+				fin.Store(true)
+				_ = uc.SetReadDeadline(time.Now().Add(yggExitHalfIdle))
+				_ = yggCopy(io.Discard, c)
 				return
 			}
 			_ = uc.Close() // the client reset: all goes

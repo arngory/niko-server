@@ -122,6 +122,12 @@ func newExitRig(t *testing.T, serve func(net.Conn), allowed func(src netip.Addr)
 		allowed = func(src netip.Addr) (yggExitSource, bool) { return who, src == r.client }
 	}
 	t.Cleanup(func() { r.open.drop(func([32]byte) bool { return false }) })
+	over := yggExitOverReleased.Load()
+	t.Cleanup(func() {
+		if n := yggExitOverReleased.Load() - over; n > 0 {
+			t.Errorf("%d releases past what was grown", n)
+		}
+	})
 	serveExits(r.ns, map[uint16]bool{443: true}, inner, allowed, r.open, exitRigLog)
 	return r
 }
@@ -541,6 +547,34 @@ func TestYggExitInnerGoneReplyWhole(t *testing.T) {
 	}
 	if got != size {
 		t.Fatalf("%d of %d bytes", got, size)
+	}
+}
+
+// Inner that shuts its reading and then holds on, silent, loses the exit
+// once it has been silent yggExitHalfIdle, as after the client's FIN
+// (protocol review: the client's way failing to inner left inner's way
+// with no deadline, the exit held for as long as the client stayed).
+func TestYggExitInnerShutsReading(t *testing.T) {
+	setVar(t, &yggExitHalfIdle, 500*time.Millisecond)
+	setVar(t, &yggExitLinger, 100*time.Millisecond)
+	hold := make(chan struct{})
+	t.Cleanup(func() { close(hold) })
+	r := newExitRig(t, func(c net.Conn) {
+		defer c.Close()
+		_ = c.(*net.UnixConn).CloseRead()
+		<-hold
+	}, nil)
+	c := r.dial(t)
+	start := time.Now()
+	b := make([]byte, 16<<10)
+	for time.Since(start) < 2*time.Second { // past the half-idle, uploading
+		if _, err := c.Write(b); err != nil {
+			break
+		}
+	}
+	_ = c.CloseWrite()
+	if !waitFor(2*time.Second, func() bool { return r.total() == 0 }) {
+		t.Fatalf("the exit stayed %v, inner silent", time.Since(start))
 	}
 }
 

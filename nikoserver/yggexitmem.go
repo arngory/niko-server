@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -123,10 +124,21 @@ func (c *yggExitCount) grow(e *yggExit, want int64) int64 {
 	}
 	var idle []*yggExit
 	now := time.Now()
-	if got < want && now.Sub(c.reclaimed) >= 100*time.Millisecond {
-		// Short of the user's share only, only its exits' help.
-		mine := node >= want
-		c.reclaimed = now
+	// Short of the user's share only, only its exits' help, at most each
+	// 100 ms a user; short of the node's budget, all exits', at most each
+	// 100 ms in all. Apart: a user at its share sweeping its own did not
+	// leave another, short of the node's, its sweep (protocol review).
+	mine := node >= want
+	last := c.reclaimed
+	if mine {
+		last = c.reclaimedBy[e.who.user]
+	}
+	if got < want && now.Sub(last) >= 100*time.Millisecond {
+		if mine {
+			c.reclaimedBy[e.who.user] = now
+		} else {
+			c.reclaimed = now
+		}
 		for _, conns := range c.conns {
 			for conn := range conns {
 				if x, ok := conn.(*yggExit); ok && x != e && (!mine || x.who.user == e.who.user) {
@@ -155,9 +167,16 @@ func (c *yggExitCount) release(user string, n int64) {
 	defer c.mu.Unlock()
 	c.grown -= n
 	if c.grownBy[user] -= n; c.grownBy[user] <= 0 {
+		if c.grownBy[user] < 0 || c.grown < 0 {
+			yggExitOverReleased.Add(1)
+		}
 		delete(c.grownBy, user)
 	}
 }
+
+// yggExitOverReleased counts releases past what was grown: an accounting
+// bug, which the tests look for (exitRig); nothing logs it.
+var yggExitOverReleased atomic.Int64
 
 // yggExitsClosing bounds the endpoints of exits ended that wait in
 // FIN-WAIT-2 or TIME-WAIT, outside every count: past it the oldest is
@@ -226,8 +245,9 @@ func (e *yggExit) firstCopied() int64 { return min(tcp.InitialCwnd*e.mss, yggExi
 // out-of-order size, so rcvMemUsed reads it in place, for the version
 // go.mod pins (TestYggRcvMemUsed); 0, the field gone: never read.
 var rcvMemOffset = func() uintptr {
+	// Endpoint's own field: a promoted one's offset is its struct's.
 	f, ok := reflect.TypeFor[tcp.Endpoint]().FieldByName("rcvMemUsed")
-	if !ok || f.Type != reflect.TypeFor[atomicbitops.Int32]() {
+	if !ok || len(f.Index) != 1 || f.Type != reflect.TypeFor[atomicbitops.Int32]() {
 		return 0
 	}
 	return f.Offset

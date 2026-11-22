@@ -713,3 +713,191 @@ func TestYggRcvMemUsed(t *testing.T) {
 		t.Fatalf("held %d with a receive buffer of %d", held, size)
 	}
 }
+
+// endpointOf is the node's endpoint of the client's c.
+func (r *exitRig) endpointOf(c net.Conn) *tcp.Endpoint {
+	port := uint16(c.LocalAddr().(*net.TCPAddr).Port)
+	for _, ep := range r.ns.RegisteredEndpoints() {
+		if e, ok := ep.(*tcp.Endpoint); ok && e.Info().(*stack.TransportEndpointInfo).ID.RemotePort == port {
+			return e
+		}
+	}
+	return nil
+}
+
+// A user short of its share sweeps its own exits, at most each 100 ms; a
+// user short of the node's budget sweeps all, on a throttle of its own
+// (protocol review: one throttle for both let a user at its share take
+// the node's sweeps from another).
+func TestYggExitSweepsApart(t *testing.T) {
+	c := newYggExitCount()
+	c.budget = 8 << 20 // a share: 1 MiB
+	a := &yggExit{who: yggExitSource{user: "a"}, open: c}
+	b := &yggExit{who: yggExitSource{user: "b"}, open: c}
+	if got := c.grow(a, 1<<20); got != 1<<20 {
+		t.Fatalf("a grew %d", got)
+	}
+	c.grow(a, 1) // short of a's share: a's sweep
+	c.mu.Lock()
+	c.grown = c.budget // the others' exits hold the rest
+	c.mu.Unlock()
+	mark := time.Now()
+	c.grow(b, 1) // short of the node's: a node sweep, a's just before
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.reclaimed.After(mark) || !c.reclaimedBy["a"].Before(mark) {
+		t.Fatalf("node sweep at %v, a's at %v, b asked at %v", c.reclaimed, c.reclaimedBy["a"], mark)
+	}
+}
+
+// A user short of the node's budget, held by other users' idle exits,
+// has them give back: the sweep is the node's, not the user's own.
+func TestYggExitBuffersNodeSweep(t *testing.T) {
+	const users, budget = 9, 16 << 20 // a share: 2 MiB; 8 users fill it
+	hold := make(chan struct{})
+	t.Cleanup(func() { close(hold) })
+	r, _ := usersRig(t, users, func(c net.Conn) {
+		defer c.Close()
+		if _, err := c.Read(make([]byte, 3)); err != nil {
+			return
+		}
+		_ = writeN(c, 16<<20)
+		<-hold
+	})
+	r.open.mu.Lock()
+	r.open.budget = budget
+	r.open.mu.Unlock()
+	for u := range users - 1 {
+		c := r.dialAs(t, u)
+		if _, err := c.Write([]byte("GET")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.CopyN(io.Discard, c, 16<<20); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if all, _ := r.grown(); all < budget*7/8 {
+		t.Fatalf("the 8 grew %d of %d", all, budget)
+	}
+	time.Sleep(yggExitIdle + 200*time.Millisecond) // all idle
+	last := r.dialAs(t, users-1)
+	if _, err := last.Write([]byte("GET")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.CopyN(io.Discard, last, 16<<20); err != nil {
+		t.Fatal(err)
+	}
+	if e := r.endpointOf(last); e == nil || e.SocketOptions().GetSendBufferSize() < 1<<20 {
+		t.Fatalf("the last user's send buffer %d", e.SocketOptions().GetSendBufferSize())
+	}
+}
+
+// An upload and a download that go on, in bursts, keep what they grew
+// through another exit's sweeps: idle is a second without a read for the
+// receive buffer, without a write for the send one.
+func TestYggExitBuffersActiveKept(t *testing.T) {
+	const budget = 32 << 20 // a user's share: 4 MiB
+	stop := make(chan struct{})
+	r := newExitRig(t, func(c net.Conn) {
+		defer c.Close()
+		b := make([]byte, 1)
+		if _, err := c.Read(b); err != nil {
+			return
+		}
+		switch b[0] {
+		case 'd': // in bursts, until stop
+			for {
+				select {
+				case <-stop:
+					return
+				case <-time.After(100 * time.Millisecond):
+				}
+				if writeN(c, 256<<10) != nil {
+					return
+				}
+			}
+		case 'x':
+			_ = writeN(c, 32<<20)
+		}
+		_, _ = io.Copy(io.Discard, c)
+	}, nil)
+	r.open.mu.Lock()
+	r.open.budget = budget
+	r.open.mu.Unlock()
+	t.Cleanup(func() { close(stop) })
+	down, up := r.dial(t), r.dial(t)
+	go func() { _, _ = io.Copy(io.Discard, down) }()
+	if _, err := down.Write([]byte("d")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := up.Write([]byte("u")); err != nil {
+		t.Fatal(err)
+	}
+	go func() { // in bursts, until stop
+		b := make([]byte, 256<<10)
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(100 * time.Millisecond):
+			}
+			if _, err := up.Write(b); err != nil {
+				return
+			}
+		}
+	}()
+	time.Sleep(time.Second) // both grown
+	d, u := r.endpointOf(down), r.endpointOf(up)
+	snd, rcv := d.SocketOptions().GetSendBufferSize(), u.SocketOptions().GetReceiveBufferSize()
+	if snd <= yggExitSendFloor || rcv <= yggExitRecvFloor {
+		t.Fatalf("grown to %d to send, %d to receive", snd, rcv)
+	}
+	other := r.dial(t)
+	if _, err := other.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { _, err := io.CopyN(io.Discard, other, 32<<20); done <- err }()
+	for end := time.Now().Add(2 * time.Second); time.Now().Before(end); time.Sleep(10 * time.Millisecond) {
+		if s, v := d.SocketOptions().GetSendBufferSize(), u.SocketOptions().GetReceiveBufferSize(); s < snd || v < rcv {
+			t.Fatalf("given back while active: send %d of %d, receive %d of %d", s, snd, v, rcv)
+		}
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	all, _ := r.grown()
+	if all < budget/yggExitShares-yggExitBufMax/4 {
+		t.Fatalf("no sweep pressure: grown %d", all)
+	}
+}
+
+// Ended endpoints the ring holds go once closed: when as many have come
+// as the ring's least compaction, those gone are dropped, not kept to its
+// bound.
+func TestYggExitRingCompacts(t *testing.T) {
+	r := newExitRig(t, func(c net.Conn) {
+		_, _ = c.Write([]byte("bye"))
+		c.Close()
+	}, nil)
+	short := func() {
+		c := r.dial(t)
+		if _, err := io.Copy(io.Discard, c); err != nil {
+			t.Fatal(err)
+		}
+		c.Close()
+		if !waitFor(2*time.Second, func() bool { return r.total() == 0 }) {
+			t.Fatal("the exit stayed")
+		}
+	}
+	for range 64 { // the ring at its least compaction, 64: the next compacts
+		short()
+	}
+	time.Sleep(yggTimeWait + 500*time.Millisecond) // all closed
+	short()
+	r.open.mu.Lock()
+	defer r.open.mu.Unlock()
+	if n := len(r.open.ending); n != 1 {
+		t.Fatalf("%d in the ring, 1 waiting", n)
+	}
+}
