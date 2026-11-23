@@ -119,13 +119,10 @@ func (c *QueuePacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	// Copy the slice so that the caller may reuse it.
 	buf := make([]byte, len(p))
 	copy(buf, p)
-	select {
-	case c.remotes.SendQueue(addr) <- buf:
-		return len(buf), nil
-	default:
-		// Drop the outgoing packet if the send queue is full.
-		return len(buf), nil
-	}
+	// Drop the outgoing packet if the send queue is full. (neko) The send
+	// is the remote map's, under its lock (RemoteMap.Send).
+	c.remotes.Send(addr, buf)
+	return len(buf), nil
 }
 
 // closeWithError unblocks pending operations and makes future operations fail
