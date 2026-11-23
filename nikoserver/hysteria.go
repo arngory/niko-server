@@ -185,8 +185,12 @@ func runHysteriaMem(ctx context.Context, c *BackendConfig, conn *packetConn, log
 		return envError("tls: %v", err)
 	}
 	defer tlsConfig.Close()
+	// With salamander_front the front takes salamander off and puts it
+	// on, with each device's key: the server gets plain QUIC, and below,
+	// with no password, its connection IDs and resets are plain QUIC's
+	// behind the front (aheadFilter), its packets salamander's size.
 	var salamander string
-	if c.Kind == "hy2-obfs" {
+	if c.Kind == "hy2-obfs" && !c.Options.SalamanderFront {
 		b, err := os.ReadFile(c.Options.ObfsPasswordFile)
 		if err != nil {
 			return envError("salamander password: %v", err)
@@ -229,7 +233,7 @@ func runHysteriaMem(ctx context.Context, c *BackendConfig, conn *packetConn, log
 	// come on top of quic-go's first packets of 1280, so they start 8 bytes
 	// smaller and leave the front at 1280 like every other QUIC on it. Path
 	// MTU discovery then counts only what came through, the salt included.
-	quicOptions := hysteriaQUICOptions(salamander != "")
+	quicOptions := hysteriaQUICOptions(salamander != "" || c.Options.SalamanderFront)
 	hysteriaWindows(&quicOptions, mem)
 	// Connection IDs with the backend's label, if it has one. With them
 	// the server sends stateless resets under a key from the label's, the

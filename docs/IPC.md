@@ -75,7 +75,7 @@ Xray: `listen` — путь сокета, `sockopt.acceptProxyProtocol: true`.
 | version | 1 | 1 |
 | client | 19 | адрес клиента (как `src` выше); в ответе — кому отправить |
 | local | 19 | локальный адрес UDP-сокета фронта, на который пришёл пакет; в ответе — с какого отправить |
-| payload | остаток | датаграмма как есть (для `hy2-obfs` — с обфускацией salamander, бэкенд снимает её сам) |
+| payload | остаток | датаграмма как есть (для `hy2-obfs` — с обфускацией salamander, бэкенд снимает её сам; с v0.19.3 у маршрута `salamander_passwords_file` — без неё: снимает и накладывает фронт, бэкенд с `salamander_front`) |
 
 - Бэкенд видит это как `net.PacketConn`: `ReadFrom` возвращает `client`, а `WriteTo(client)` пишет ответ с тем же
   `local`.
