@@ -201,6 +201,7 @@ type dnsFront struct {
 	stats       *dnsFrontStats
 	tagged      map[string]*taggedZone // zones whose queries carry a device's tag (slipstream)
 	seenEarly   atomic.Uint64          // their memories' generations started early
+	share       answerShare            // their copies' answers: the first one's
 }
 
 func (f *dnsFront) closeAll() {
@@ -275,14 +276,24 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 			var verdict int
 			if forward, field, device, verdict = t.check(query, name, questionEnd, rebuilt, raw); verdict != tagPassed {
 				// Not a device's query, or a copy of one: the backend
-				// sees nothing of it. A copy right after the original
-				// gets nothing: the original's answer is on its way.
+				// sees nothing of it. A copy of a field passed on
+				// lately gets the answer the first one gets
+				// (answerShare), a few times; another right after the
+				// original gets nothing: the original's answer is on
+				// its way.
 				switch verdict {
-				case tagEcho:
+				case tagEcho, tagReplayed:
 					f.stats.replayed.Add(1)
-					continue
-				case tagReplayed:
-					f.stats.replayed.Add(1)
+					if reply, handled := f.share.copyOf(field, query, questionEnd, client, local, dst); handled {
+						if reply != nil {
+							f.stats.shared.Add(1)
+							f.reply(conn, reply, client, dst)
+						}
+						continue
+					}
+					if verdict == tagEcho {
+						continue
+					}
 				default:
 					f.stats.untagged.Add(1)
 				}
@@ -297,7 +308,10 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 		// back (docs/IPC.md), not dst: the wire stays as it was, and the
 		// backend keeps one local per client, which a resolver asking two
 		// of the host's addresses from one port would mix up.
-		f.pending.add(client, query, questionEnd, dst)
+		if t != nil {
+			f.share.open(field)
+		}
+		f.pending.addField(client, query, questionEnd, dst, field, t != nil)
 		link := f.zoneBackend[zone]
 		var msg []byte
 		if t != nil && link.ref.Devices {
@@ -309,6 +323,7 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 			f.pending.take(client, query) // the backend never got it
 			if t != nil {
 				t.seen.forget(field, time.Now()) // nor its packet: one retry is no copy
+				f.share.forget(field)
 			}
 			f.stats.backendAway.Add(1)
 			continue
@@ -335,12 +350,19 @@ const maxDNSQuery = 4096
 // and on a wildcard from the address it came to: only to a query that
 // waits for it, and within its requester's size (pendingQueries).
 func (f *dnsFront) answer(client, local netip.AddrPort, payload []byte) {
-	size, src, ok := f.pending.take(client, payload)
+	e, ok := f.pending.takeEntry(client, payload)
 	if !ok {
 		f.stats.unmatched.Add(1)
 		f.log.Debugf("an answer to %s no query waits for: dropped", client)
 		return
 	}
+	if e.tagged {
+		// The copies that wait for this answer get it too, as their own.
+		for _, w := range f.share.answered(e.field, payload) {
+			f.answerCopy(w, payload)
+		}
+	}
+	size, src := int(e.size), e.dst
 	cut := false
 	if len(payload) > min(size, maxBackendAnswer) {
 		if payload = truncated(payload); payload == nil {
@@ -373,6 +395,20 @@ func (f *dnsFront) answer(client, local netip.AddrPort, payload []byte) {
 	if cut {
 		f.stats.truncated.Add(1)
 	}
+}
+
+// answerCopy sends a backend's answer to a copy of the query it answers
+// that waited for it (answerShare), made its own, from the socket and
+// address the copy came to.
+func (f *dnsFront) answerCopy(w shareWaiter, answer []byte) {
+	reply := shareReply(answer, w.query, w.questionEnd)
+	conn := f.sockets[w.local]
+	if reply == nil || conn == nil {
+		f.stats.dropped.Add(1)
+		return
+	}
+	f.stats.shared.Add(1)
+	f.reply(conn, reply, w.client, w.dst)
 }
 
 // backendLink is the front's connection to one backend: reconnects with backoff,
