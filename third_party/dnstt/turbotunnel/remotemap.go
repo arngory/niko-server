@@ -71,6 +71,24 @@ func (m *RemoteMap) SendQueue(addr net.Addr) chan []byte {
 	return m.inner.Lookup(addr, time.Now()).SendQueue
 }
 
+// Send places p in the send queue corresponding to addr, creating it if
+// necessary, unless the queue is full. Returns true if p was queued.
+//
+// (neko) The send happens under the lock, as removeExpired's close does: a
+// queue taken out with SendQueue and sent to afterwards could be closed in
+// between by the expiry, and a send on a closed channel panics (seen as a
+// race under -race; a crash of the server in use).
+func (m *RemoteMap) Send(addr net.Addr, p []byte) bool {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	select {
+	case m.inner.Lookup(addr, time.Now()).SendQueue <- p:
+		return true
+	default:
+		return false
+	}
+}
+
 // Stash places p in the stash corresponding to addr, if the stash is not
 // already occupied. Returns true if the p was placed in the stash, false
 // otherwise.
