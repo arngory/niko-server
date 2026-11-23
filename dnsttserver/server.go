@@ -531,79 +531,6 @@ type record struct {
 	Seal *sealKey
 }
 
-// answerMemo keeps the data of recent answers by query payload (neko). A
-// resolver that hears nothing in time asks again, the same query of the
-// client's, and takes whichever answer comes first; the other is dropped.
-// Answered with new data, the retry lost what it carried, and KCP had to
-// send it again. Now it gets the first answer's data, and so does any
-// copy of the query, however its name is cased or split: it takes nothing
-// of the client's next data. The payload carries the client's random
-// padding, or a sealed query's N, so the client never repeats one. Two
-// generations of
-// memoGeneration bound it: an answer is kept 5 to 10 seconds, fewer under
-// a flood. Only sendLoop uses it, from one goroutine.
-type answerMemo struct {
-	cur, prev map[string]memoEntry
-	swapped   time.Time
-}
-
-type memoEntry struct {
-	data []byte // TXT RDATA
-	raw  int    // payload bytes in it
-}
-
-const (
-	memoGeneration = 5 * time.Second
-	memoMax        = 4096 // answers in a generation
-)
-
-// age turns the generations over by the clock: what is older than two
-// generations is gone even when no answer came meanwhile.
-func (m *answerMemo) age(now time.Time) {
-	switch since := now.Sub(m.swapped); {
-	case m.cur == nil || since > 2*memoGeneration:
-		m.prev, m.cur, m.swapped = nil, make(map[string]memoEntry), now
-	case since > memoGeneration || len(m.cur) >= memoMax:
-		m.prev, m.cur, m.swapped = m.cur, make(map[string]memoEntry), now
-	}
-}
-
-// answer fills rec's answer from the memo, if its query was answered
-// lately. Data that would not fit this requester (a retry through a
-// smaller resolver) is not sent: the answer goes out empty.
-func (m *answerMemo) answer(rec *record) bool {
-	if rec.Key == "" {
-		return false
-	}
-	m.age(time.Now())
-	e, ok := m.cur[rec.Key]
-	if !ok {
-		e, ok = m.prev[rec.Key]
-	}
-	if !ok {
-		return false
-	}
-	data := e.data
-	if e.raw > encodedPayload(rec.Size) {
-		var empty []byte
-		if rec.Seal != nil {
-			empty = rec.Seal.answer(nil, encodedPayload(rec.Size))
-		}
-		data = dns.EncodeRDataTXT(empty)
-	}
-	q := rec.Resp.Question[0]
-	rec.Resp.Answer = []dns.RR{{Name: q.Name, Type: q.Type, Class: q.Class, TTL: responseTTL, Data: data}}
-	return true
-}
-
-func (m *answerMemo) remember(rec *record, raw int) {
-	if rec.Key == "" {
-		return
-	}
-	m.age(time.Now())
-	m.cur[rec.Key] = memoEntry{data: rec.Resp.Answer[0].Data, raw: raw}
-}
-
 // requesterSize is a query's EDNS(0) UDP payload size within 512 and
 // maxUDPPayload (neko): RFC 6891 §6.1.1, "values lower than 512 MUST be
 // treated as equal to 512"; no OPT, 512.
@@ -773,6 +700,10 @@ func recvLoop(domains []dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Qu
 func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-chan *record, sessions *sessionTable) error {
 	var nextRec *record
 	var memo answerMemo
+	var copies copyMemory
+	if sessions != nil {
+		copies.turns = func() { sessions.stats.CopyTurns.Add(1) }
+	}
 	for {
 		rec := nextRec
 		nextRec = nil
@@ -792,6 +723,19 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 			// (neko) A query asked before (a resolver's retry): the
 			// same data as the first answer, which the resolver may
 			// already have taken.
+		} else if rec.Resp.Rcode() == dns.RcodeNoError && carriesData(rec.Resp) && !rec.NoData && copies.sight(rec.Key, memo.clock()) {
+			// (neko) A copy the memo no longer answers (later than
+			// it keeps answers, or past their repeats): an empty
+			// answer, never the session's next data (copyMemory).
+			if sessions != nil {
+				sessions.stats.Copies.Add(1)
+			}
+			var data []byte
+			if rec.Seal != nil {
+				data = rec.Seal.answer(nil, encodedPayload(rec.Size))
+			}
+			q := rec.Resp.Question[0]
+			rec.Resp.Answer = []dns.RR{{Name: q.Name, Type: q.Type, Class: q.Class, TTL: responseTTL, Data: dns.EncodeRDataTXT(data)}}
 		} else if rec.Resp.Rcode() == dns.RcodeNoError && carriesData(rec.Resp) && !rec.NoData && sessions != nil && !sessions.has(rec.ClientID) {
 			// (neko) No KCP session for this ClientID: nothing to
 			// send, and no queues are made for it (they were 3.6 KB a
