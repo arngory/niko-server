@@ -100,3 +100,25 @@ func TestFrontRRLBlocks(t *testing.T) {
 		t.Fatalf("%d answers of 1232 bytes a second later", n)
 	}
 }
+
+// TestFrontRRLDataRate: dns.rrl_data_kib sets a block's budget of the
+// backends' answers; -1 lifts it.
+func TestFrontRRLDataRate(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	clock := func() time.Time { return now }
+	addr := netip.MustParseAddr("192.0.2.7")
+	r := frontRRL{dataRate: 1024, now: clock} // 1 KiB/s, 2 KiB at once
+	if !r.data(addr, 2048) || r.data(addr, 1) {
+		t.Fatal("a budget of 1 KiB/s does not hold 2 KiB at once and no more")
+	}
+	off := frontRRL{dataRate: -1024, now: clock}
+	for range 100 {
+		if !off.data(addr, 1<<20) {
+			t.Fatal("rrl_data_kib -1 limits")
+		}
+	}
+	def := frontRRL{now: clock}
+	if !def.data(addr, rrlDataBurst) || def.data(addr, 1) {
+		t.Fatal("the default budget is not rrlDataBurst at once")
+	}
+}

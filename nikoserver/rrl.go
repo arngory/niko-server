@@ -35,6 +35,7 @@ import (
 // generation, a flood of blocks swaps them sooner): a block forgotten
 // starts full again.
 type frontRRL struct {
+	dataRate  float64 // bytes a second to a block, 0: rrlDataRate; < 0: no limit (dns.rrl_data_kib)
 	mu        sync.Mutex
 	cur, prev map[netip.Prefix]*rrlBlock
 	swapped   time.Time
@@ -97,8 +98,15 @@ func (r *frontRRL) soa(addr netip.Addr) bool {
 
 // data reports whether a backend's answer of n bytes may go to addr now.
 func (r *frontRRL) data(addr netip.Addr, n int) bool {
+	rate, burst := float64(rrlDataRate), float64(rrlDataBurst)
+	switch {
+	case r.dataRate < 0:
+		return true
+	case r.dataRate > 0:
+		rate, burst = r.dataRate, 2*r.dataRate
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := r.clock()
-	return r.block(addr, now).data.take(float64(n), rrlDataRate, rrlDataBurst, now)
+	return r.block(addr, now).data.take(float64(n), rate, burst, now)
 }

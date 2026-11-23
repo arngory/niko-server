@@ -97,6 +97,11 @@ type FrontDNS struct {
 	// StatsSocket (v0.11.0): where the front gives its counters, one JSON
 	// line to each connection (DNSFrontSnapshot), for the node's metrics.
 	StatsSocket string `json:"stats_socket,omitempty"`
+	// RRLDataKiB (v0.19.3): what the backends' answers may send to one
+	// address block (a /24, a /48) a second, in KiB, twice that at once
+	// (frontRRL). 0: 4096 (4 MiB/s); -1: no limit. A node with many users
+	// behind one resolver's block raises it.
+	RRLDataKiB int `json:"rrl_data_kib,omitempty"`
 }
 
 // TCPRoute sends TLS connections with one of these server names, or
@@ -527,6 +532,9 @@ func (c *FrontConfig) validate() []ConfigError {
 	}
 	if len(c.DNS.Zones) == 0 {
 		e.add("dns.zones", "no zones")
+	}
+	if c.DNS.RRLDataKiB < -1 || c.DNS.RRLDataKiB > 1<<20 {
+		e.add("dns.rrl_data_kib", "want -1 (no limit), 0 (4096) or 1 to 1048576")
 	}
 	if c.DNS.ProbeKeyFile != "" {
 		checkSocket(&e, "dns.probe_key_file", c.DNS.ProbeKeyFile)

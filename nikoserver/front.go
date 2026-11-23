@@ -88,6 +88,7 @@ func listenDNS(ctx context.Context, network string, addr netip.AddrPort) (*net.U
 func runDNSFront(ctx context.Context, c *FrontConfig, log *Logger) error {
 	front := &dnsFront{log: log, zoneBackend: make(map[string]*backendLink), sockets: make(map[netip.AddrPort]*net.UDPConn),
 		pktinfo: map[netip.AddrPort]bool{}, probeZones: map[string]bool{}, padZones: map[string]bool{}, apex: map[string]*apexZone{}, tagged: map[string]*taggedZone{}}
+	front.rrl.dataRate = float64(c.DNS.RRLDataKiB) * 1024
 	if c.DNS.ProbeKeyFile != "" {
 		// Without the key the front answers no probes, and goes on: the
 		// tunnels, TCP and UDP 443 must not stop for a resolver check.
