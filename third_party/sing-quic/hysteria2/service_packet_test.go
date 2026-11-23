@@ -39,9 +39,12 @@ func fragment(packetID uint16, id, total uint8, size int) *udpMessage {
 }
 
 // A client's fragments of packets it never completes are kept for a few
-// packets only (neko: udpDefragPackets), and a packet in more fragments
-// than 64 KiB needs is dropped (udpMaxFragments): before, the fragments
-// of up to 65536 packets stayed 10 s, 255 of up to a datagram each.
+// packets only (neko: udpDefragPackets), and a packet whose fragments
+// carry more than a UDP payload can is dropped (udpMaxPacketBytes): before,
+// the fragments of up to 65536 packets stayed 10 s, 255 of up to a
+// datagram each. The number of fragments is the client's: 64 KiB in
+// fragments of 900 bytes (a long destination in each header, a small MTU)
+// completes.
 func TestUDPDefragmenterBounded(t *testing.T) {
 	d := newUDPDefragger()
 	for id := range 1000 {
@@ -54,19 +57,34 @@ func TestUDPDefragmenterBounded(t *testing.T) {
 	if kept > 4 {
 		t.Fatalf("the fragments of %d packets kept", kept)
 	}
-	if m := d.feed(fragment(5000, 0, 200, 1200)); m != nil {
-		t.Fatal("completed")
+	// 200 fragments of 1200 bytes: past 64 KiB at the 55th, dropped; what
+	// comes after starts again and never holds more than 64 KiB.
+	for id := range uint8(200) {
+		if m := d.feed(fragment(5000, id, 200, 1200)); m != nil {
+			t.Fatal("a packet of 240000 bytes completed")
+		}
+		if it, ok := d.packetMap.Load(5000); ok && it.bytes > 65535 {
+			t.Fatalf("a packet's fragments hold %d bytes", it.bytes)
+		}
 	}
-	if it, ok := d.packetMap.Load(5000); ok && len(it.messages) != 0 {
-		t.Fatal("a packet of 200 fragments kept")
+	held := 0
+	if it, ok := d.packetMap.Load(5000); ok {
+		for _, m := range it.messages {
+			if m != nil {
+				held += m.data.Len()
+			}
+		}
 	}
-	// A packet of two still completes, and one of 64.
-	for _, total := range []uint8{2, 64} {
+	if held > 65535 {
+		t.Fatalf("a packet past 64 KiB holds %d bytes", held)
+	}
+	// Packets of two and of 72 fragments (64800 bytes) complete.
+	for _, total := range []uint8{2, 72} {
 		var m *udpMessage
 		for id := range total {
-			m = d.feed(fragment(6000+uint16(total), id, total, 1000))
+			m = d.feed(fragment(6000+uint16(total), id, total, 900))
 		}
-		if m == nil || m.data.Len() != int(total)*1000 {
+		if m == nil || m.data.Len() != int(total)*900 {
 			t.Fatalf("a packet of %d fragments: %v", total, m)
 		}
 		m.releaseMessage()

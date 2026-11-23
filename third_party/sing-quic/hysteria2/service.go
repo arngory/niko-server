@@ -420,20 +420,23 @@ func (s *serverSession[U]) serveStreams(srv *http3.Server) error {
 
 type serverSession[U comparable] struct {
 	*Service[U]
-	ctx           context.Context
-	quicConn      *quic.Conn
-	connAccess    sync.Mutex
-	connDone      chan struct{}
-	connErr       error
-	authenticated bool
-	authUser      U
-	udpAccess     sync.RWMutex
-	udpConnMap    map[uint32]*udpPacketConn
+	ctx        context.Context
+	quicConn   *quic.Conn
+	connAccess sync.Mutex
+	connDone   chan struct{}
+	connErr    error
+	// auth is the user the connection authenticated as, nil before (neko:
+	// a bool and a U written by the auth request's handler and read by the
+	// stream's goroutines without a lock, so a stream could see the bool
+	// and not the user).
+	auth       atomic.Pointer[U]
+	udpAccess  sync.RWMutex
+	udpConnMap map[uint32]*udpPacketConn
 }
 
 func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost && r.Host == protocol.URLHost && r.URL.Path == protocol.URLPath {
-		if s.authenticated {
+		if _, ok := s.user(); ok {
 			protocol.AuthResponseToHeader(w.Header(), protocol.AuthResponse{
 				UDPEnabled: !s.udpDisabled,
 				Rx:         s.receiveBPS,
@@ -453,8 +456,7 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			s.masqueradeHandler.ServeHTTP(w, r)
 			return
 		}
-		s.authUser = user
-		s.authenticated = true
+		s.auth.Store(&user)
 		var rxAuto bool
 		var brutal *hyCC.BrutalSender
 		if s.receiveBPS > 0 && s.ignoreClientBandwidth && request.Rx == 0 {
@@ -508,6 +510,15 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// user is whom the connection authenticated as, if it did.
+func (s *serverSession[U]) user() (U, bool) {
+	if p := s.auth.Load(); p != nil {
+		return *p, true
+	}
+	var none U
+	return none, false
+}
+
 // setCongestionControl gives the connection cc, through the caller's wrap
 // if it has one (neko).
 func (s *serverSession[U]) setCongestionControl(user U, cc congestion.CongestionControl) {
@@ -518,7 +529,8 @@ func (s *serverSession[U]) setCongestionControl(user U, cc congestion.Congestion
 }
 
 func (s *serverSession[U]) dispatchStream(frameType http3.FrameType, stream *quic.Stream, err error) (bool, error) {
-	if !s.authenticated || err != nil {
+	user, authenticated := s.user()
+	if !authenticated || err != nil {
 		return false, nil
 	}
 	if frameType != protocol.FrameTypeTCPRequest {
@@ -528,7 +540,7 @@ func (s *serverSession[U]) dispatchStream(frameType http3.FrameType, stream *qui
 	// refused is reset, as a stream past the connection's limit would be.
 	var started func()
 	if s.streamStart != nil {
-		done, ok := s.streamStart(s.authUser)
+		done, ok := s.streamStart(user)
 		if !ok {
 			stream.CancelRead(0)
 			stream.CancelWrite(0)
@@ -548,7 +560,7 @@ func (s *serverSession[U]) dispatchStream(frameType http3.FrameType, stream *qui
 		return true, nil
 	}
 	go func() {
-		hErr := s.handleStream(stream, started)
+		hErr := s.handleStream(stream, user, started)
 		if hErr != nil {
 			stream.CancelRead(0)
 			stream.Close()
@@ -558,7 +570,7 @@ func (s *serverSession[U]) dispatchStream(frameType http3.FrameType, stream *qui
 	return true, nil
 }
 
-func (s *serverSession[U]) handleStream(stream *quic.Stream, started func()) error {
+func (s *serverSession[U]) handleStream(stream *quic.Stream, user U, started func()) error {
 	destinationString, err := protocol.ReadTCPRequest(stream)
 	if started != nil {
 		started()
@@ -573,7 +585,7 @@ func (s *serverSession[U]) handleStream(stream *quic.Stream, started func()) err
 	if len(destination.Fqdn) > 255 {
 		return E.New("fqdn too long")
 	}
-	s.handler.NewConnectionEx(auth.ContextWithUser(s.ctx, s.authUser), &serverConn{Stream: stream}, M.SocksaddrFromNet(s.quicConn.RemoteAddr()).Unwrap(), destination, nil)
+	s.handler.NewConnectionEx(auth.ContextWithUser(s.ctx, user), &serverConn{Stream: stream}, M.SocksaddrFromNet(s.quicConn.RemoteAddr()).Unwrap(), destination, nil)
 	return nil
 }
 

@@ -32,13 +32,17 @@ import (
 //     MiB; every byte a connection's window grows by is taken from the
 //     node's budget (hyMemBudget) within its user's share of it,
 //     hyMemShares-th, and given back when the connection ends (quic-go
-//     never shrinks a window it gave);
+//     never shrinks a window it gave); the windows take half the budget
+//     and half a share at most, so that a long upload leaves the flights
+//     theirs;
 //   - what the server has in flight on an authenticated connection is
 //     bounded by hySendFloor plus what it took from the same budget, to
 //     what Brutal or BBR allow; a connection whose congestion window wants
 //     more takes it in steps (hySendStep), and when the budget or the
-//     user's share runs short, connections that sent nothing for
-//     hyMemIdle give back what they took (giveBack);
+//     user's share runs short, the others give back what they hold past
+//     their windows and their flights, past their flights once idle for
+//     hyMemIdle (giveBack): a flight its client does not acknowledge is
+//     memory held, and stays counted;
 //   - a user has at most hy2ConnsPerUser connections at once (hyusers.go)
 //     and hy2PendingPerUser streams waiting for their request (hylimits.go),
 //     a connection hy2PendingStreams streams read before they are known,
@@ -46,7 +50,9 @@ import (
 //     sing-quic's udpQueueBytes, udpDefragPackets).
 //
 // So the windows and the flight of all connections are at most the budget
-// plus their floors. quic-go holds a STREAM frame of 128 bytes or more in a
+// plus their floors: per user, hy2ConnsPerUser × (hySendFloor +
+// hyConnWindow), some 28 MiB, outside the budget; the unauthenticated,
+// hyConnWindow a connection, as many as the front lets through. quic-go holds a STREAM frame of 128 bytes or more in a
 // packet buffer of its own (1452 bytes), so the heap under a full receive
 // window is up to 11 times the window for a client that sends 128-byte
 // frames, about the window for one that fills its packets: the budget
@@ -60,6 +66,7 @@ const (
 	hyMemShares    = 8         // as 8 users fill the budget
 	hyMemIdle      = time.Second
 	hyMemSweepGap  = 100 * time.Millisecond
+	hyMemShortFor  = 20 * time.Millisecond // a sender short of the budget waits this before it asks again
 )
 
 // hyMemBudget is the default budget: an eighth of the memory the process
@@ -86,13 +93,21 @@ type hyMem struct {
 	warnedUser  bool
 	reclaimed   time.Time
 	reclaimedBy map[string]time.Time
+	// recvAll and recvBy are what the receive windows took, of all and of
+	// each user: within half the budget and half a share, the rest of each
+	// is the flights' (hyMemRecvShare). A window gives nothing back while its
+	// connection lives.
+	recvAll int64
+	recvBy  map[string]int64
+
+	takes atomic.Int64 // asks of the budget, for the tests
 
 	overReleased atomic.Int64 // releases past what was taken: a bug, for the tests
 }
 
 func newHyMem(budget int64, log *Logger) *hyMem {
 	return &hyMem{budget: budget, log: log, grownBy: map[string]int64{}, conns: map[<-chan struct{}]*hyMemConn{},
-		reclaimedBy: map[string]time.Time{}}
+		reclaimedBy: map[string]time.Time{}, recvBy: map[string]int64{}}
 }
 
 // hyMemConn is what one QUIC connection took: of its receive window, and
@@ -136,6 +151,7 @@ func (m *hyMem) end(done <-chan struct{}) {
 	}
 	delete(m.conns, done)
 	c.ended = true
+	m.recvLocked(c.user, -c.recv)
 	m.releaseLocked(c.user, c.recv+c.send)
 	c.recv, c.send = 0, 0
 	if c.sender != nil {
@@ -155,9 +171,25 @@ func (m *hyMem) setUser(done <-chan struct{}, user string) *hyMemConn {
 			m.grown += n
 			m.grownBy[user] += n
 		}
+		m.recvLocked(c.user, -c.recv)
 		c.user = user
+		m.recvLocked(c.user, c.recv)
 	}
 	return c
+}
+
+// recvLocked counts n more bytes of user's receive windows.
+func (m *hyMem) recvLocked(user string, n int64) {
+	if n == 0 {
+		return
+	}
+	m.recvAll += n
+	if m.recvBy[user] += n; m.recvBy[user] <= 0 {
+		if m.recvBy[user] < 0 || m.recvAll < 0 {
+			m.overReleased.Add(1)
+		}
+		delete(m.recvBy, user)
+	}
 }
 
 func (m *hyMem) releaseLocked(user string, n int64) {
@@ -181,6 +213,7 @@ func (m *hyMem) takeLocked(c *hyMemConn, want int64, whole bool) (got int64, idl
 	if c.ended || want <= 0 {
 		return 0, nil, ""
 	}
+	m.takes.Add(1)
 	node := m.budget - m.grown
 	user := m.budget/hyMemShares - m.grownBy[c.user]
 	got = max(min(want, node, user), 0)
@@ -232,11 +265,22 @@ func (m *hyMem) takeLocked(c *hyMemConn, want int64, whole bool) (got int64, idl
 // have it all. A window cannot shrink: the bytes stay taken until the
 // connection ends.
 func (m *hyMem) allowRecv(conn *squic.Conn, delta uint64) bool {
-	done := conn.Context().Done() // a field: allowed in the callback
+	return m.growRecv(conn.Context().Done(), int64(delta)) // Context is a field: allowed in the callback
+}
+
+// growRecv is allowRecv by the connection's end.
+func (m *hyMem) growRecv(done <-chan struct{}, delta int64) bool {
 	m.mu.Lock()
 	c := m.connLocked(done)
-	got, idle, warn := m.takeLocked(c, int64(delta), true)
+	// Windows take half the budget and half a share at most: a long upload
+	// does not hold what downloads need for the connection's life.
+	if m.recvAll+delta > m.budget/2 || m.recvBy[c.user]+delta > m.budget/hyMemShares/2 {
+		m.mu.Unlock()
+		return false
+	}
+	got, idle, warn := m.takeLocked(c, delta, true)
 	c.recv += got
+	m.recvLocked(c.user, got)
 	m.mu.Unlock()
 	m.after(idle, warn)
 	return got > 0
@@ -256,13 +300,18 @@ func (m *hyMem) after(idle []*hyMemSender, warn string) {
 // controller may have in flight: at most limit (hySendFloor plus what the
 // connection took), whatever the controller's own window. quic-go calls it
 // from the connection's loop; limit is read there without a lock and
-// changed under hyMem.mu.
+// changed under hyMem.mu, always hySendFloor plus the connection's send.
+// inFlight and cwnd are the flight and the controller's window as the loop
+// last saw them, for a give back from another connection's loop.
 type hyMemSender struct {
 	congestion.CongestionControl
-	m        *hyMem
-	c        *hyMemConn
-	limit    atomic.Int64
-	lastSent atomic.Int64 // monotime of the last packet sent
+	m          *hyMem
+	c          *hyMemConn
+	limit      atomic.Int64
+	inFlight   atomic.Int64
+	cwnd       atomic.Int64
+	lastSent   atomic.Int64 // monotime of the last ack-eliciting packet sent
+	shortUntil atomic.Int64 // monotime: the budget was short, no asking before
 }
 
 // hyMemSenderEx is hyMemSender for a controller that takes quic-go's
@@ -274,6 +323,14 @@ type hyMemSenderEx struct {
 
 func (s hyMemSenderEx) OnCongestionEventEx(priorInFlight congestion.ByteCount, eventTime monotime.Time,
 	acked []congestion.AckedPacketInfo, lost []congestion.LostPacketInfo) {
+	left := int64(priorInFlight)
+	for _, a := range acked {
+		left -= int64(a.BytesAcked)
+	}
+	for _, l := range lost {
+		left -= int64(l.BytesLost)
+	}
+	s.inFlight.Store(max(left, 0))
 	s.ex.OnCongestionEventEx(priorInFlight, eventTime, acked, lost)
 }
 func (s hyMemSenderEx) OnPacketNeutered(n congestion.PacketNumber)  { s.ex.OnPacketNeutered(n) }
@@ -308,17 +365,42 @@ func (m *hyMem) sender(done <-chan struct{}, user string, cc congestion.Congesti
 	return s
 }
 
+// OnPacketSent notes the flight, and the time of a packet that asks for an
+// ACK: one that carries only ACKs says nothing of what the connection
+// sends, and an idle connection keeps acknowledging its client's.
 func (s *hyMemSender) OnPacketSent(sentTime monotime.Time, bytesInFlight congestion.ByteCount, number congestion.PacketNumber,
 	bytes congestion.ByteCount, retransmittable bool) {
-	s.lastSent.Store(int64(sentTime))
+	if retransmittable {
+		s.lastSent.Store(int64(sentTime))
+		s.inFlight.Store(int64(bytesInFlight + bytes))
+	} else {
+		s.inFlight.Store(int64(bytesInFlight))
+	}
 	s.CongestionControl.OnPacketSent(sentTime, bytesInFlight, number, bytes, retransmittable)
 }
 
+func (s *hyMemSender) OnPacketAcked(number congestion.PacketNumber, acked, priorInFlight congestion.ByteCount, t monotime.Time) {
+	s.inFlight.Store(max(int64(priorInFlight)-int64(acked), 0))
+	s.CongestionControl.OnPacketAcked(number, acked, priorInFlight, t)
+}
+
+func (s *hyMemSender) OnCongestionEvent(number congestion.PacketNumber, lost, priorInFlight congestion.ByteCount) {
+	s.inFlight.Store(max(int64(priorInFlight)-int64(lost), 0))
+	s.CongestionControl.OnCongestionEvent(number, lost, priorInFlight)
+}
+
 // CanSend lets a packet go while the flight is under the limit; at it, a
-// controller whose window is above takes more of the budget first.
+// controller whose window is above takes more of the budget first, unless
+// the budget was short a moment ago (hyMemShortFor): a sender at its limit
+// asks at each packet, and the lock is the backend's.
 func (s *hyMemSender) CanSend(bytesInFlight congestion.ByteCount) bool {
+	cwnd := int64(s.CongestionControl.GetCongestionWindow())
+	s.cwnd.Store(cwnd)
+	s.inFlight.Store(int64(bytesInFlight))
 	if int64(bytesInFlight) >= s.limit.Load() {
-		s.grow(int64(s.CongestionControl.GetCongestionWindow()))
+		if now := monotime.Now(); int64(now) >= s.shortUntil.Load() {
+			s.grow(cwnd, now)
+		}
 		if int64(bytesInFlight) >= s.limit.Load() {
 			return false
 		}
@@ -332,8 +414,9 @@ func (s *hyMemSender) GetCongestionWindow() congestion.ByteCount {
 }
 
 // grow takes budget towards the controller's window cwnd, by hySendStep at
-// least, a quarter of the limit for a big one.
-func (s *hyMemSender) grow(cwnd int64) {
+// least, a quarter of the limit for a big one. Short, the sender asks no
+// more for hyMemShortFor.
+func (s *hyMemSender) grow(cwnd int64, now monotime.Time) {
 	limit := s.limit.Load()
 	if cwnd <= limit {
 		return
@@ -347,25 +430,35 @@ func (s *hyMemSender) grow(cwnd int64) {
 		s.limit.Add(got)
 	}
 	m.mu.Unlock()
+	if got < want {
+		s.shortUntil.Store(int64(now.Add(hyMemShortFor)))
+	}
 	m.after(idle, warn)
 }
 
-// giveBack returns what the connection took for its flight if it sent
-// nothing for hyMemIdle: its flight is then back to the floor, and it takes
-// again when it sends again.
+// giveBack returns what the connection took for its flight past what it
+// needs, when another is short: past its window and its flight, and once
+// it sent nothing that asks for an ACK for hyMemIdle, past its flight. A
+// flight that its client does not acknowledge is memory held: it stays
+// counted however long the sender has been blocked.
 func (s *hyMemSender) giveBack(now monotime.Time) {
+	keep := max(hySendFloor, s.inFlight.Load())
 	if now.Sub(monotime.Time(s.lastSent.Load())) < hyMemIdle {
-		return
+		keep = max(keep, s.cwnd.Load())
 	}
 	m := s.m
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if s.c.ended || s.c.send == 0 {
+	if s.c.ended {
 		return
 	}
-	m.releaseLocked(s.c.user, s.c.send)
-	s.c.send = 0
-	s.limit.Store(hySendFloor)
+	n := min(s.limit.Load()-keep, s.c.send)
+	if n <= 0 {
+		return
+	}
+	m.releaseLocked(s.c.user, n)
+	s.c.send -= n
+	s.limit.Add(-n)
 }
 
 // hysteriaWindows are the backend's receive windows: quic-go's to start

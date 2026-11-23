@@ -99,7 +99,7 @@ const (
 	refusedDest    = "dest"    // new UDP destinations
 	refusedLive    = "live"    // UDP pairs
 	refusedLookup  = "lookup"  // name lookups
-	refusedConns   = "conns"   // QUIC connections: the quietest gave way (v0.19.3)
+	refusedConns   = "conns"   // QUIC connections: one gave way, or the new one was refused (v0.19.3)
 	refusedPending = "pending" // streams waiting for their request (v0.19.3)
 )
 

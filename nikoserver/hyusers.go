@@ -77,10 +77,16 @@ type hy2Conn struct {
 
 // hy2ConnsPerUser bounds a user's QUIC connections at once in a backend,
 // by base name, all its credentials and devices together (hyLimitNumbers
-// conns): past it the one heard from longest ago gives way. Each
-// connection holds windows of its own (hymem.go), and before v0.19.3 one
-// user could open as many as the front let through.
+// conns). Each connection holds windows of its own (hymem.go), and before
+// v0.19.3 one user could open as many as the front let through.
 const hy2ConnsPerUser = 16
+
+// hy2UnheardAfter is how long a connection of another credential of the
+// user must have been unheard to give way to a new one: a live client is
+// heard at least each keepalive (its own 25 s, or its answer to the
+// server's PING at hysteriaKeepAlive), and the watch counts each
+// usersLookEvery; past both and a margin it is gone (a var for the tests).
+var hy2UnheardAfter = hysteriaKeepAlive + 7*time.Second
 
 type hy2Users struct {
 	mu     sync.Mutex
@@ -220,11 +226,15 @@ func (u *hy2Users) trafficOf(name string) *hy2Traffic {
 
 // admit lets an authenticated connection in unless its user was revoked
 // meanwhile; leave takes it out when it ends. With the per-user limits on
-// (hyLimits), at the user's limit of connections the one heard from
-// longest ago, the oldest of those, gives way: it is closed, and counted
-// (conns). A client whose phone changed networks leaves its old
-// connection behind until the idle timeout: that one goes first. A user
-// over the limit with every connection alive loses its quietest.
+// (hyLimits), at the user's limit of connections one gives way, closed: of
+// the newcomer's own credential (a device that reconnects, its phone on
+// another network, leaves its old connection behind until the idle
+// timeout), the one heard from longest ago; else one of the user's others
+// unheard for hy2UnheardAfter, the longest so; else none, and the
+// newcomer is refused. Either is counted (conns). So one credential of a
+// user (a leaked link) cannot take the places of the others' live
+// connections, nor a user with more live ones than the limit make them
+// take each other's.
 func (u *hy2Users) admit(user *hy2User, c *hy2Conn) bool {
 	u.mu.Lock()
 	if user == nil || user.revoked {
@@ -238,14 +248,27 @@ func (u *hy2Users) admit(user *hy2User, c *hy2Conn) bool {
 	}
 	var gone *hy2Conn
 	if l := u.limits; l != nil && l.limited(c.base) && len(u.byBase[c.base]) >= max(1, l.n.conns) {
-		for x := range u.byBase[c.base] {
-			x.look(now)
-			if gone == nil || x.heard.Before(gone.heard) || x.heard.Equal(gone.heard) && x.at.Before(gone.at) {
+		quieter := func(x, y *hy2Conn) bool {
+			return y == nil || x.heard.Before(y.heard) || x.heard.Equal(y.heard) && x.at.Before(y.at)
+		}
+		for x := range u.conns[user] {
+			if x.look(now); quieter(x, gone) {
 				gone = x
 			}
 		}
-		u.dropLocked(u.byBase[c.base][gone], gone)
+		if gone == nil {
+			for x := range u.byBase[c.base] {
+				if x.look(now); now.Sub(x.heard) >= hy2UnheardAfter && quieter(x, gone) {
+					gone = x
+				}
+			}
+		}
 		l.refuse(c.base, refusedConns)
+		if gone == nil {
+			u.mu.Unlock()
+			return false
+		}
+		u.dropLocked(u.byBase[c.base][gone], gone)
 	}
 	if u.conns == nil {
 		u.conns = map[*hy2User]map[*hy2Conn]bool{}

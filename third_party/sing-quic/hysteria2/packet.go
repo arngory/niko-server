@@ -138,12 +138,14 @@ type udpPacketConn struct {
 // fragments of up to 65536 packets for 10 s, none ever completed: a user's
 // 256 sessions held what the client sent of them, unbounded. Now a session
 // queues udpQueueBytes, keeps the fragments of udpDefragPackets packets
-// (Hysteria's own keeps one), and a packet of more than udpMaxFragments
-// fragments (65535 bytes in fragments of 1024) is dropped.
+// (Hysteria's own keeps one), and a packet whose fragments carry more than
+// udpMaxPacketBytes, more than a UDP payload can be, is dropped; their
+// number is the client's (up to 255), which a long destination's header or
+// a smaller MTU raises.
 const (
-	udpQueueBytes    = 128 << 10
-	udpDefragPackets = 2
-	udpMaxFragments  = 64
+	udpQueueBytes     = 128 << 10
+	udpDefragPackets  = 2
+	udpMaxPacketBytes = 65535
 )
 
 // took counts a message out of the queue.
@@ -385,13 +387,14 @@ type packetItem struct {
 	access   sync.Mutex
 	messages []*udpMessage
 	count    uint8
+	bytes    int // of the fragments kept (neko)
 }
 
 func (d *udpDefragger) feed(m *udpMessage) *udpMessage {
 	if m.fragmentTotal <= 1 {
 		return m
 	}
-	if m.fragmentID >= m.fragmentTotal || m.fragmentTotal > udpMaxFragments { // neko: udpMaxFragments
+	if m.fragmentID >= m.fragmentTotal {
 		m.releaseMessage()
 		return nil
 	}
@@ -403,10 +406,17 @@ func (d *udpDefragger) feed(m *udpMessage) *udpMessage {
 		item.messages = make([]*udpMessage, m.fragmentTotal)
 		item.count = 1
 		item.messages[m.fragmentID] = m
+		item.bytes = m.data.Len()
 		return nil
 	}
 	if item.messages[m.fragmentID] != nil {
 		m.releaseMessage()
+		return nil
+	}
+	if item.bytes += m.data.Len(); item.bytes > udpMaxPacketBytes { // neko
+		m.releaseMessage()
+		releaseMessages(item.messages)
+		item.messages, item.count, item.bytes = nil, 0, 0
 		return nil
 	}
 	item.messages[m.fragmentID] = m

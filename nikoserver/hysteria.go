@@ -405,8 +405,12 @@ func (g sagernetCIDs) GenerateConnectionID() (squic.ConnectionID, error) {
 
 func (sagernetCIDs) ConnectionIDLen() int { return cidLen }
 
+// usersLookEvery is how often watchUsers looks (a var for the tests).
+var usersLookEvery = 5 * time.Second
+
 // watchUsers reloads the users file on SIGHUP and when it changes; check
-// runs at each look, every 5 s and on SIGHUP, whether it changed or not.
+// runs at each look, every usersLookEvery and on SIGHUP, whether it changed
+// or not.
 func watchUsers(ctx context.Context, path string, reload func() error, check func(), log *Logger) {
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
@@ -415,7 +419,7 @@ func watchUsers(ctx context.Context, path string, reload func() error, check fun
 	if st, err := os.Stat(path); err == nil {
 		last = st.ModTime()
 	}
-	tick := time.NewTicker(5 * time.Second)
+	tick := time.NewTicker(usersLookEvery)
 	defer tick.Stop()
 	for {
 		select {
