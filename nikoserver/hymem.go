@@ -52,12 +52,15 @@ import (
 // So the windows and the flight of all connections are at most the budget
 // plus their floors: per user, hy2ConnsPerUser × (hySendFloor +
 // hyConnWindow), some 28 MiB, outside the budget; the unauthenticated,
-// hyConnWindow a connection, as many as the front lets through. quic-go holds a STREAM frame of 128 bytes or more in a
-// packet buffer of its own (1452 bytes), so the heap under a full receive
-// window is up to 11 times the window for a client that sends 128-byte
-// frames, about the window for one that fills its packets: the budget
-// bounds the windows, not that ratio. The unauthenticated count as one
-// user, "".
+// hyConnWindow a connection, as many as the front lets through. quic-go
+// holds a STREAM frame of 128 bytes or more in a packet buffer of its own
+// (1452 bytes), so the heap under a full receive window is up to 11 times
+// the window for a client that sends 128-byte frames, about the window for
+// one that fills its packets: the budget bounds the windows, not that
+// ratio. The unauthenticated count as one user, "". Half a share for the
+// windows stops a connection's at 1.5 MiB on the least budget (32 MiB: a
+// process allowed 256 MiB or less), its upload at that over the round trip
+// (some 27 MiB/s at 40 ms, measured), and at 6 MiB on a node of 1 GiB.
 const (
 	hyStreamWindow = 512 << 10 // quic-go's InitialStreamReceiveWindow
 	hyConnWindow   = 768 << 10 // and InitialConnectionReceiveWindow
@@ -66,7 +69,8 @@ const (
 	hyMemShares    = 8         // as 8 users fill the budget
 	hyMemIdle      = time.Second
 	hyMemSweepGap  = 100 * time.Millisecond
-	hyMemShortFor  = 20 * time.Millisecond // a sender short of the budget waits this before it asks again
+	// hyMemShortFor: a sender short of the budget asks again this later.
+	hyMemShortFor = 20 * time.Millisecond
 )
 
 // hyMemBudget is the default budget: an eighth of the memory the process
@@ -94,8 +98,8 @@ type hyMem struct {
 	reclaimed   time.Time
 	reclaimedBy map[string]time.Time
 	// recvAll and recvBy are what the receive windows took, of all and of
-	// each user: within half the budget and half a share, the rest of each
-	// is the flights' (hyMemRecvShare). A window gives nothing back while its
+	// each user: within half the budget and half a share (growRecv), the
+	// rest of each is the flights'. A window gives nothing back while its
 	// connection lives.
 	recvAll int64
 	recvBy  map[string]int64

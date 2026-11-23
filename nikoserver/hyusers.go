@@ -226,15 +226,26 @@ func (u *hy2Users) trafficOf(name string) *hy2Traffic {
 
 // admit lets an authenticated connection in unless its user was revoked
 // meanwhile; leave takes it out when it ends. With the per-user limits on
-// (hyLimits), at the user's limit of connections one gives way, closed: of
-// the newcomer's own credential (a device that reconnects, its phone on
-// another network, leaves its old connection behind until the idle
-// timeout), the one heard from longest ago; else one of the user's others
-// unheard for hy2UnheardAfter, the longest so; else none, and the
-// newcomer is refused. Either is counted (conns). So one credential of a
-// user (a leaked link) cannot take the places of the others' live
-// connections, nor a user with more live ones than the limit make them
-// take each other's.
+// (hyLimits), at the user's limit of connections one gives way, closed,
+// the one heard from longest ago among:
+//  1. the newcomer's own credential's (a device that reconnects, its phone
+//     on another network, leaves its old connection behind until the idle
+//     timeout);
+//  2. else the user's unheard for hy2UnheardAfter (gone);
+//  3. else those of the credential that holds the most, if that is more
+//     than its fair share: the limit over the credentials with
+//     connections, the newcomer's counted, one at least. Each credential
+//     is a device (raycontrol names one for each), so a leaked one with
+//     the limit's worth of live connections loses places to the owner's
+//     other devices, down to an equal share, and takes nothing from them;
+//  4. else none, and the newcomer is refused: every credential is at its
+//     fair share or under, all heard. Its client has the auth's answer
+//     (233) by then and sees the connection closed as a revoked user's
+//     is, with no error code; Hysteria clients dial again.
+//
+// Each is counted (conns). So more live connections than the limit do not
+// take each other's places in turn either: a newcomer of a credential at
+// its share replaces its own.
 func (u *hy2Users) admit(user *hy2User, c *hy2Conn) bool {
 	u.mu.Lock()
 	if user == nil || user.revoked {
@@ -260,6 +271,26 @@ func (u *hy2Users) admit(user *hy2User, c *hy2Conn) bool {
 			for x := range u.byBase[c.base] {
 				if x.look(now); now.Sub(x.heard) >= hy2UnheardAfter && quieter(x, gone) {
 					gone = x
+				}
+			}
+		}
+		if gone == nil {
+			held := map[*hy2User]int{}
+			for _, y := range u.byBase[c.base] {
+				held[y]++
+			}
+			var most *hy2User
+			for y, n := range held {
+				if most == nil || n > held[most] {
+					most = y
+				}
+			}
+			fair := max(1, max(1, l.n.conns)/(len(held)+1)) // the newcomer's holds none
+			if most != nil && held[most] > fair {
+				for x := range u.conns[most] {
+					if quieter(x, gone) {
+						gone = x
+					}
 				}
 			}
 		}

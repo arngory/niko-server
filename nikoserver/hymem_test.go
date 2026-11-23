@@ -431,44 +431,45 @@ func download(t *testing.T, r *rawHy2, mem *hyMem, from string, d time.Duration)
 // gets no more in flight than the floor and its share of the budget: its
 // download goes at that over its round trip, where before Brutal's window
 // (rate × RTT × 2) kept tens of MiB of the server's memory in flight. With
-// a budget that has room the same client goes much faster.
+// a budget that has room the same client's flight takes more than the
+// small budget's whole share: the budget is what held it.
 func TestHysteriaFlightWithinBudget(t *testing.T) {
 	const delay = 150 * time.Millisecond
-	var got [2]int64
-	t.Run("budgets", func(t *testing.T) {
-		for i, budget := range []int64{4 << 20, 1 << 30} {
-			t.Run(strconv.Itoa(int(budget>>20)), func(t *testing.T) {
-				t.Parallel()
-				ctx, cancel := context.WithCancel(context.Background())
-				defer cancel()
-				mem := newHyMem(budget, nil)
-				node := hy2MasqNode(t, ctx, nil, mem, "u1", "password-one")
-				from, _ := sinkTarget(t, true)
-				r, err := dialRawHy2(t, ctx, node.server, []tls.CurveID{tls.X25519MLKEM768}, delay)
-				if err != nil {
-					t.Fatal(err)
+	const small = int64(4 << 20)
+	for _, budget := range []int64{small, 1 << 30} {
+		t.Run(strconv.Itoa(int(budget>>20)), func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			mem := newHyMem(budget, nil)
+			node := hy2MasqNode(t, ctx, nil, mem, "u1", "password-one")
+			from, _ := sinkTarget(t, true)
+			r, err := dialRawHy2(t, ctx, node.server, []tls.CurveID{tls.X25519MLKEM768}, delay)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if st := r.auth(t, "password-one", 50e6); st != 233 {
+				t.Fatalf("auth %d", st)
+			}
+			n, held, took := download(t, r, mem, from, time.Second)
+			t.Logf("budget %d MiB: %d MiB in 1 s, the user took %d KiB at most", budget>>20, n>>20, took>>10)
+			share := budget / hyMemShares
+			if held > share+64<<10 || took > share {
+				t.Errorf("the user held %d past the floors and took %d, its share %d", held, took, share)
+			}
+			if budget == small {
+				// At most floor + share in flight a round trip: (1 + 0.5)
+				// MiB / 0.15 s, 10 MiB in 1 s; half again for the first
+				// round trips.
+				if limit := (hySendFloor + share) * 10 * 3 / 2; n > limit {
+					t.Errorf("%d MiB in 1 s, past %d MiB", n>>20, limit>>20)
 				}
-				if st := r.auth(t, "password-one", 50e6); st != 233 {
-					t.Fatalf("auth %d", st)
-				}
-				n, held, took := download(t, r, mem, from, time.Second)
-				got[i] = n
-				t.Logf("budget %d MiB: %d MiB in 1 s, the user took %d KiB at most", budget>>20, n>>20, took>>10)
-				if share := budget / hyMemShares; held > share+64<<10 || took > share {
-					t.Errorf("the user held %d past the floors and took %d, its share %d", held, took, share)
-				}
-				r.conn.CloseWithError(0, "")
-				waitReleased(t, mem)
-			})
-		}
-	})
-	// At most floor + share in flight a round trip: (1 + 0.5) MiB / 0.15 s,
-	// 10 MiB in 1 s; half again for the first round trips.
-	if limit := int64(hySendFloor+(4<<20)/hyMemShares) * 10 * 3 / 2; got[0] > limit {
-		t.Errorf("small budget: %d MiB in 1 s, past %d MiB", got[0]>>20, limit>>20)
-	}
-	if got[1] < 2*got[0] {
-		t.Errorf("large budget: %d MiB, small: %d MiB: the budget was not what held it", got[1]>>20, got[0]>>20)
+			} else if took <= small/hyMemShares {
+				t.Errorf("with room the flight took %d only, not past the small budget's share %d", took, small/hyMemShares)
+			}
+			r.conn.CloseWithError(0, "")
+			waitReleased(t, mem)
+		})
 	}
 }
 
@@ -529,18 +530,21 @@ func TestHysteriaFlightUnackedStaysCounted(t *testing.T) {
 }
 
 // A user's connections at once in a backend are bounded, all its
-// credentials together. A newcomer replaces the quietest connection of its
-// own credential first (a device that reconnected); else one of the user's
-// others unheard for hy2UnheardAfter; else it is refused. Each is counted
-// (conns), and other users' connections go on.
+// credentials (its devices) together. A newcomer replaces the quietest
+// connection of its own credential first (a device that reconnected); else
+// one of the user's unheard for hy2UnheardAfter; else the quietest of the
+// credential holding the most, while that is more than its fair share (a
+// leaked link with the limit's worth of live connections makes room for
+// the owner's devices); else, every credential at its share, the newcomer
+// is refused. Each is counted (conns), and other users' go on.
 func TestHysteriaConnsPerUser(t *testing.T) {
 	setVar(t, &usersLookEvery, 100*time.Millisecond)
 	setVar(t, &hy2UnheardAfter, time.Second)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	lim := newHyLimits()
-	lim.n.conns = 2
-	node := hy2MasqNode(t, ctx, lim, nil, "u1", "pw-1", "u1-ab12", "pw-2", "u1-cd34", "pw-3", "u2", "pw-u2")
+	lim.n.conns = 3
+	node := hy2MasqNode(t, ctx, lim, nil, "u1", "pw-1", "u1-ab12", "pw-2", "u1-cd34", "pw-3", "u1-ef56", "pw-4", "u2", "pw-u2")
 	to, _ := sinkTarget(t, false)
 	dial := func(password string) (*rawHy2, bool) {
 		t.Helper()
@@ -577,34 +581,68 @@ func TestHysteriaConnsPerUser(t *testing.T) {
 			return false
 		}
 	}
+	// live is how many of rs are not closed, once as many as want are
+	// (the close of one that gave way comes a round trip or so later), or
+	// after 3 s.
+	live := func(want int, rs ...*rawHy2) (n int) {
+		for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+			n = 0
+			for _, r := range rs {
+				if !closed(r, 0) {
+					n++
+				}
+			}
+			if n <= want || time.Now().After(deadline) {
+				return n
+			}
+		}
+	}
 	conns := func() int64 { return node.traffic(t).Limit["u1"]["conns"] }
 	other, _ := dial("pw-u2")
-	a, _ := dial("pw-1")
-	defer busy(a)()
-	b, _ := dial("pw-2")
-	stopB := busy(b)
-	// A newcomer of b's credential: b gives way, live as it is.
-	c, ok := dial("pw-2")
-	if !ok || !closed(b, 2*time.Second) || closed(a, 0) || closed(c, 0) {
-		t.Fatalf("a newcomer of b's credential: admitted %v, b closed %v, a %v", ok, closed(b, 0), closed(a, 0))
+	// A leaked credential holds the limit's worth, all live.
+	var leaked []*rawHy2
+	for range 3 {
+		r, ok := dial("pw-2")
+		if !ok {
+			t.Fatal("pw-2 refused under the limit")
+		}
+		defer busy(r)()
+		leaked = append(leaked, r)
 	}
-	stopB()
-	stopC := busy(c)
-	// A third credential, both of the others heard: refused.
-	if d, ok := dial("pw-3"); ok && !closed(d, 2*time.Second) {
-		t.Fatal("a newcomer admitted while all the user's connections are heard")
+	time.Sleep(3 * usersLookEvery)
+	// The owner's device: pw-2 holds 3, past a fair share of 3/2.
+	owner, ok := dial("pw-1")
+	if n := live(2, leaked...); !ok || n != 2 || closed(owner, 0) {
+		t.Fatalf("the owner's device: admitted %v, closed %v, the leaked credential keeps %d", ok, closed(owner, 0), n)
 	}
-	if closed(a, 0) || closed(c, 0) || conns() != 2 {
-		t.Fatalf("after a refusal: a closed %v, c closed %v, conns %d", closed(a, 0), closed(c, 0), conns())
+	defer busy(owner)()
+	// Another device: pw-2 holds 2, past 3/3.
+	third, ok := dial("pw-3")
+	if n := live(1, leaked...); !ok || n != 1 || closed(third, 0) || closed(owner, 0) {
+		t.Fatalf("a third device: admitted %v, the leaked credential keeps %d", ok, n)
 	}
-	// c falls silent: once unheard for hy2UnheardAfter it gives way.
-	stopC()
+	stopThird := busy(third)
+	// The leaked credential again: it replaces its own.
+	again, ok := dial("pw-2")
+	if n := live(0, leaked...); !ok || n != 0 || closed(again, 0) || closed(owner, 0) || closed(third, 0) {
+		t.Fatalf("the leaked credential again: admitted %v, its old ones %d, owner closed %v", ok, n, closed(owner, 0))
+	}
+	defer busy(again)()
+	// A fourth credential, every one at its share and heard: refused.
+	if d, ok := dial("pw-4"); ok && !closed(d, 2*time.Second) {
+		t.Fatal("a newcomer admitted while every credential is at its share and heard")
+	}
+	if n := live(3, owner, third, again); n != 3 || conns() != 4 {
+		t.Fatalf("after a refusal: %d of 3 live, conns %d", n, conns())
+	}
+	// The third falls silent: once unheard for hy2UnheardAfter it gives way.
+	stopThird()
 	time.Sleep(hy2UnheardAfter + 3*usersLookEvery)
-	e, ok := dial("pw-3")
-	if !ok || !closed(c, 2*time.Second) || closed(a, 0) || closed(e, 0) {
-		t.Fatalf("after c's silence: admitted %v, c closed %v, a closed %v", ok, closed(c, 0), closed(a, 0))
+	e, ok := dial("pw-4")
+	if !ok || !closed(third, 2*time.Second) || closed(owner, 0) || closed(again, 0) || closed(e, 0) {
+		t.Fatalf("after the third's silence: admitted %v, the third closed %v", ok, closed(third, 0))
 	}
-	if closed(other, 0) || conns() != 3 {
+	if closed(other, 0) || conns() != 5 {
 		t.Fatalf("u2's closed %v, conns %d", closed(other, 0), conns())
 	}
 }
@@ -846,5 +884,34 @@ func TestHysteriaStreamsWithoutAFrame(t *testing.T) {
 		if st := r.auth(t, "password-one", 0); st != 233 {
 			t.Errorf("authenticated %v: a request after them: %d", authed, st)
 		}
+	}
+}
+
+// Auth requests of one connection at once make it its user's once: the
+// others are answered as authenticated already. Before, each that read the
+// state before the first wrote it went on, and the connection was admitted
+// as many times: with a limit of one connection it took its own place and
+// was closed.
+func TestHysteriaAuthOnce(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	lim := newHyLimits()
+	lim.n.conns = 1
+	node := hy2MasqNode(t, ctx, lim, nil, "u1", "password-one")
+	for range 10 {
+		r, err := dialRawHy2(t, ctx, node.server, []tls.CurveID{tls.X25519MLKEM768}, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		for range 20 {
+			wg.Go(func() { _, _ = r.tryAuth("password-one", 0) })
+		}
+		wg.Wait()
+		if n := node.traffic(t).Limit["u1"]["conns"]; n != 0 {
+			t.Fatalf("a connection authenticated at once 20 times: %d gave way", n)
+		}
+		r.conn.CloseWithError(0, "")
+		time.Sleep(20 * time.Millisecond) // its leave, before the next
 	}
 }

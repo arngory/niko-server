@@ -436,13 +436,16 @@ type serverSession[U comparable] struct {
 
 func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost && r.Host == protocol.URLHost && r.URL.Path == protocol.URLPath {
-		if _, ok := s.user(); ok {
+		authenticated := func() {
 			protocol.AuthResponseToHeader(w.Header(), protocol.AuthResponse{
 				UDPEnabled: !s.udpDisabled,
 				Rx:         s.receiveBPS,
 				RxAuto:     s.receiveBPS == 0 && s.ignoreClientBandwidth,
 			})
 			w.WriteHeader(protocol.StatusAuthOK)
+		}
+		if _, ok := s.user(); ok {
+			authenticated()
 			return
 		}
 		request := protocol.AuthRequestFromHeader(r.Header)
@@ -456,7 +459,14 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			s.masqueradeHandler.ServeHTTP(w, r)
 			return
 		}
-		s.auth.Store(&user)
+		// One auth request of a connection's makes it its user's (neko): of
+		// two at once, the second is answered as authenticated already, and
+		// the connection's controller, hook and datagram loop are set once.
+		// Before, both went on, and the hook admitted the connection twice.
+		if !s.auth.CompareAndSwap(nil, &user) {
+			authenticated()
+			return
+		}
 		var rxAuto bool
 		var brutal *hyCC.BrutalSender
 		if s.receiveBPS > 0 && s.ignoreClientBandwidth && request.Rx == 0 {

@@ -53,6 +53,20 @@ type udpMessage struct {
 	destination   string
 	data          *buf.Buffer
 	referenced    bool
+	held          int // neko: the received datagram's bytes this message keeps (decodeUDPMessage)
+}
+
+// footprint is what a client's message keeps of the server's memory
+// (neko): the datagram it was decoded from, whose payload it slices, or
+// its own buffer, its destination, and the message itself; the bounds of a
+// session count it, not the payload alone, which a datagram of a long
+// destination and no data makes nothing.
+func (m *udpMessage) footprint() int {
+	n := m.held
+	if n == 0 && m.data != nil {
+		n = m.data.RawCap()
+	}
+	return n + len(m.destination) + udpMessageOverhead
 }
 
 func (m *udpMessage) release() {
@@ -138,18 +152,22 @@ type udpPacketConn struct {
 // fragments of up to 65536 packets for 10 s, none ever completed: a user's
 // 256 sessions held what the client sent of them, unbounded. Now a session
 // queues udpQueueBytes, keeps the fragments of udpDefragPackets packets
-// (Hysteria's own keeps one), and a packet whose fragments carry more than
-// udpMaxPacketBytes, more than a UDP payload can be, is dropped; their
-// number is the client's (up to 255), which a long destination's header or
-// a smaller MTU raises.
+// (Hysteria's own keeps one), and a packet whose fragments keep more than
+// udpMaxPacketBytes is dropped; their number is the client's (up to 255),
+// which a long destination's header or a smaller MTU raises. Each counts
+// at its footprint, the datagram and the destination it keeps; and a
+// destination longer than udpMaxDestination is no message (an IPv6
+// literal's zone could be a kilobyte).
 const (
-	udpQueueBytes     = 128 << 10
-	udpDefragPackets  = 2
-	udpMaxPacketBytes = 65535
+	udpQueueBytes      = 128 << 10
+	udpDefragPackets   = 2
+	udpMaxPacketBytes  = 96 << 10 // 65535 of payload and the fragments' own: 78 of 300 bytes of destination
+	udpMaxDestination  = 300      // a name of 255 and a port; an IPv6 address with a zone (Linux: 15)
+	udpMessageOverhead = 96       // the message, its buffer's header, the strings' headers
 )
 
 // took counts a message out of the queue.
-func (c *udpPacketConn) took(p *udpMessage) { c.queued.Add(-int64(p.data.Len())) }
+func (c *udpPacketConn) took(p *udpMessage) { c.queued.Add(-int64(p.footprint())) }
 
 func newUDPPacketConn(ctx context.Context, quicConn *quic.Conn, onDestroy func()) *udpPacketConn {
 	ctx, cancel := context.WithCancelCause(ctx)
@@ -291,7 +309,7 @@ func (c *udpPacketConn) inputPacket(message *udpMessage) {
 		}
 	}
 	// Within udpQueueBytes (neko); a full queue or past them, dropped.
-	n := int64(message.data.Len())
+	n := int64(message.footprint())
 	if c.queued.Add(n) > udpQueueBytes {
 		c.queued.Add(-n)
 		message.releaseMessage()
@@ -406,14 +424,14 @@ func (d *udpDefragger) feed(m *udpMessage) *udpMessage {
 		item.messages = make([]*udpMessage, m.fragmentTotal)
 		item.count = 1
 		item.messages[m.fragmentID] = m
-		item.bytes = m.data.Len()
+		item.bytes = m.footprint()
 		return nil
 	}
 	if item.messages[m.fragmentID] != nil {
 		m.releaseMessage()
 		return nil
 	}
-	if item.bytes += m.data.Len(); item.bytes > udpMaxPacketBytes { // neko
+	if item.bytes += m.footprint(); item.bytes > udpMaxPacketBytes { // neko
 		m.releaseMessage()
 		releaseMessages(item.messages)
 		item.messages, item.count, item.bytes = nil, 0, 0
@@ -479,6 +497,10 @@ func decodeUDPMessage(message *udpMessage, data []byte) error {
 	if len(message.destination) > 255 && len(M.ParseSocksaddr(message.destination).Fqdn) > 255 {
 		return E.New("fqdn too long")
 	}
+	if len(message.destination) > udpMaxDestination { // neko
+		return E.New("destination too long")
+	}
 	message.data = buf.As(data[len(data)-reader.Len():])
+	message.held = cap(data)
 	return nil
 }
