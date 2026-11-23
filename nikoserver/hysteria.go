@@ -128,21 +128,56 @@ func hysteriaQUICOptions(salamander bool) qtls.QUICOptions {
 // first, with its reason. With the limits off, it alone bounds a connection.
 const hy2MaxStreams = 2048
 
+// hy2PendingStreams is how many streams of a connection are read at once
+// before they are known (the service's PendingStreams, v0.19.3): until
+// their frame type, and an HTTP request until it is answered, each within
+// hy2RequestWait. A client opens a stream with its first bytes, so these
+// pass at once; one that sent a byte of a frame type and stopped held a
+// goroutine until the connection ended, up to hy2MaxStreams a connection,
+// before or after a password. The rest wait in quic-go's queue, as
+// raycontrol's naive-quic has them wait (naive.PendingStreams).
+const hy2PendingStreams = 64
+
 func runHysteria(ctx context.Context, c *BackendConfig, conn *packetConn, log *Logger, dial dialFunc) error {
 	return runHysteriaWith(ctx, c, conn, log, dial, newHyLimits())
+}
+
+// hysteriaTLS is a backend's TLS. hy2-obfs takes X25519MLKEM768 only, as
+// before. hy2-masq takes the groups the site on its address takes, Go's
+// defaults (X25519MLKEM768 first; TLS 1.3, QUIC has no other), and a
+// password only on a connection whose key exchange was X25519MLKEM768
+// (AuthCurve): any other gets the masquerade, as a wrong password does.
+// Before v0.19.3 hy2-masq refused other groups in the handshake, and a
+// probe without ML-KEM told it, and raycontrol's naive-quic and DoH3 on the
+// same address, from the site under the same certificate (protocol review
+// 2026-11-21, M3). Behind salamander no one without its key sees a
+// handshake: hy2-obfs keeps the strict one.
+func hysteriaTLS(c *BackendConfig) (option.InboundTLSOptions, tls.CurveID) {
+	o := option.InboundTLSOptions{
+		Enabled:         true,
+		ALPN:            []string{"h3"},
+		MinVersion:      "1.3",
+		CertificatePath: c.TLS.CertificateFile,
+		KeyPath:         c.TLS.KeyFile,
+	}
+	if c.Kind == "hy2-obfs" {
+		o.CurvePreferences = []option.CurvePreference{option.CurvePreference(tls.X25519MLKEM768)}
+		return o, 0
+	}
+	return o, tls.X25519MLKEM768
 }
 
 // runHysteriaWith is runHysteria with the backend's limits given (tests:
 // their numbers and clock).
 func runHysteriaWith(ctx context.Context, c *BackendConfig, conn *packetConn, log *Logger, dial dialFunc, lim *hyLimits) error {
-	tlsConfig, err := sbtls.NewServer(ctx, nopLogger(), option.InboundTLSOptions{
-		Enabled:          true,
-		ALPN:             []string{"h3"},
-		MinVersion:       "1.3",
-		CertificatePath:  c.TLS.CertificateFile,
-		KeyPath:          c.TLS.KeyFile,
-		CurvePreferences: []option.CurvePreference{option.CurvePreference(tls.X25519MLKEM768)},
-	})
+	return runHysteriaMem(ctx, c, conn, log, dial, lim, newHyMem(hyMemBudget(), log))
+}
+
+// runHysteriaMem is runHysteriaWith with the budget of the connections'
+// windows given (tests: a small one).
+func runHysteriaMem(ctx context.Context, c *BackendConfig, conn *packetConn, log *Logger, dial dialFunc, lim *hyLimits, mem *hyMem) error {
+	tlsOptions, authCurve := hysteriaTLS(c)
+	tlsConfig, err := sbtls.NewServer(ctx, nopLogger(), tlsOptions)
 	if err != nil {
 		return envError("tls: %v", err)
 	}
@@ -195,6 +230,7 @@ func runHysteriaWith(ctx context.Context, c *BackendConfig, conn *packetConn, lo
 	// smaller and leave the front at 1280 like every other QUIC on it. Path
 	// MTU discovery then counts only what came through, the salt included.
 	quicOptions := hysteriaQUICOptions(salamander != "")
+	hysteriaWindows(&quicOptions, mem)
 	// Connection IDs with the backend's label, if it has one. With them
 	// the server sends stateless resets under a key from the label's, the
 	// same in the next process, under salamander too: a client whose
@@ -227,18 +263,28 @@ func runHysteriaWith(ctx context.Context, c *BackendConfig, conn *packetConn, lo
 		// a PATH_CHALLENGE there: without that one packet of a user's own
 		// connection from a spoofed source aimed its download at anyone
 		// (the front pins a new address by the label, or by an Initial).
-		PathValidation:     true,
-		StatelessResetKey:  resetKey,
-		ObfsConnFilter:     obfsFilter,
-		ConnectionHook:     connectionHook(users, &live),
-		Context:            ctx,
-		Logger:             nopLogger(),
-		SendBPS:            uint64(c.Options.UpMbps * hysteria.MbpsToBps),
-		ReceiveBPS:         uint64(c.Options.DownMbps * hysteria.MbpsToBps),
-		SalamanderPassword: salamander,
-		TLSConfig:          tlsConfig,
-		UDPTimeout:         2 * time.Minute,
-		Handler:            &outbound{dial: dial, log: log, probe: c.Options.Probe, lim: lim},
+		PathValidation:    true,
+		StatelessResetKey: resetKey,
+		ObfsConnFilter:    obfsFilter,
+		ConnectionHook:    connectionHook(users, &live),
+		AuthCurve:         authCurve,
+		// The flight of an authenticated connection within the budget
+		// (hymem.go), and a user's streams waiting for their request
+		// within its limit (hylimits.go), each such wait at most
+		// hy2RequestWait: a Hysteria2 client sends the request with the
+		// stream's first bytes.
+		WrapCongestionControl: mem.wrapSender,
+		StreamStart:           lim.streamStart,
+		RequestWait:           hy2RequestWait,
+		PendingStreams:        hy2PendingStreams,
+		Context:               ctx,
+		Logger:                nopLogger(),
+		SendBPS:               uint64(c.Options.UpMbps * hysteria.MbpsToBps),
+		ReceiveBPS:            uint64(c.Options.DownMbps * hysteria.MbpsToBps),
+		SalamanderPassword:    salamander,
+		TLSConfig:             tlsConfig,
+		UDPTimeout:            2 * time.Minute,
+		Handler:               &outbound{dial: dial, log: log, probe: c.Options.Probe, lim: lim},
 		MasqueradeHandler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Length", "0")
 			w.WriteHeader(http.StatusNotFound)

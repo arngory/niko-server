@@ -129,7 +129,25 @@ type udpPacketConn struct {
 	onDestroy       func()
 	readWaitOptions N.ReadWaitOptions
 	readDeadline    pipe.Deadline
+	queued          atomic.Int64 // bytes in data (neko)
 }
+
+// The bounds of a session's datagrams from the client (neko). Before, a
+// session queued 64 messages whatever their size, a reassembled one up to
+// 64 KiB, while its reader waited (a lookup takes seconds), and kept the
+// fragments of up to 65536 packets for 10 s, none ever completed: a user's
+// 256 sessions held what the client sent of them, unbounded. Now a session
+// queues udpQueueBytes, keeps the fragments of udpDefragPackets packets
+// (Hysteria's own keeps one), and a packet of more than udpMaxFragments
+// fragments (65535 bytes in fragments of 1024) is dropped.
+const (
+	udpQueueBytes    = 128 << 10
+	udpDefragPackets = 2
+	udpMaxFragments  = 64
+)
+
+// took counts a message out of the queue.
+func (c *udpPacketConn) took(p *udpMessage) { c.queued.Add(-int64(p.data.Len())) }
 
 func newUDPPacketConn(ctx context.Context, quicConn *quic.Conn, onDestroy func()) *udpPacketConn {
 	ctx, cancel := context.WithCancelCause(ctx)
@@ -148,6 +166,7 @@ func newUDPPacketConn(ctx context.Context, quicConn *quic.Conn, onDestroy func()
 func (c *udpPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, err error) {
 	select {
 	case p := <-c.data:
+		c.took(p)
 		_, err = buffer.ReadOnceFrom(p.data)
 		destination = M.ParseSocksaddr(p.destination).Unwrap()
 		p.releaseMessage()
@@ -162,6 +181,7 @@ func (c *udpPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr,
 func (c *udpPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	select {
 	case pkt := <-c.data:
+		c.took(pkt)
 		n = copy(p, pkt.data.Bytes())
 		destination := M.ParseSocksaddr(pkt.destination).Unwrap()
 		if destination.IsDomain() {
@@ -263,21 +283,23 @@ func (c *udpPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 }
 
 func (c *udpPacketConn) inputPacket(message *udpMessage) {
-	if message.fragmentTotal <= 1 {
-		select {
-		case c.data <- message:
-		default:
-			message.releaseMessage()
+	if message.fragmentTotal > 1 {
+		if message = c.defragger.feed(message); message == nil {
+			return
 		}
-	} else {
-		newMessage := c.defragger.feed(message)
-		if newMessage != nil {
-			select {
-			case c.data <- newMessage:
-			default:
-				newMessage.releaseMessage()
-			}
-		}
+	}
+	// Within udpQueueBytes (neko); a full queue or past them, dropped.
+	n := int64(message.data.Len())
+	if c.queued.Add(n) > udpQueueBytes {
+		c.queued.Add(-n)
+		message.releaseMessage()
+		return
+	}
+	select {
+	case c.data <- message:
+	default:
+		c.queued.Add(-n)
+		message.releaseMessage()
 	}
 }
 
@@ -350,6 +372,7 @@ func newUDPDefragger() *udpDefragger {
 	return &udpDefragger{
 		packetMap: cache.New(
 			cache.WithAge[uint16, *packetItem](10),
+			cache.WithSize[uint16, *packetItem](udpDefragPackets), // neko
 			cache.WithUpdateAgeOnGet[uint16, *packetItem](),
 			cache.WithEvict[uint16, *packetItem](func(key uint16, value *packetItem) {
 				releaseMessages(value.messages)
@@ -368,7 +391,7 @@ func (d *udpDefragger) feed(m *udpMessage) *udpMessage {
 	if m.fragmentTotal <= 1 {
 		return m
 	}
-	if m.fragmentID >= m.fragmentTotal {
+	if m.fragmentID >= m.fragmentTotal || m.fragmentTotal > udpMaxFragments { // neko: udpMaxFragments
 		m.releaseMessage()
 		return nil
 	}

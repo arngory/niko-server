@@ -62,13 +62,32 @@ type hy2Traffic struct {
 const trafficStale = 5 * time.Minute
 
 // hy2Conn is an authenticated QUIC connection: close ends it, its streams
-// and datagram sessions with it.
-type hy2Conn struct{ close func() }
+// and datagram sessions with it. packets are those it has received (QUIC's
+// count; nil: none known), by which the watch's looks tell when the client
+// was last heard; the fields after it are hy2Users'.
+type hy2Conn struct {
+	close   func()
+	packets func() uint64
+
+	base  string    // its user's base name (baseName)
+	at    time.Time // admitted
+	heard time.Time // the last look that saw its count of packets grow
+	seen  uint64    // the count then
+}
+
+// hy2ConnsPerUser bounds a user's QUIC connections at once in a backend,
+// by base name, all its credentials and devices together (hyLimitNumbers
+// conns): past it the one heard from longest ago gives way. Each
+// connection holds windows of its own (hymem.go), and before v0.19.3 one
+// user could open as many as the front let through.
+const hy2ConnsPerUser = 16
 
 type hy2Users struct {
 	mu     sync.Mutex
 	byPass map[string]*hy2User // the service's table
 	conns  map[*hy2User]map[*hy2Conn]bool
+	// byBase are the connections of each base name, for its limit.
+	byBase map[string]map[*hy2Conn]*hy2User
 	// traffic is by name, the names gone from the users file too until
 	// prune drops them: raycontrol counts by name.
 	traffic map[string]*hy2Traffic
@@ -126,8 +145,8 @@ func (u *hy2Users) set(names, passwords []string, update func([]*hy2User, []stri
 		user.revoked = true
 		for c := range u.conns[user] {
 			doomed = append(doomed, c)
+			u.dropLocked(user, c) // deleting while ranging is allowed
 		}
-		delete(u.conns, user)
 	}
 	u.byPass = next
 	u.prune(u.clock())
@@ -139,11 +158,28 @@ func (u *hy2Users) set(names, passwords []string, update func([]*hy2User, []stri
 }
 
 // check is the watch's look every few seconds, whether the users file
-// changed or not: prune.
+// changed or not: prune, and each connection whose count of packets grew
+// since the last look was heard from now.
 func (u *hy2Users) check() {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	u.prune(u.clock())
+	now := u.clock()
+	u.prune(now)
+	for _, conns := range u.conns {
+		for c := range conns {
+			c.look(now)
+		}
+	}
+}
+
+// look notes when c was last heard from; under hy2Users.mu.
+func (c *hy2Conn) look(now time.Time) {
+	if c.packets == nil {
+		return
+	}
+	if n := c.packets(); n != c.seen {
+		c.seen, c.heard = n, now
+	}
 }
 
 // prune drops the counters of the names the users file no longer has,
@@ -183,33 +219,74 @@ func (u *hy2Users) trafficOf(name string) *hy2Traffic {
 }
 
 // admit lets an authenticated connection in unless its user was revoked
-// meanwhile; leave takes it out when it ends.
+// meanwhile; leave takes it out when it ends. With the per-user limits on
+// (hyLimits), at the user's limit of connections the one heard from
+// longest ago, the oldest of those, gives way: it is closed, and counted
+// (conns). A client whose phone changed networks leaves its old
+// connection behind until the idle timeout: that one goes first. A user
+// over the limit with every connection alive loses its quietest.
 func (u *hy2Users) admit(user *hy2User, c *hy2Conn) bool {
 	u.mu.Lock()
-	defer u.mu.Unlock()
 	if user == nil || user.revoked {
+		u.mu.Unlock()
 		return false
+	}
+	now := u.clock()
+	c.base, c.at, c.heard = baseName(user.name), now, now
+	if c.packets != nil {
+		c.seen = c.packets()
+	}
+	var gone *hy2Conn
+	if l := u.limits; l != nil && l.limited(c.base) && len(u.byBase[c.base]) >= max(1, l.n.conns) {
+		for x := range u.byBase[c.base] {
+			x.look(now)
+			if gone == nil || x.heard.Before(gone.heard) || x.heard.Equal(gone.heard) && x.at.Before(gone.at) {
+				gone = x
+			}
+		}
+		u.dropLocked(u.byBase[c.base][gone], gone)
+		l.refuse(c.base, refusedConns)
 	}
 	if u.conns == nil {
 		u.conns = map[*hy2User]map[*hy2Conn]bool{}
+		u.byBase = map[string]map[*hy2Conn]*hy2User{}
 	}
 	if u.conns[user] == nil {
 		u.conns[user] = map[*hy2Conn]bool{}
 	}
+	if u.byBase[c.base] == nil {
+		u.byBase[c.base] = map[*hy2Conn]*hy2User{}
+	}
 	u.conns[user][c] = true
+	u.byBase[c.base][c] = user
 	user.traffic.live.Add(1)
+	u.mu.Unlock()
+	if gone != nil {
+		gone.close() // QUIC's close waits for the connection's loop: not under the lock
+	}
 	return true
 }
 
-// leave takes out a connection that admit let in.
-func (u *hy2Users) leave(user *hy2User, c *hy2Conn) {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	user.traffic.live.Add(-1)
+// dropLocked takes a connection out of the tables; under u.mu. Its
+// counter of what is live goes when it ends (leave).
+func (u *hy2Users) dropLocked(user *hy2User, c *hy2Conn) {
 	delete(u.conns[user], c)
 	if len(u.conns[user]) == 0 {
 		delete(u.conns, user)
 	}
+	delete(u.byBase[c.base], c)
+	if len(u.byBase[c.base]) == 0 {
+		delete(u.byBase, c.base)
+	}
+}
+
+// leave takes out a connection that admit let in, once, whether it gave
+// way or was revoked before it ended or not.
+func (u *hy2Users) leave(user *hy2User, c *hy2Conn) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	user.traffic.live.Add(-1)
+	u.dropLocked(user, c)
 }
 
 // connectionHook is the service's ConnectionHook: a connection is admitted
@@ -218,7 +295,7 @@ func (u *hy2Users) leave(user *hy2User, c *hy2Conn) {
 func connectionHook(users *hy2Users, live *sessions) func(net.Addr, any, func() hysteria2.ConnectionStats, func(), <-chan struct{}) {
 	return func(remote net.Addr, user any, stats func() hysteria2.ConnectionStats, closeConnection func(), done <-chan struct{}) {
 		u, _ := user.(*hy2User)
-		c := &hy2Conn{close: closeConnection}
+		c := &hy2Conn{close: closeConnection, packets: func() uint64 { return stats().PacketsReceived }}
 		if !users.admit(u, c) {
 			closeConnection()
 			return
@@ -271,7 +348,8 @@ type HysteriaTraffic struct {
 	// Limit (v0.17.0, Hysteria2) are the refusals of the per-user
 	// connection limits by base name (u5 for each of u5's credentials: the
 	// limits are a user's, the bytes a credential's) and kind (tcp, rate,
-	// failed, udp, evicted, dest, live, lookup), since the process started
+	// failed, udp, evicted, dest, live, lookup; conns and pending since
+	// v0.19.3), since the process started
 	// (raycontrol conn-limit-v1 §2, §7); only names and kinds with some,
 	// and absent with none. As rayd naive answers (raycontrol v0.24.0): a
 	// field a rayd before that does not read.

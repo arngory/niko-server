@@ -46,7 +46,7 @@ func bg() context.Context { return context.Background() }
 func TestHyLimitDefaults(t *testing.T) {
 	want := hyLimitNumbers{tcp: 1024, tcpRate: 30, tcpBurst: 600, tcpWait: 500 * time.Millisecond,
 		failRate: 5, failBurst: 100, failDebt: 1024, udp: 256, quietAfter: 10 * time.Second,
-		destRate: 100, destBurst: 200, pairs: 1024, lookupRate: 20, lookupBurst: 100}
+		destRate: 100, destBurst: 200, pairs: 1024, lookupRate: 20, lookupBurst: 100, conns: 16, pending: 1024}
 	if got := newHyLimits().n; got != want {
 		t.Fatalf("defaults %+v", got)
 	}

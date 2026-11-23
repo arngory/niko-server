@@ -2,6 +2,7 @@ package hysteria2
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/sagernet/quic-go"
+	"github.com/sagernet/quic-go/congestion"
 	"github.com/sagernet/quic-go/http3"
 	"github.com/sagernet/quic-go/quicvarint"
 	qtls "github.com/sagernet/sing-quic"
@@ -84,6 +86,31 @@ type ServiceOptions struct {
 	// ObfsConnFilter (neko), if set, wraps the packet socket under the
 	// obfuscation, where the QUIC packets are plain.
 	ObfsConnFilter func(net.PacketConn) net.PacketConn
+	// AuthCurve (neko), if set, is the key exchange a connection's TLS must
+	// have taken for its password to be checked: on any other the auth
+	// request gets the masquerade, as a wrong password does. The handshake
+	// may then take groups the users' clients never offer (a site's), and
+	// what the users send stays under this one.
+	AuthCurve tls.CurveID
+	// WrapCongestionControl (neko), if set, takes an authenticated
+	// connection's congestion controller (Brutal, or BBR when the client
+	// gives no rate) with the user, and gives the one the connection gets.
+	WrapCongestionControl func(conn *quic.Conn, user any, cc congestion.CongestionControl) congestion.CongestionControl
+	// StreamStart (neko), if set, is asked for each stream of an
+	// authenticated connection before its TCP request is read: false resets
+	// the stream at once; true with done, which the service calls once the
+	// request is read (or failed), as the handler is called. RequestWait
+	// (neko), if set, bounds the wait for the request.
+	StreamStart func(user any) (done func(), ok bool)
+	RequestWait time.Duration
+	// PendingStreams (neko), if set, is how many streams of a connection,
+	// authenticated or not, are read at once before they are known: until
+	// their first frame type, and an HTTP request (the auth request, the
+	// masquerade's) until its handler returns; the next ones wait to be
+	// accepted. Each then waits RequestWait at most for its bytes, or is
+	// reset. Without it (upstream) every stream gets a goroutine at once,
+	// which waits as long as its client sends nothing.
+	PendingStreams int
 }
 
 // errClosedByHook is how a connection ends when its ConnectionHook closes it
@@ -130,6 +157,11 @@ type Service[U comparable] struct {
 	connIDGenerator       quic.ConnectionIDGenerator
 	statelessResetKey     *quic.StatelessResetKey
 	obfsConnFilter        func(net.PacketConn) net.PacketConn
+	authCurve             tls.CurveID
+	wrapCongestionControl func(conn *quic.Conn, user any, cc congestion.CongestionControl) congestion.CongestionControl
+	streamStart           func(user any) (done func(), ok bool)
+	requestWait           time.Duration
+	pendingStreams        int
 }
 
 func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
@@ -202,6 +234,11 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		connIDGenerator:       options.ConnectionIDGenerator,
 		statelessResetKey:     options.StatelessResetKey,
 		obfsConnFilter:        options.ObfsConnFilter,
+		authCurve:             options.AuthCurve,
+		wrapCongestionControl: options.WrapCongestionControl,
+		streamStart:           options.StreamStart,
+		requestWait:           options.RequestWait,
+		pendingStreams:        options.PendingStreams,
 	}
 	service.users.Store(&map[string]U{})
 	return service, nil
@@ -316,8 +353,69 @@ func (s *Service[U]) handleConnection(connection *quic.Conn) {
 		Handler:          session,
 		StreamDispatcher: session.dispatchStream,
 	}
-	_ = httpServer.ServeQUICConn(connection)
+	if s.pendingStreams > 0 {
+		_ = session.serveStreams(&httpServer)
+	} else {
+		_ = httpServer.ServeQUICConn(connection)
+	}
 	_ = connection.CloseWithError(0, "")
+}
+
+// serveStreams is http3.Server.ServeQUICConn with the streams read before
+// they are known bounded (neko, PendingStreams): pendingStreams at once,
+// each for requestWait at most. Graceful shutdown is not needed here: the
+// service closes its connections whole.
+func (s *serverSession[U]) serveStreams(srv *http3.Server) error {
+	conn := s.quicConn
+	hconn, err := srv.NewRawServerConn(conn)
+	if err != nil {
+		return err
+	}
+	go func() {
+		for {
+			str, err := conn.AcceptUniStream(conn.Context())
+			if err != nil {
+				return
+			}
+			go hconn.HandleUnidirectionalStream(str)
+		}
+	}()
+	places := make(chan struct{}, s.pendingStreams)
+	for {
+		str, err := conn.AcceptStream(conn.Context())
+		if err != nil {
+			return err
+		}
+		select {
+		case places <- struct{}{}:
+		case <-conn.Context().Done():
+			return conn.Context().Err()
+		}
+		go func() {
+			defer func() { <-places }()
+			if s.requestWait > 0 {
+				_ = str.SetReadDeadline(time.Now().Add(s.requestWait))
+			}
+			frameType, err := quicvarint.Peek(str)
+			if err != nil {
+				str.CancelRead(quic.StreamErrorCode(http3.ErrCodeRequestIncomplete))
+				str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestIncomplete))
+				return
+			}
+			handled, err := s.dispatchStream(http3.FrameType(frameType), str, nil)
+			if err != nil {
+				str.CancelRead(quic.StreamErrorCode(http3.ErrCodeRequestIncomplete))
+				str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestIncomplete))
+				return
+			}
+			if !handled {
+				// An HTTP request: its header and its handler within the
+				// same wait (the auth request has no body, the masquerade
+				// reads none).
+				hconn.HandleRequestStream(str)
+			}
+		}()
+	}
 }
 
 type serverSession[U comparable] struct {
@@ -346,6 +444,11 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		request := protocol.AuthRequestFromHeader(r.Header)
 		user, loaded := (*s.users.Load())[request.Auth]
+		if loaded && s.authCurve != 0 && s.quicConn.ConnectionState().TLS.CurveID != s.authCurve {
+			// Not the key exchange the users' traffic must have (neko):
+			// a stranger's, whatever the password.
+			loaded = false
+		}
 		if !loaded {
 			s.masqueradeHandler.ServeHTTP(w, r)
 			return
@@ -364,9 +467,9 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				rx = s.sendBPS
 			}
 			brutal = hyCC.NewBrutalSender(rx, s.quicConn.InitialPacketSize(), s.brutalDebug, s.logger)
-			s.quicConn.SetCongestionControl(brutal)
+			s.setCongestionControl(user, brutal)
 		} else {
-			s.quicConn.SetCongestionControl(congestion_meta2.NewBbrSenderWithProfile(
+			s.setCongestionControl(user, congestion_meta2.NewBbrSenderWithProfile(
 				s.quicConn.InitialPacketSize(),
 				s.bbrProfile,
 			))
@@ -405,6 +508,15 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// setCongestionControl gives the connection cc, through the caller's wrap
+// if it has one (neko).
+func (s *serverSession[U]) setCongestionControl(user U, cc congestion.CongestionControl) {
+	if s.wrapCongestionControl != nil {
+		cc = s.wrapCongestionControl(s.quicConn, user, cc)
+	}
+	s.quicConn.SetCongestionControl(cc)
+}
+
 func (s *serverSession[U]) dispatchStream(frameType http3.FrameType, stream *quic.Stream, err error) (bool, error) {
 	if !s.authenticated || err != nil {
 		return false, nil
@@ -412,13 +524,31 @@ func (s *serverSession[U]) dispatchStream(frameType http3.FrameType, stream *qui
 	if frameType != protocol.FrameTypeTCPRequest {
 		return false, nil
 	}
+	// The caller's admission of a stream before its request (neko): one
+	// refused is reset, as a stream past the connection's limit would be.
+	var started func()
+	if s.streamStart != nil {
+		done, ok := s.streamStart(s.authUser)
+		if !ok {
+			stream.CancelRead(0)
+			stream.CancelWrite(0)
+			return true, nil
+		}
+		started = done
+	}
+	if s.requestWait > 0 {
+		_ = stream.SetReadDeadline(time.Now().Add(s.requestWait))
+	}
 	_, err = quicvarint.Read(quicvarint.NewReader(stream))
 	if err != nil {
+		if started != nil {
+			started()
+		}
 		s.logger.Error(E.Cause(err, "seek frame type"))
 		return true, nil
 	}
 	go func() {
-		hErr := s.handleStream(stream)
+		hErr := s.handleStream(stream, started)
 		if hErr != nil {
 			stream.CancelRead(0)
 			stream.Close()
@@ -428,8 +558,14 @@ func (s *serverSession[U]) dispatchStream(frameType http3.FrameType, stream *qui
 	return true, nil
 }
 
-func (s *serverSession[U]) handleStream(stream *quic.Stream) error {
+func (s *serverSession[U]) handleStream(stream *quic.Stream, started func()) error {
 	destinationString, err := protocol.ReadTCPRequest(stream)
+	if started != nil {
+		started()
+	}
+	if s.requestWait > 0 {
+		_ = stream.SetReadDeadline(time.Time{})
+	}
 	if err != nil {
 		return E.New("read TCP request")
 	}
