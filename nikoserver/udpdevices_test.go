@@ -373,17 +373,22 @@ func TestUDPFrontDeviceWatch(t *testing.T) {
 // A backend of two routes is one backend routed by its label.
 func TestUDPFrontDeviceLabelsCounted(t *testing.T) {
 	dir := t.TempDir()
-	one, two := filepath.Join(dir, "one.keys"), filepath.Join(dir, "two.keys")
-	writePasswords(t, one, devicePassword(1))
-	writePasswords(t, two, devicePassword(2))
+	list, shared := filepath.Join(dir, "s.list"), filepath.Join(dir, "a.shared")
+	writePasswords(t, list, devicePassword(1))
+	writePasswords(t, shared, devicePassword(2))
 	c := &FrontUDP{Listen: []string{"127.0.0.1:0"}, CIDKeysFile: writeCIDKeys(t, dir, cidSecret, 1, 3), Routes: []UDPRoute{
 		{SNI: []string{"a.example.com"}, Backend: "a"},
-		{SalamanderPasswordsFile: one, Backend: "s"},
-		{SalamanderPasswordsFile: two, Backend: "s"},
+		{SalamanderPasswordFile: shared, Backend: "a"},
+		{SalamanderPasswordsFile: list, Backend: "s"},
 	}}
 	backends := map[string]BackendRef{
 		"a": {Socket: filepath.Join(dir, "a.sock"), Mode: "packet", UID: os.Getuid(), CIDLabel: 1},
 		"s": {Socket: filepath.Join(dir, "s.sock"), Mode: "packet", UID: os.Getuid(), CIDLabel: 3},
+	}
+	var e configErrors
+	c.validate(&e, backends)
+	if len(e) > 0 {
+		t.Fatal(e)
 	}
 	var out syncBuffer
 	if _, err := newUDPFront(c, backends, NewLogger("info", &out)); err != nil {
@@ -515,6 +520,9 @@ func TestUDPFrontDeviceReplay(t *testing.T) {
 	if link, _ := ingestDevice(f, flowKey{netip.MustParseAddrPort("192.0.2.9:1000"), local}, obfuscate(a, initialPacket(1200)), now); link != nil {
 		t.Fatal("an Initial past the key's share went")
 	}
+	if f.devStats.keyShare.Load() != 1 || f.devStats.overBudget.Load() != 0 {
+		t.Fatalf("past the key's share counted %d, over the trial budget %d", f.devStats.keyShare.Load(), f.devStats.overBudget.Load())
+	}
 	f.devices[0].list()[0].salts = 0
 	// Two generations: a copy within them stays out, past them it is new.
 	f.salts.age(now.Add(saltsFor + time.Second))
@@ -603,6 +611,34 @@ func TestUDPFrontDeviceBudget(t *testing.T) {
 	}
 }
 
+// With the source's own budget spent, a device's new port is matched by
+// the rest's budget, and its own key pins at once as it would have first:
+// a label of the source's own key is no candidate.
+func TestUDPFrontDeviceOwnBudgetSpent(t *testing.T) {
+	var passwords []string
+	for i := range 1000 {
+		passwords = append(passwords, devicePassword(i))
+	}
+	device := passwords[500]
+	f, _ := deviceFront(t, passwords...)
+	now := time.Now()
+	local := netip.MustParseAddrPort("127.0.0.1:443")
+	if link, _ := ingestDevice(f, flowKey{netip.MustParseAddrPort("192.0.2.1:1000"), local}, obfuscate(device, initialPacket(1200)), now); link == nil {
+		t.Fatal("not pinned")
+	}
+	own := f.recentSources.bucket(netip.MustParseAddr("192.0.2.1"), now)
+	own.tokens, own.last = 0, now
+	for i := range 3 {
+		moved := flowKey{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), uint16(2000+i)), local}
+		if link, _ := ingestDevice(f, moved, obfuscate(device, shortPacket(cidID(cidSecret, 3, uint64(i)), 100)), now); link == nil {
+			t.Fatalf("new port %d: not pinned with the source's own budget spent", i)
+		}
+	}
+	if rest, _ := trialsTaken(f, "192.0.2.1", now); rest != 4*501 { // the key the 501st, at the Initial and each new port
+		t.Fatalf("%v trials of the rest", rest)
+	}
+}
+
 // A device backend's answer goes only on a flow of that backend: once the
 // device's flow went and the 4-tuple is another's (pinned by a plain
 // Initial, anyone's), it would go in the clear; another backend's answer
@@ -647,9 +683,24 @@ func TestUDPFrontDeviceTableFull(t *testing.T) {
 	f.confirm(f.flows[other])
 	f.access.Unlock()
 	key := flowKey{netip.MustParseAddrPort("192.0.2.1:1000"), other.local}
-	if link, _ := ingestDevice(f, key, obfuscate(a, initialPacket(1200)), now); link != nil {
+	d := obfuscate(a, initialPacket(1200))
+	if link, _ := ingestDevice(f, key, d, now); link != nil {
 		t.Fatal("a device's datagram went with no flow")
 	}
+	// Nothing pinned, nothing taken: not its salt, its key's share or a
+	// place among the source's keys. With room, the same Initial pins.
+	if k := f.recent.get(sourceKey(key.client.Addr())); k[0] != nil || f.devices[0].list()[0].salts != 0 {
+		t.Fatal("a datagram that pinned nothing took the key's place or share")
+	}
+	f.maxFlows = 10
+	if link, _ := ingestDevice(f, key, d, now); link == nil {
+		t.Fatal("with room, the Initial refused before was taken for a copy")
+	}
+	// A flow there already: the datagram goes, nothing is pinned anew.
+	if forward, pinned := f.pinFlow(key, f.links["s"], f.flows[key].route, d, len(d), netip.Addr{}, now); !forward || pinned {
+		t.Fatalf("a flow there already: forward %v, pinned %v", forward, pinned)
+	}
+	f.maxFlows = 1
 	// A plain flow's goes as before, unpinned.
 	if !f.pinWith(key, f.links["a"], nil, initialPacket(1200), 1200, netip.Addr{}, now) {
 		t.Fatal("a plain datagram dropped")

@@ -24,6 +24,9 @@ func TestNekoServerConfigSalamanderDevices(t *testing.T) {
 		t.Fatal(errs)
 	}
 	for name, c := range map[string]struct{ content, path string }{
+		"its backend in an sni route too": {route(keys + `"backend":"hy2-obfs"},{"sni":["h.example.com"],`), "udp.routes[0].backend"},
+		"its backend in a salamander_password_file route too": {
+			route(keys + `"backend":"hy2-obfs"},{"salamander_password_file":"/r/front/o.salamander",`), "udp.routes[0].backend"},
 		"the file and sni":   {route(keys + `"sni":["h.example.com"],`), "udp.routes[0]"},
 		"both files":         {route(keys + `"salamander_password_file":"/r/front/o.salamander",`), "udp.routes[0]"},
 		"neither":            {route(""), "udp.routes[0]"},
@@ -34,6 +37,11 @@ func TestNekoServerConfigSalamanderDevices(t *testing.T) {
 		if len(errs) != 1 || errs[0].Path != c.path {
 			t.Errorf("%s: %v, want one error at %q", name, errs, c.path)
 		}
+	}
+	// Two device routes of one backend: each says so.
+	errs := checkConfig(t, route(keys+`"backend":"hy2-obfs"},{"salamander_passwords_file":"/r/front/other.keys",`))
+	if len(errs) != 2 || errs[0].Path != "udp.routes[0].backend" || errs[1].Path != "udp.routes[1].backend" {
+		t.Errorf("two device routes of one backend: %v", errs)
 	}
 
 	backend := `{"schema":1,"role":"backend","kind":"KIND","socket":"/run/niko/hy2-obfs/packet.sock","front_uid":9100,

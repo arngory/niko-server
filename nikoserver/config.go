@@ -1026,8 +1026,19 @@ func (u *FrontUDP) validate(e *configErrors, backends map[string]BackendRef) {
 		checkSocket(e, "udp.cid_keys_file", u.CIDKeysFile)
 	}
 	names := map[string]bool{}
+	// A backend of a device route has that route alone: the front takes
+	// salamander off its flows and puts it on its answers, and drops an
+	// answer of it with no flow of a device. A flow pinned by another
+	// route to the same backend would have its answers go in the clear.
+	routesOf := map[string]int{}
+	for _, r := range u.Routes {
+		routesOf[r.Backend]++
+	}
 	for i, r := range u.Routes {
 		path := fmt.Sprintf("udp.routes[%d]", i)
+		if r.SalamanderPasswordsFile != "" && routesOf[r.Backend] > 1 {
+			e.add(path+".backend", "backend %q has other routes: a salamander_passwords_file route's backend has it alone", r.Backend)
+		}
 		given := 0
 		for _, set := range []bool{len(r.SNI) > 0, r.SalamanderPasswordFile != "", r.SalamanderPasswordsFile != ""} {
 			if set {

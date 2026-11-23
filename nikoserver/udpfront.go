@@ -566,7 +566,7 @@ func (f *udpFront) run(ctx context.Context) error {
 	for _, r := range f.devices {
 		go f.watchDevices(ctx, r, f.devicesEvery)
 	}
-	var said [5]uint64
+	var said [6]uint64
 	report := time.NewTicker(time.Hour)
 	defer report.Stop()
 	errCh := make(chan error, len(f.sockets))
@@ -675,10 +675,11 @@ func (f *udpFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 		if route != nil {
 			sent += salamanderSalt // what came, its salt with it
 		}
-		if !f.pinWith(key, link, route, datagram, sent, dst, now) {
+		forward, pinned := f.pinFlow(key, link, route, datagram, sent, dst, now)
+		if !forward {
 			continue
 		}
-		if route != nil {
+		if pinned && route != nil {
 			f.log.Debugf("udp: a flow to %s pinned by a device's key", link.name)
 		}
 		for _, p := range packets {
@@ -1100,24 +1101,45 @@ func (f *udpFront) pin(key flowKey, link *backendLink, d []byte, sent int, dst n
 }
 
 // pinWith is pin with the flow's route if it is known (a device's key),
-// nil: a salamander route's that d opens under, or plain. false: the key
-// left its list meanwhile, nothing is pinned and nothing goes.
+// nil: a salamander route's that d opens under, or plain. false: nothing
+// is pinned and nothing goes (pinFlow).
 func (f *udpFront) pinWith(key flowKey, link *backendLink, route *flowRoute, d []byte, sent int, dst netip.Addr, now time.Time) bool {
+	forward, _ := f.pinFlow(key, link, route, d, sent, dst, now)
+	return forward
+}
+
+// pinFlow is pinWith; forward: d goes; pinned: a flow is pinned now. A
+// device's datagram goes only on a flow of its own, pinned here: not
+// when its key left the list meanwhile, nor with the table full (its
+// answers need the flow's key), nor an Initial whose salt came before or
+// past its key's share (§7). Only a flow pinned takes the salt, the
+// key's share and a place among the source's keys.
+func (f *udpFront) pinFlow(key flowKey, link *backendLink, route *flowRoute, d []byte, sent int, dst netip.Addr, now time.Time) (forward, pinned bool) {
 	f.access.Lock()
 	defer f.access.Unlock()
 	if route != nil && route.gone {
-		return false
+		return false, false
 	}
 	if f.flows[key] != nil {
-		return true
+		return true, false
 	}
 	if len(f.flows) >= f.maxFlows {
 		if f.unconfirmed.head == nil {
-			// A device's datagram goes only on a flow: its answers
-			// need the flow's key.
-			return route == nil
+			return route == nil, false
 		}
-		f.unpin(f.unconfirmed.head.key)
+		if route == nil {
+			f.unpin(f.unconfirmed.head.key)
+		}
+	}
+	if route != nil {
+		if deviceInitial(route, d) && !f.newSalt(route, d, now) {
+			return false, false
+		}
+		if len(f.flows) >= f.maxFlows {
+			f.unpin(f.unconfirmed.head.key)
+		}
+		f.candidates.drop(key)
+		f.recent.note(sourceKey(key.client.Addr()), route, now)
 	}
 	sk := sourceKey(key.client.Addr())
 	b := f.budgets[sk]
@@ -1138,7 +1160,7 @@ func (f *udpFront) pinWith(key flowKey, link *backendLink, route *flowRoute, d [
 	fl.initialID = clientID(fl.password(), d)
 	f.unconfirmed.push(fl)
 	f.flows[key] = fl
-	return true
+	return true, true
 }
 
 // unpin forgets a flow. With f.access.

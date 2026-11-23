@@ -37,8 +37,9 @@ const (
 	// flow of a source (an IPv4 address, an IPv6 /64), a second;
 	// trialTotalRate and trialTotalBurst: of all (§4.1). A key is one
 	// BLAKE2b of 40 bytes (BenchmarkUDPFrontDeviceTrial: ~0.25 µs), so
-	// the front's share is about an eighth of a core at most, spent on
-	// the socket's own goroutine. The budget makes an exhaustion of the
+	// the front's share, with its own keys' budget (600,000 a second in
+	// all), is ~0.15 s of a core a second at most, spent on the socket's
+	// own goroutine. The budget makes an exhaustion of the
 	// CPU one of these trials: a source's share is a fiftieth of the
 	// front's, and only an address past the knock reaches the front, so
 	// it takes 50 sources that knocked to keep new flows out (devices'
@@ -108,7 +109,7 @@ func (r *deviceRoute) list() []*flowRoute {
 // deviceStats are the counters of the device routes, all together:
 // numbers only, never a key or an address (§6).
 type deviceStats struct {
-	pinned, unmatched, overBudget, replayed, cut atomic.Uint64
+	pinned, unmatched, overBudget, replayed, keyShare, cut atomic.Uint64
 }
 
 // errTooManyPasswords: a file past maxSalamanderPasswords, not taken.
@@ -223,15 +224,16 @@ func (f *udpFront) watchDevices(ctx context.Context, r *deviceRoute, every time.
 }
 
 // reportDevices logs the device routes' counters, when they changed.
-func (f *udpFront) reportDevices(said *[5]uint64) {
+func (f *udpFront) reportDevices(said *[6]uint64) {
 	s := &f.devStats
-	now := [5]uint64{s.pinned.Load(), s.unmatched.Load(), s.overBudget.Load(), s.replayed.Load(), s.cut.Load()}
+	now := [6]uint64{s.pinned.Load(), s.unmatched.Load(), s.overBudget.Load(), s.replayed.Load(), s.keyShare.Load(), s.cut.Load()}
 	if now == *said {
 		return
 	}
 	*said = now
 	f.log.Infof("udp salamander keys: %d flows pinned, %d datagrams opened under none, %d over the trial budget, "+
-		"%d Initials sent again, %d flows of keys gone cut, since the start", now[0], now[1], now[2], now[3], now[4])
+		"%d Initials sent again, %d Initials past their key's share, %d flows of keys gone cut, since the start",
+		now[0], now[1], now[2], now[3], now[4], now[5])
 }
 
 // tryKeys finds the key of a device route that a datagram of no flow
@@ -270,7 +272,7 @@ func (f *udpFront) tryKeys(key flowKey, d []byte, now time.Time) (*backendLink, 
 	sk := sourceKey(src)
 
 	var first [recentPerSource + 1]*flowRoute
-	n := 0
+	n, nAll := 0, 0
 	f.access.Lock()
 	recent := f.recent.get(sk)
 	if c := f.candidates.get(key); c != nil && c.device.can(initial, short) {
@@ -283,8 +285,9 @@ func (f *udpFront) tryKeys(key flowKey, d []byte, now time.Time) (*backendLink, 
 			n++
 		}
 	}
+	nAll = n
 	if n > 0 && !f.recentGrant(src, n, now) {
-		n = 0 // past the source's own: tried with the rest
+		n = 0 // past the source's own: tried with the rest, its keys still
 	}
 	f.access.Unlock()
 
@@ -336,22 +339,20 @@ func (f *udpFront) tryKeys(key flowKey, d []byte, now time.Time) (*backendLink, 
 		return nil, nil, nil
 	}
 
+	// The salt, the key's share and its place among the source's go
+	// with the pin (pinFlow): a datagram that pins nothing takes none.
 	f.access.Lock()
 	ok := !found.gone
 	switch {
-	case !ok:
-	case kind == matchInitial:
-		ok = f.newSalt(found, d, now)
-	case rest > 0:
-		// The rest's label: a candidate, not a pin.
+	case !ok, kind == matchInitial:
+	case rest > 0 && !isFirst(first[:nAll], found):
+		// A label of the rest: a candidate, not a pin. One of the
+		// source's own keys tried with the rest (its own budget spent)
+		// pins as it would have first.
 		f.candidates.note(key, found, now)
 		ok = false
 	default:
 		ok = f.cidSources.allow(src, now)
-	}
-	if ok {
-		f.candidates.drop(key)
-		f.recent.note(sk, found, now)
 	}
 	f.access.Unlock()
 	if !ok {
@@ -360,6 +361,17 @@ func (f *udpFront) tryKeys(key flowKey, d []byte, now time.Time) (*backendLink, 
 	out := make([]byte, len(d)-salamanderSalt)
 	hysteria2.SalamanderXOR(out, d[salamanderSalt:], &k, 0)
 	return found.device.link, found, [][]byte{out}
+}
+
+// deviceInitial reports whether d opens under k's key to an Initial of a
+// size (tryKeys' matchInitial).
+func deviceInitial(k *flowRoute, d []byte) bool {
+	if len(d) < salamanderSalt+minInitialDatagram {
+		return false
+	}
+	key := salamanderKey(k.password, d[:salamanderSalt])
+	h, n := openHeadKey(&key, d, 7)
+	return n == 7 && isQUICInitial(h[:7])
 }
 
 // newSalt reports whether an Initial a key opened is new (§7), and
@@ -375,7 +387,7 @@ func (f *udpFront) newSalt(k *flowRoute, d []byte, now time.Time) bool {
 		k.saltGen, k.salts = f.salts.gen, 0
 	}
 	if k.salts >= saltsPerKey {
-		f.devStats.overBudget.Add(1)
+		f.devStats.keyShare.Add(1)
 		return false
 	}
 	k.salts++
