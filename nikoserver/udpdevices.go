@@ -43,7 +43,8 @@ const (
 	// CPU one of these trials: a source's share is a fiftieth of the
 	// front's, and only an address past the knock reaches the front, so
 	// it takes 50 sources that knocked to keep new flows out (devices'
-	// new ports go on: their own keys have a budget apart). With 1000
+	// new ports go on: their own keys within their budget, then with the
+	// rest under the rest's, still pinning at once). With 1000
 	// keys a source opens 10 new flows a second, 40 at once (a datagram
 	// no key opens costs the whole list); a list longer than a burst is
 	// tried once the bucket fills to it (65,536 keys: one a source each
