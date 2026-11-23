@@ -161,7 +161,7 @@ type udpPacketConn struct {
 const (
 	udpQueueBytes      = 128 << 10
 	udpDefragPackets   = 2
-	udpMaxPacketBytes  = 96 << 10 // 65535 of payload and the fragments' own: 78 of 300 bytes of destination
+	udpMaxPacketBytes  = 96 << 10 // a datagram of 65535 in fragments of ~1.2 KiB with a short destination (it counts twice: in its datagram, and its copy); clients send 4 KiB at most
 	udpMaxDestination  = 300      // a name of 255 and a port; an IPv6 address with a zone (Linux: 15)
 	udpMessageOverhead = 96       // the message, its buffer's header, the strings' headers
 )

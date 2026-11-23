@@ -244,9 +244,10 @@ func (u *hy2Users) trafficOf(name string) *hy2Traffic {
 //     (233) by then and sees the connection closed as a revoked user's
 //     is, with no error code; Hysteria clients dial again.
 //
-// Each is counted (conns). So more live connections than the limit do not
-// take each other's places in turn either: a newcomer of a credential at
-// its share replaces its own.
+// Each is counted (conns). Live connections of different credentials do not
+// take each other's places in turn: a newcomer of a credential at its share
+// replaces its own. Two clients of one credential (a shared link) cut down
+// below their number by (3) do: each one's redial replaces the other's.
 func (u *hy2Users) admit(user *hy2User, c *hy2Conn) bool {
 	u.mu.Lock()
 	if user == nil || user.revoked {

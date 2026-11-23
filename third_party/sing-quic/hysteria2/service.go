@@ -463,17 +463,20 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// two at once, the second is answered as authenticated already, and
 		// the connection's controller, hook and datagram loop are set once.
 		// Before, both went on, and the hook admitted the connection twice.
+		// A request the server answers with the masquerade is no auth: it
+		// leaves the connection unauthenticated (neko), before the swap.
+		if s.receiveBPS > 0 && s.ignoreClientBandwidth && request.Rx == 0 {
+			s.logger.Debug("process connection from ", r.RemoteAddr, ": BBR disabled by server")
+			s.masqueradeHandler.ServeHTTP(w, r)
+			return
+		}
 		if !s.auth.CompareAndSwap(nil, &user) {
 			authenticated()
 			return
 		}
 		var rxAuto bool
 		var brutal *hyCC.BrutalSender
-		if s.receiveBPS > 0 && s.ignoreClientBandwidth && request.Rx == 0 {
-			s.logger.Debug("process connection from ", r.RemoteAddr, ": BBR disabled by server")
-			s.masqueradeHandler.ServeHTTP(w, r)
-			return
-		} else if !(s.receiveBPS == 0 && s.ignoreClientBandwidth) && request.Rx > 0 {
+		if !(s.receiveBPS == 0 && s.ignoreClientBandwidth) && request.Rx > 0 {
 			rx := request.Rx
 			if s.sendBPS > 0 && rx > s.sendBPS {
 				rx = s.sendBPS
