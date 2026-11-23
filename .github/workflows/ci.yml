@@ -73,11 +73,12 @@ jobs:
       - name: Unit and in-process tests
         run: go vet ./... && go test -race -count=1 -timeout 600s ./...
       # The vendored dnstt is a module of its own: ./... above does not reach
-      # it (review 12). Only the dns package, which niko changes; vet ./...
-      # there stops on two upstream warnings in noise_test.go.
-      - name: dnstt's dns package (vendored, changed by niko)
+      # it (review 12). Only the dns and turbotunnel packages, which niko
+      # changes; vet ./... there stops on two upstream warnings in
+      # noise_test.go.
+      - name: dnstt's dns and turbotunnel packages (vendored, changed by niko)
         working-directory: third_party/dnstt
-        run: go vet ./dns && go test -race -count=1 ./dns
+        run: go vet ./dns ./turbotunnel && go test -race -count=1 ./dns ./turbotunnel
       # The vendored sing-quic is a module of its own too: its hysteria2
       # package, which niko changes (salamander, the session map).
       - name: sing-quic's hysteria2 package (vendored, changed by niko)
