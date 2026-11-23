@@ -41,9 +41,12 @@ type pendingEntry struct {
 	// with one key, the later's.
 	dst netip.Addr
 	// field: a tagged zone's query's dnsauth-v2 field, whose copies wait
-	// for its answer (answerShare); tagged false: none. The later's too.
+	// for its answer (answerShare); tagged false: none. apex: the zone's
+	// when the front answers at it, whose SOA goes with a NODATA below it
+	// (apexZone.negative). The later's too.
 	field  [8]byte
 	tagged bool
+	apex   *apexZone
 }
 
 const (
@@ -70,11 +73,12 @@ func (p *pendingQueries) age(now time.Time) {
 
 // add notes a query from client to dst that goes to a backend.
 func (p *pendingQueries) add(client netip.AddrPort, query []byte, questionEnd int, dst netip.Addr) {
-	p.addField(client, query, questionEnd, dst, [8]byte{}, false)
+	p.addEntry(client, query, questionEnd, pendingEntry{dst: dst})
 }
 
-// addField is add for a tagged zone's query, with its field.
-func (p *pendingQueries) addField(client netip.AddrPort, query []byte, questionEnd int, dst netip.Addr, field [8]byte, tagged bool) {
+// addEntry is add with what the answer needs besides: with's dst, field,
+// tagged and apex.
+func (p *pendingQueries) addEntry(client netip.AddrPort, query []byte, questionEnd int, with pendingEntry) {
 	k := pendingKey{client, binary.BigEndian.Uint16(query)}
 	size := uint16(requesterSize(query, questionEnd))
 	p.mu.Lock()
@@ -87,8 +91,7 @@ func (p *pendingQueries) addField(client netip.AddrPort, query []byte, questionE
 		}
 	}
 	e.size = max(e.size, size)
-	e.dst = dst
-	e.field, e.tagged = field, tagged
+	e.dst, e.field, e.tagged, e.apex = with.dst, with.field, with.tagged, with.apex
 	if e.n < 1<<16-1 {
 		e.n++
 	}

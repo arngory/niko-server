@@ -335,24 +335,24 @@ func TestAnswerShareGenerations(t *testing.T) {
 	s := answerShare{now: func() time.Time { return now }}
 	a := netip.MustParseAddrPort("192.0.2.1:53")
 	q := []byte{1, 2, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 1}
-	if _, handled := s.copyOf([8]byte{1}, q, len(q), a, a, netip.Addr{}); handled {
+	if _, handled := s.copyOf([8]byte{1}, q, len(q), a, a, netip.Addr{}, nil); handled {
 		t.Fatal("a field never passed on, handled")
 	}
 	s.open([8]byte{1})
 	s.open([8]byte{2})
 	s.forget([8]byte{2})
-	if _, handled := s.copyOf([8]byte{2}, q, len(q), a, a, netip.Addr{}); handled {
+	if _, handled := s.copyOf([8]byte{2}, q, len(q), a, a, netip.Addr{}, nil); handled {
 		t.Fatal("a field forgotten, handled")
 	}
 	now = now.Add(pendingGeneration + time.Second)
-	if _, handled := s.copyOf([8]byte{1}, q, len(q), a, a, netip.Addr{}); !handled {
+	if _, handled := s.copyOf([8]byte{1}, q, len(q), a, a, netip.Addr{}, nil); !handled {
 		t.Fatal("a field of the last generation, not handled")
 	}
 	if w := s.answered([8]byte{1}, append([]byte{1, 2, 0x84, 0}, q[4:]...)); len(w) != 1 {
 		t.Fatalf("%d waiting", len(w))
 	}
 	now = now.Add(2*pendingGeneration + time.Second)
-	if _, handled := s.copyOf([8]byte{1}, q, len(q), a, a, netip.Addr{}); handled {
+	if _, handled := s.copyOf([8]byte{1}, q, len(q), a, a, netip.Addr{}, nil); handled {
 		t.Fatal("a field older than two generations, handled")
 	}
 }

@@ -54,6 +54,7 @@ type shareWaiter struct {
 	dst           netip.Addr
 	query         []byte
 	questionEnd   int
+	apex          *apexZone // its zone's, for the SOA of a NODATA
 }
 
 const (
@@ -108,7 +109,7 @@ func (s *answerShare) forget(field [dnsttserver.AuthTagLen]byte) {
 // one passed on lately (the caller answers as before); else reply is the
 // first's answer for it to send now, or nil: it waits for the answer, or
 // gets none (the field's answers given).
-func (s *answerShare) copyOf(field [dnsttserver.AuthTagLen]byte, query []byte, questionEnd int, client, local netip.AddrPort, dst netip.Addr) (reply []byte, handled bool) {
+func (s *answerShare) copyOf(field [dnsttserver.AuthTagLen]byte, query []byte, questionEnd int, client, local netip.AddrPort, dst netip.Addr, apex *apexZone) (reply []byte, handled bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.age(s.clock())
@@ -126,7 +127,7 @@ func (s *answerShare) copyOf(field [dnsttserver.AuthTagLen]byte, query []byte, q
 		return reply, true
 	}
 	e.given++
-	e.waiting = append(e.waiting, shareWaiter{client: client, local: local, dst: dst, query: append([]byte(nil), query...), questionEnd: questionEnd})
+	e.waiting = append(e.waiting, shareWaiter{client: client, local: local, dst: dst, query: append([]byte(nil), query...), questionEnd: questionEnd, apex: apex})
 	s.curBytes += len(query)
 	return nil, true
 }

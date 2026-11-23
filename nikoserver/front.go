@@ -284,10 +284,10 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 				switch verdict {
 				case tagEcho, tagReplayed:
 					f.stats.replayed.Add(1)
-					if reply, handled := f.share.copyOf(field, query, questionEnd, client, local, dst); handled {
+					if reply, handled := f.share.copyOf(field, query, questionEnd, client, local, dst, f.apex[zone]); handled {
 						if reply != nil {
 							f.stats.shared.Add(1)
-							f.reply(conn, reply, client, dst)
+							f.reply(conn, withNegativeSOA(f.apex[zone], reply, requesterSize(query, questionEnd)), client, dst)
 						}
 						continue
 					}
@@ -297,7 +297,7 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 				default:
 					f.stats.untagged.Add(1)
 				}
-				f.reply(conn, nodata(query, questionEnd), client, dst)
+				f.reply(conn, f.nodata(zone, query, questionEnd), client, dst)
 				continue
 			}
 		}
@@ -311,7 +311,7 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 		if t != nil {
 			f.share.open(field)
 		}
-		f.pending.addField(client, query, questionEnd, dst, field, t != nil)
+		f.pending.addEntry(client, query, questionEnd, pendingEntry{dst: dst, field: field, tagged: t != nil, apex: f.apex[zone]})
 		link := f.zoneBackend[zone]
 		var msg []byte
 		if t != nil && link.ref.Devices {
@@ -330,6 +330,28 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 		}
 		f.stats.forwarded.Add(1)
 	}
+}
+
+// nodata is the front's NODATA to a query of zone below its apex: with the
+// zone's SOA in the authority section when the front answers at the apex
+// (RFC 2308 §3; within the requester's size, else without).
+func (f *dnsFront) nodata(zone string, query []byte, questionEnd int) []byte {
+	return withNegativeSOA(f.apex[zone], nodata(query, questionEnd), requesterSize(query, questionEnd))
+}
+
+// withNegativeSOA is answer with the SOA of a's zone when it is a NODATA
+// below the apex and the SOA fits size (and maxBackendAnswer); else answer
+// as it is. a may be nil: a zone the front does not answer at.
+func withNegativeSOA(a *apexZone, answer []byte, size int) []byte {
+	if a == nil {
+		return answer
+	}
+	if end, ok := skipName(answer, 12); ok {
+		if soa := a.negative(answer, end+4, min(size, maxBackendAnswer)); soa != nil {
+			return soa
+		}
+	}
+	return answer
 }
 
 // reply sends the front's own answer to a query (refused, apex, probe,
@@ -363,6 +385,7 @@ func (f *dnsFront) answer(client, local netip.AddrPort, payload []byte) {
 		}
 	}
 	size, src := int(e.size), e.dst
+	payload = withNegativeSOA(e.apex, payload, size) // a NODATA below the apex: the zone's SOA with it
 	cut := false
 	if len(payload) > min(size, maxBackendAnswer) {
 		if payload = truncated(payload); payload == nil {
@@ -408,7 +431,7 @@ func (f *dnsFront) answerCopy(w shareWaiter, answer []byte) {
 		return
 	}
 	f.stats.shared.Add(1)
-	f.reply(conn, reply, w.client, w.dst)
+	f.reply(conn, withNegativeSOA(w.apex, reply, requesterSize(w.query, w.questionEnd)), w.client, w.dst)
 }
 
 // backendLink is the front's connection to one backend: reconnects with backoff,
