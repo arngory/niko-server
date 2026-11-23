@@ -82,14 +82,17 @@ type udpFront struct {
 	// devLinks their backends: an answer of theirs with no flow goes
 	// nowhere. Under access: the trial budgets, the keys each source
 	// matched lately, the salts of the Initials matched.
-	devices      []*deviceRoute
-	devicesEvery time.Duration // how often their files are read again
-	devLinks     map[*backendLink]bool
-	devStats     deviceStats
-	trialSources sourceLimits
-	allTrials    tokenBucket
-	recent       recentKeys
-	salts        saltMemory
+	devices       []*deviceRoute
+	devicesEvery  time.Duration // how often their files are read again
+	devLinks      map[*backendLink]bool
+	devStats      deviceStats
+	trialSources  sourceLimits
+	allTrials     tokenBucket
+	recentSources sourceLimits
+	allRecent     tokenBucket
+	recent        recentKeys
+	candidates    candidates
+	salts         saltMemory
 }
 
 // sourceBudget is what a source (an IPv4 address, an IPv6 /64) sent the
@@ -127,10 +130,13 @@ type flowRoute struct {
 	password []byte
 	// front: the front takes salamander off the client's datagrams and
 	// puts it on the backend's, which are plain QUIC; device: its route.
-	// gone (with udpFront.access): the key left the list.
-	front  bool
-	device *deviceRoute
-	gone   bool
+	// gone (with udpFront.access): the key left the list; salts: its
+	// Initials in the salts' generation saltGen (saltsPerKey).
+	front   bool
+	device  *deviceRoute
+	gone    bool
+	salts   int
+	saltGen uint64
 }
 
 type salamanderRoute struct {
@@ -507,18 +513,21 @@ func newUDPFront(c *FrontUDP, backends map[string]BackendRef, log *Logger) (*udp
 		}
 	}
 	if keys != nil {
-		labels := len(f.byLabel)
+		labels := map[*backendLink]bool{} // a backend of several routes once
+		for _, r := range f.byLabel {
+			labels[r.link] = true
+		}
 		for _, r := range f.salamander {
 			if r.codec != nil {
-				labels++
+				labels[r.link] = true
 			}
 		}
 		for _, r := range f.devices {
 			if r.codec != nil {
-				labels++
+				labels[r.link] = true
 			}
 		}
-		log.Infof("routing by connection ID for %d backends", labels)
+		log.Infof("routing by connection ID for %d backends", len(labels))
 	}
 	return f, nil
 }
@@ -606,7 +615,9 @@ func (f *udpFront) expire(now time.Time) {
 	f.freeProbes.age(now)
 	f.sourceProbes.age(now)
 	f.trialSources.age(now)
+	f.recentSources.age(now)
 	f.recent.age(now)
+	f.candidates.age(now)
 	f.salts.age(now)
 }
 
@@ -635,7 +646,10 @@ func (f *udpFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 		now := time.Now()
 
 		var k [blake2b.Size256]byte
-		if link, route, keyed := f.pinnedFlow(key, datagram, dst, now, &k); link != nil {
+		if link, route, keyed, drop := f.pinnedFlow(key, datagram, dst, now, &k); link != nil {
+			if drop {
+				continue
+			}
 			if route != nil && route.front {
 				// The device's key off, in place.
 				if len(datagram) <= salamanderSalt {
@@ -663,6 +677,9 @@ func (f *udpFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 		}
 		if !f.pinWith(key, link, route, datagram, sent, dst, now) {
 			continue
+		}
+		if route != nil {
+			f.log.Debugf("udp: a flow to %s pinned by a device's key", link.name)
 		}
 		for _, p := range packets {
 			link.send(encodePacket(message, client, local, p))
@@ -958,19 +975,28 @@ func (f *udpFront) answer(link *backendLink, client, local netip.AddrPort, paylo
 // flow in use is not the oldest.
 func (f *udpFront) pinned(key flowKey, d []byte, dst netip.Addr, now time.Time) *backendLink {
 	var k [blake2b.Size256]byte
-	link, _, _ := f.pinnedFlow(key, d, dst, now, &k)
+	link, _, _, _ := f.pinnedFlow(key, d, dst, now, &k)
 	return link
 }
 
 // pinnedFlow is pinned with the flow's route; keyed: it opened the
 // datagram's head under a device's key (flowRoute.front), and k is the
-// datagram's key.
-func (f *udpFront) pinnedFlow(key flowKey, d []byte, dst netip.Addr, now time.Time, k *[blake2b.Size256]byte) (link *backendLink, route *flowRoute, keyed bool) {
+// datagram's key. drop: an Initial under the key whose salt came before
+// (§7), from the flow's own 4-tuple: dropped, nothing counted. The
+// backend retires the first flight's connection ID after the handshake,
+// so a copy of it would open a new connection there.
+func (f *udpFront) pinnedFlow(key flowKey, d []byte, dst netip.Addr, now time.Time, k *[blake2b.Size256]byte) (link *backendLink, route *flowRoute, keyed, drop bool) {
 	f.access.Lock()
 	defer f.access.Unlock()
 	fl := f.flows[key]
 	if fl == nil {
-		return nil, nil, false
+		return nil, nil, false, false
+	}
+	if fl.route != nil && fl.route.front && len(d) >= salamanderSalt+minInitialDatagram {
+		*k, keyed = salamanderKey(fl.route.password, d[:salamanderSalt]), true
+		if h, n := openHeadKey(k, d, 7); n == 7 && isQUICInitial(h[:7]) && !f.newSalt(fl.route, d, now) {
+			return fl.link, fl.route, keyed, true
+		}
 	}
 	fl.dst = dst
 	prev := fl.last
@@ -987,13 +1013,15 @@ func (f *udpFront) pinnedFlow(key flowKey, d []byte, dst netip.Addr, now time.Ti
 		if fl.listed {
 			f.unconfirmed.moveToBack(fl)
 		}
-		return fl.link, fl.route, keyed
+		return fl.link, fl.route, keyed, false
 	}
 	var h [7 + 2*maxCIDLen]byte
 	var n int
 	if fl.route != nil && fl.route.front && len(d) > salamanderSalt {
 		// The key serves to take salamander off too.
-		*k, keyed = salamanderKey(fl.route.password, d[:salamanderSalt]), true
+		if !keyed {
+			*k, keyed = salamanderKey(fl.route.password, d[:salamanderSalt]), true
+		}
 		h, n = openHeadKey(k, d, 6+maxCIDLen)
 	} else {
 		h, n = openHead(fl.password(), d, 6+maxCIDLen)
@@ -1001,13 +1029,8 @@ func (f *udpFront) pinnedFlow(key flowKey, d []byte, dst netip.Addr, now time.Ti
 	if again && n >= 1 && h[0]&0x80 != 0 {
 		fl.answers = 0
 	}
-	if keyed && again && n >= 7 && isQUICInitial(h[:7]) {
-		// Its salt too (a ClientHello in two Initials, the second on the
-		// flow): a copy of it from another address goes nowhere.
-		f.salts.seen(binary.LittleEndian.Uint64(d[:salamanderSalt]), now)
-	}
 	if !fl.listed {
-		return fl.link, fl.route, keyed
+		return fl.link, fl.route, keyed, false
 	}
 	if !fl.answered && fl.checks < maxServerCIDChecks {
 		switch x := headID(h[:], n); {
@@ -1026,14 +1049,14 @@ func (f *udpFront) pinnedFlow(key flowKey, d []byte, dst netip.Addr, now time.Ti
 			// It has answered within idle/2, or since the client's last
 			// datagram (a client's keepalives further apart than idle/2).
 			if (int32(fl.last-fl.backendAt) <= int32(f.idle/time.Second/2) || int32(fl.backendAt-prev) >= 0) && f.confirm(fl) {
-				return fl.link, fl.route, keyed
+				return fl.link, fl.route, keyed, false
 			}
 		case cidOther:
 			fl.checks++
 		}
 	}
 	f.unconfirmed.moveToBack(fl)
-	return fl.link, fl.route, keyed
+	return fl.link, fl.route, keyed, false
 }
 
 // confirm takes a flow off the list, unless its source has maxConfirmed
@@ -1090,7 +1113,9 @@ func (f *udpFront) pinWith(key flowKey, link *backendLink, route *flowRoute, d [
 	}
 	if len(f.flows) >= f.maxFlows {
 		if f.unconfirmed.head == nil {
-			return true
+			// A device's datagram goes only on a flow: its answers
+			// need the flow's key.
+			return route == nil
 		}
 		f.unpin(f.unconfirmed.head.key)
 	}
@@ -1107,7 +1132,6 @@ func (f *udpFront) pinWith(key flowKey, link *backendLink, route *flowRoute, d [
 	if route != nil {
 		fl.route = route
 		f.devStats.pinned.Add(1)
-		f.log.Debugf("udp: a flow to %s pinned by a device's key", link.name)
 	} else if r := f.salamanderFor(link, d); r != nil {
 		fl.route = r.flow
 	}
@@ -1164,6 +1188,13 @@ func (f *udpFront) answeredFlow(link *backendLink, key flowKey, payload []byte, 
 			return false, netip.Addr{}, nil
 		}
 		return !f.linkProbe(link, payload), netip.Addr{}, nil
+	}
+	if fl.link != link && (f.devLinks[link] || fl.route != nil && fl.route.front) {
+		// The 4-tuple is another backend's flow now (the device's went:
+		// cut, idle, or out of a full table): a device backend's answer
+		// would go in the clear or under another key, another's under a
+		// device's key.
+		return false, netip.Addr{}, nil
 	}
 	fl.last = f.clock(now)
 	fl.backendAt = fl.last

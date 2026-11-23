@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net/netip"
 	"os"
@@ -36,11 +37,28 @@ const (
 	// flow of a source (an IPv4 address, an IPv6 /64), a second;
 	// trialTotalRate and trialTotalBurst: of all (§4.1). A key is one
 	// BLAKE2b of 40 bytes (BenchmarkUDPFrontDeviceTrial: ~0.25 µs), so
-	// the front's share is about an eighth of a core at most. Only an
-	// address past the knock reaches the front: a source pays with its
-	// own budget.
-	trialRate, trialBurst           = 50000, 200000
+	// the front's share is about an eighth of a core at most, spent on
+	// the socket's own goroutine. The budget makes an exhaustion of the
+	// CPU one of these trials: a source's share is a fiftieth of the
+	// front's, and only an address past the knock reaches the front, so
+	// it takes 50 sources that knocked to keep new flows out (devices'
+	// new ports go on: their own keys have a budget apart). With 1000
+	// keys a source opens 10 new flows a second, 40 at once (a datagram
+	// no key opens costs the whole list); a list longer than a burst is
+	// tried once the bucket fills to it (65,536 keys: one a source each
+	// 6.5 s, ~16 ms of the socket's goroutine each).
+	trialRate, trialBurst           = 10000, 40000
 	trialTotalRate, trialTotalBurst = 500000, 500000
+	// recentTrialRate and recentTrialBurst: the trials of a source's own
+	// keys (the candidate and those it matched lately, 5 a datagram at
+	// most), a second, a source; recentTrialTotalRate and
+	// recentTrialTotalBurst: of all. A budget apart: whoever spends the
+	// rest, a device's new port is still matched at its first key.
+	recentTrialRate, recentTrialBurst           = 1000, 4000
+	recentTrialTotalRate, recentTrialTotalBurst = 100000, 100000
+	// candidatesMax: the 4-tuples of a generation (a minute) whose next
+	// datagram tries a candidate first (tryKeys).
+	candidatesMax = 16384
 	// recentKeysFor: a source's keys are tried first for this long (two
 	// generations of it at most): a client whose NAT gave it a new port
 	// is matched at the first key. recentKeysMax: the sources of a
@@ -53,8 +71,13 @@ const (
 	// generations of saltsFor of saltsMax each at most (§7): a copy of a
 	// client's Initial sent again gets nothing, where it got the server's
 	// handshake, some 3 × 1280 bytes that tell the service is alive.
-	saltsFor = 10 * time.Minute
-	saltsMax = 65536
+	// saltsPerKey: a key's Initials a generation at most, past them
+	// dropped: one key cannot turn the generations over early and flush
+	// the memory, 16 together can (a device opens a few connections in
+	// 10 minutes).
+	saltsFor    = 10 * time.Minute
+	saltsMax    = 65536
+	saltsPerKey = 4096
 	// devicesEvery: how often a route's file is read again.
 	devicesEvery = 5 * time.Second
 )
@@ -88,6 +111,9 @@ type deviceStats struct {
 	pinned, unmatched, overBudget, replayed, cut atomic.Uint64
 }
 
+// errTooManyPasswords: a file past maxSalamanderPasswords, not taken.
+var errTooManyPasswords = fmt.Errorf("more than %d passwords", maxSalamanderPasswords)
+
 // parseSalamanderPasswords reads a passwords file (§4.2): a password a
 // line, as its bytes; empty lines and lines starting with # skipped,
 // trailing \r and spaces trimmed, a password once. An empty list lets
@@ -101,7 +127,7 @@ func parseSalamanderPasswords(b []byte) ([][]byte, error) {
 			continue
 		}
 		if len(out) == maxSalamanderPasswords {
-			return nil, fmt.Errorf("more than %d passwords", maxSalamanderPasswords)
+			return nil, errTooManyPasswords
 		}
 		seen[string(line)] = true
 		out = append(out, bytes.Clone(line))
@@ -164,8 +190,10 @@ func (f *udpFront) setDevices(r *deviceRoute, passwords [][]byte) {
 }
 
 // watchDevices reads a route's file again every period until ctx ends, as
-// the DNS front its zones' auth_keys_file: a file that does not read, or
-// not as a list, leaves the list in force, said once.
+// the DNS front its zones' auth_keys_file: a file that does not read
+// leaves the list in force, said once (being replaced, or gone). A file
+// of too many passwords leaves it too, and is an error at each read
+// while it stays: no device it adds gets in, none it removes is cut.
 func (f *udpFront) watchDevices(ctx context.Context, r *deviceRoute, every time.Duration) {
 	t := time.NewTicker(every)
 	defer t.Stop()
@@ -177,6 +205,9 @@ func (f *udpFront) watchDevices(ctx context.Context, r *deviceRoute, every time.
 		}
 		changed, err := f.loadDevices(r)
 		switch {
+		case errors.Is(err, errTooManyPasswords):
+			r.problem = err.Error()
+			f.log.Errorf("udp salamander passwords %s not taken, the %d in force stay, revocations too: %v", r.file, len(r.list()), err)
 		case err != nil:
 			if err.Error() != r.problem {
 				r.problem = err.Error()
@@ -205,102 +236,197 @@ func (f *udpFront) reportDevices(said *[5]uint64) {
 
 // tryKeys finds the key of a device route that a datagram of no flow
 // opens under: to a QUIC Initial (v1, v2) of 1200 bytes or more under
-// its salt, or to a packet to the label of the route's backend. Its
-// source's keys of the last minutes go first, then the rest, within the
-// trial budget; past it the datagram is dropped. It returns the datagram
-// opened.
+// its salt, or to a packet to the label of the route's backend. It
+// returns the datagram opened.
+//
+// The keys of the source go first, each budget of its own: the key a
+// label matched on this 4-tuple's last datagram (a candidate), then those
+// its source (an IPv4 address, an IPv6 /64) matched in the last minutes.
+// A client whose NAT gave it a new port is matched at the first key,
+// whatever the others spend. Then all the rest, or none: the trial
+// budget holds them all, or the datagram is dropped untried.
+//
+// A label is 24 bits of the 64 of a connection ID's block: under one of
+// K keys, a datagram of garbage reads as a short header with the label at
+// about K × 2^-26. So a label the rest matched does not pin: its key is
+// the 4-tuple's candidate, and the next datagram, under it, pins (2^-52).
+// An Initial (34 bits and its size) and a key of the source's pin at once.
 func (f *udpFront) tryKeys(key flowKey, d []byte, now time.Time) (*backendLink, *flowRoute, [][]byte) {
 	if len(d) < salamanderSalt+7 {
 		return nil, nil, nil
 	}
 	initial := len(d) >= salamanderSalt+minInitialDatagram
 	short := len(d)-salamanderSalt >= minCIDPacket
-	want := 0
+	total := 0
 	for _, r := range f.devices {
 		if r.can(initial, short) {
-			want += len(r.list())
+			total += len(r.list())
 		}
 	}
-	if want == 0 {
+	if total == 0 {
 		return nil, nil, nil
 	}
 	src := key.client.Addr()
 	sk := sourceKey(src)
+
+	var first [recentPerSource + 1]*flowRoute
+	n := 0
 	f.access.Lock()
-	n := f.trialGrant(src, want, now)
 	recent := f.recent.get(sk)
-	f.access.Unlock()
-	if n == 0 {
-		f.devStats.overBudget.Add(1)
-		return nil, nil, nil
+	if c := f.candidates.get(key); c != nil && c.device.can(initial, short) {
+		first[n] = c
+		n++
 	}
-	tried := 0
+	for _, fr := range recent {
+		if fr != nil && fr != first[0] && fr.device.can(initial, short) {
+			first[n] = fr
+			n++
+		}
+	}
+	if n > 0 && !f.recentGrant(src, n, now) {
+		n = 0 // past the source's own: tried with the rest
+	}
+	f.access.Unlock()
+
 	var found *flowRoute
 	var k [blake2b.Size256]byte
-	var kind int
-	for _, fr := range recent {
-		if fr == nil || tried == n {
-			break
-		}
-		if !fr.device.can(initial, short) {
-			continue
-		}
-		tried++
+	kind := matchNone
+	for _, fr := range first[:n] {
 		if k, kind = fr.device.open(fr, d, initial, short); kind != matchNone {
 			found = fr
 			break
 		}
 	}
-routes:
-	for _, r := range f.devices {
-		if found != nil {
-			break
+	firsts := first[:n]
+	rest := 0
+	if found == nil {
+		want := total - n
+		f.access.Lock()
+		ok := want > 0 && f.trialGrant(src, want, now)
+		f.access.Unlock()
+		if want > 0 && !ok {
+			f.devStats.overBudget.Add(1)
+			return nil, nil, nil
 		}
-		if !r.can(initial, short) {
-			continue
-		}
-		for _, fr := range r.list() {
-			if tried == n {
-				break routes
-			}
-			if isRecent(&recent, fr) {
+	routes:
+		for _, r := range f.devices {
+			if !r.can(initial, short) {
 				continue
 			}
-			tried++
-			if k, kind = r.open(fr, d, initial, short); kind != matchNone {
-				found = fr
-				break routes
+			for _, fr := range r.list() {
+				if rest == want {
+					break routes // the list grew meanwhile
+				}
+				if isFirst(firsts, fr) {
+					continue
+				}
+				rest++
+				if k, kind = r.open(fr, d, initial, short); kind != matchNone {
+					found = fr
+					break routes
+				}
 			}
 		}
+		f.access.Lock()
+		f.trialReturn(src, want, want-rest, now)
+		f.access.Unlock()
 	}
+	if found == nil {
+		f.devStats.unmatched.Add(1)
+		return nil, nil, nil
+	}
+
 	f.access.Lock()
-	f.trialReturn(src, n-tried, now)
-	ok := found != nil && !found.gone
+	ok := !found.gone
 	switch {
 	case !ok:
 	case kind == matchInitial:
-		if f.salts.seen(binary.LittleEndian.Uint64(d[:salamanderSalt]), now) {
-			f.devStats.replayed.Add(1)
-			ok = false
-		}
+		ok = f.newSalt(found, d, now)
+	case rest > 0:
+		// The rest's label: a candidate, not a pin.
+		f.candidates.note(key, found, now)
+		ok = false
 	default:
 		ok = f.cidSources.allow(src, now)
 	}
 	if ok {
+		f.candidates.drop(key)
 		f.recent.note(sk, found, now)
 	}
 	f.access.Unlock()
-	if found == nil && tried == n && n < want {
-		f.devStats.overBudget.Add(1)
-	} else if found == nil {
-		f.devStats.unmatched.Add(1)
-	}
 	if !ok {
 		return nil, nil, nil
 	}
 	out := make([]byte, len(d)-salamanderSalt)
 	hysteria2.SalamanderXOR(out, d[salamanderSalt:], &k, 0)
 	return found.device.link, found, [][]byte{out}
+}
+
+// newSalt reports whether an Initial a key opened is new (§7), and
+// remembers its salt: not a salt seen in the two generations, nor past
+// the key's share of one (saltsPerKey). With f.access.
+func (f *udpFront) newSalt(k *flowRoute, d []byte, now time.Time) bool {
+	salt := binary.LittleEndian.Uint64(d[:salamanderSalt])
+	if f.salts.has(salt) {
+		f.devStats.replayed.Add(1)
+		return false
+	}
+	if k.saltGen != f.salts.gen {
+		k.saltGen, k.salts = f.salts.gen, 0
+	}
+	if k.salts >= saltsPerKey {
+		f.devStats.overBudget.Add(1)
+		return false
+	}
+	k.salts++
+	f.salts.add(salt, now)
+	return true
+}
+
+func isFirst(first []*flowRoute, fr *flowRoute) bool {
+	for _, x := range first {
+		if x == fr {
+			return true
+		}
+	}
+	return false
+}
+
+// candidates are the keys a label of the rest matched, by 4-tuple, for
+// its next datagram (tryKeys), in two generations of a minute.
+type candidates struct {
+	current, older map[flowKey]*flowRoute
+	swapped        time.Time
+}
+
+// get is a 4-tuple's candidate still in force. With f.access.
+func (c *candidates) get(key flowKey) *flowRoute {
+	k := c.current[key]
+	if k == nil {
+		k = c.older[key]
+	}
+	if k == nil || k.gone {
+		return nil
+	}
+	return k
+}
+
+func (c *candidates) note(key flowKey, k *flowRoute, now time.Time) {
+	if c.current == nil || len(c.current) >= candidatesMax {
+		c.older, c.current, c.swapped = c.current, map[flowKey]*flowRoute{}, now
+	}
+	c.current[key] = k
+}
+
+func (c *candidates) drop(key flowKey) {
+	delete(c.current, key)
+	delete(c.older, key)
+}
+
+func (c *candidates) age(now time.Time) {
+	if c.current != nil && now.Sub(c.swapped) > time.Minute {
+		c.older, c.current, c.swapped = c.current, map[flowKey]*flowRoute{}, now
+	}
 }
 
 // What a key opens a datagram to.
@@ -341,46 +467,42 @@ func (r *deviceRoute) open(fr *flowRoute, d []byte, initial, short bool) ([blake
 	return k, matchNone
 }
 
-func isRecent(recent *[recentPerSource]*flowRoute, fr *flowRoute) bool {
-	for _, x := range recent {
-		if x == fr {
-			return true
-		}
+// recentGrant takes n trials of the source's keys from the source's
+// budget of them and the front's, or none. With f.access.
+func (f *udpFront) recentGrant(src netip.Addr, n int, now time.Time) bool {
+	sb := f.recentSources.bucket(src, now)
+	if !sb.take(float64(n), recentTrialRate, recentTrialBurst, now) {
+		return false
 	}
-	return false
+	if !f.allRecent.take(float64(n), recentTrialTotalRate, recentTrialTotalBurst, now) {
+		sb.give(n, recentTrialBurst)
+		return false
+	}
+	return true
 }
 
-// trialGrant takes up to want trials from src's budget and the front's,
-// as many as both hold. With f.access.
-func (f *udpFront) trialGrant(src netip.Addr, want int, now time.Time) int {
+// trialGrant takes want trials from src's budget and the front's, or
+// none. A list longer than a burst is tried whole once the bucket has
+// filled to it.
+func (f *udpFront) trialGrant(src netip.Addr, want int, now time.Time) bool {
 	sb := f.trialSources.bucket(src, now)
-	n := sb.takeUpTo(want, trialRate, trialBurst, now)
-	g := f.allTrials.takeUpTo(n, trialTotalRate, trialTotalBurst, now)
-	sb.give(n-g, trialBurst)
-	return g
+	if !sb.take(float64(want), trialRate, max(trialBurst, float64(want)), now) {
+		return false
+	}
+	if !f.allTrials.take(float64(want), trialTotalRate, max(trialTotalBurst, float64(want)), now) {
+		sb.give(want, max(trialBurst, float64(want)))
+		return false
+	}
+	return true
 }
 
-// trialReturn gives back the trials granted and not made. With f.access.
-func (f *udpFront) trialReturn(src netip.Addr, n int, now time.Time) {
+// trialReturn gives back n of the want trials granted, not made. With
+// f.access.
+func (f *udpFront) trialReturn(src netip.Addr, want, n int, now time.Time) {
 	if n > 0 {
-		f.trialSources.bucket(src, now).give(n, trialBurst)
-		f.allTrials.give(n, trialTotalBurst)
+		f.trialSources.bucket(src, now).give(n, max(trialBurst, float64(want)))
+		f.allTrials.give(n, max(trialTotalBurst, float64(want)))
 	}
-}
-
-// takeUpTo takes up to n, as many whole ones as the bucket holds, and
-// returns how many.
-func (b *tokenBucket) takeUpTo(n int, rate, burst float64, now time.Time) int {
-	if b.last.IsZero() {
-		b.tokens = burst
-	} else {
-		b.tokens = min(burst, b.tokens+now.Sub(b.last).Seconds()*rate)
-	}
-	b.last = now
-	k := max(min(float64(n), b.tokens), 0)
-	k = float64(int(k))
-	b.tokens -= k
-	return int(k)
 }
 
 // give puts back n taken.
@@ -445,31 +567,39 @@ func (r *recentKeys) age(now time.Time) {
 }
 
 // saltMemory is the salts of the Initials a key opened (§7), in two
-// generations of saltsFor, saltsMax each at most.
+// generations of saltsFor, saltsMax each at most; gen counts the
+// generations, for each key's share of one (flowRoute.salts).
 type saltMemory struct {
 	current, older map[uint64]struct{}
 	swapped        time.Time
+	gen            uint64
 }
 
-// seen reports whether a salt came before, and remembers it. With
-// f.access.
-func (s *saltMemory) seen(salt uint64, now time.Time) bool {
-	if _, ok := s.current[salt]; ok {
-		return true
+// has reports whether a salt came before. With f.access.
+func (s *saltMemory) has(salt uint64) bool {
+	_, ok := s.current[salt]
+	if !ok {
+		_, ok = s.older[salt]
 	}
-	if _, ok := s.older[salt]; ok {
-		return true
-	}
+	return ok
+}
+
+// add remembers a salt. With f.access.
+func (s *saltMemory) add(salt uint64, now time.Time) {
 	if s.current == nil || len(s.current) >= saltsMax {
-		s.older, s.current, s.swapped = s.current, make(map[uint64]struct{}, 1024), now
+		s.turn(now)
 	}
 	s.current[salt] = struct{}{}
-	return false
+}
+
+func (s *saltMemory) turn(now time.Time) {
+	s.older, s.current, s.swapped = s.current, make(map[uint64]struct{}, 1024), now
+	s.gen++
 }
 
 func (s *saltMemory) age(now time.Time) {
 	if s.current != nil && now.Sub(s.swapped) > saltsFor {
-		s.older, s.current, s.swapped = s.current, make(map[uint64]struct{}, 1024), now
+		s.turn(now)
 	}
 }
 
