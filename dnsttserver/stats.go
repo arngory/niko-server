@@ -75,6 +75,8 @@ type StatsSnapshot struct {
 	HandshakeTimeouts uint64 `json:"handshake_timeouts"`
 	StreamsRefused    uint64 `json:"streams_refused"`
 	AuthValid         uint64 `json:"auth_valid"`
+	AuthValidV1       uint64 `json:"auth_valid_v1"` // of them dnsauth-v1 tags (v0.19.3)
+	AuthValidV2       uint64 `json:"auth_valid_v2"` // and dnsauth-v2 ones, by their hint (v0.19.3)
 	AuthUntagged      uint64 `json:"auth_untagged"`
 	AuthRefused       uint64 `json:"auth_refused"`
 	AuthThrottled     uint64 `json:"auth_throttled"`
@@ -113,6 +115,7 @@ func (s *Stats) Snapshot(auth *Auth, seal *Seal) StatsSnapshot {
 	}
 	if auth != nil {
 		out.AuthValid, out.AuthUntagged = auth.Valid.Load(), auth.Untagged.Load()
+		out.AuthValidV1, out.AuthValidV2 = auth.ValidV1.Load(), auth.ValidV2.Load()
 		out.AuthRefused, out.AuthThrottled = auth.Refused.Load(), auth.Throttled.Load()
 	}
 	if seal != nil {

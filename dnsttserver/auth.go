@@ -113,8 +113,10 @@ type Auth struct {
 
 	// Counters for the log: queries with a valid tag, untagged ones taken
 	// (optional), refused ones, and of those refused without a scan over
-	// the budget.
+	// the budget. The valid ones by version too (v0.19.3): dnsauth-v1
+	// tags, and v2 ones found by their hint.
 	Valid, Untagged, Refused, Throttled atomic.Uint64
+	ValidV1, ValidV2                    atomic.Uint64
 }
 
 // SetKeys replaces the keys: lines "<device id> <64 hex digits>"; empty lines
@@ -186,12 +188,13 @@ func (a *Auth) LoadKeys(file string) error {
 // the seal's watcher did before). A file that does not parse keeps the keys
 // in force. Every hour it logs the counters, when they moved.
 func (a *Auth) WatchKeys(file string, every time.Duration, stop <-chan struct{}, logf func(string, ...any)) {
-	var said [4]uint64
+	var said [6]uint64
 	watchKeys(file, every, stop, logf, &a.text, a.SetKeys, a.Devices, func() {
-		now := [4]uint64{a.Valid.Load(), a.Untagged.Load(), a.Refused.Load(), a.Throttled.Load()}
+		now := [6]uint64{a.Valid.Load(), a.ValidV1.Load(), a.ValidV2.Load(), a.Untagged.Load(), a.Refused.Load(), a.Throttled.Load()}
 		if now != said {
 			said = now
-			logf("auth: %d valid, %d untagged, %d refused (%d over the scan budget) since the start", now[0], now[1], now[2], now[3])
+			logf("auth: %d valid (%d v1, %d v2), %d untagged, %d refused (%d over the scan budget) since the start",
+				now[0], now[1], now[2], now[3], now[4], now[5])
 		}
 	})
 }
@@ -305,9 +308,14 @@ func (a *Auth) CheckDevice(payload []byte) (rest []byte, device string, ok bool)
 	}
 	var head turbotunnel.ClientID
 	copy(head[:], payload)
-	switch a.validLocked(payload, head) {
-	case tagValid:
+	switch v := a.validLocked(payload, head); v {
+	case tagValid, tagValid2:
 		a.Valid.Add(1)
+		if v == tagValid2 {
+			a.ValidV2.Add(1)
+		} else {
+			a.ValidV1.Add(1)
+		}
 		var cid turbotunnel.ClientID
 		copy(cid[:], payload[AuthTagLen:])
 		return payload[AuthTagLen:], a.cache[cid], true // validLocked cached it
@@ -334,6 +342,7 @@ type tagResult int
 const (
 	tagInvalid   tagResult = iota
 	tagValid               // a key's tag
+	tagValid2              // a key's dnsauth-v2 tag, by its hint
 	tagThrottled           // not looked at: over the budget
 	tagKnown               // the head of a query no key explained before
 	tagKnownBusy           // the same, not looked at again: over half the budget
@@ -395,13 +404,13 @@ func (a *Auth) validLocked(payload []byte, head turbotunnel.ClientID) tagResult 
 		for _, i := range tried {
 			if x.keyMatches(i, &tag, func(epoch uint32) bool { return match2Key(i, epoch) }) {
 				a.cacheSession(cid, id)
-				return tagValid
+				return tagValid2
 			}
 		}
 		// The session's keys were tried above: not again.
 		if i := x.find(&tag, func(i int, epoch uint32) bool { return !slices.Contains(tried, i) && match2Key(i, epoch) }); i >= 0 {
 			a.cacheSession(cid, keys.keys[i].id)
-			return tagValid
+			return tagValid2
 		}
 		if a.Hint == HintRequired {
 			// No dnsauth-v1 tag is taken: nothing to scan.
