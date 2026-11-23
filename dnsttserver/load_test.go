@@ -21,9 +21,10 @@ func heapNow() uint64 {
 	return m.HeapAlloc
 }
 
-// The answer memo at capacity: two generations of memoMax answers, each the
-// largest a requester of maxUDPPayload takes (sealed: every answer at least
-// 64 bytes), keyed by the longest payload a query name carries.
+// The answer memo at capacity: two generations of memoBytes, of answers
+// each the largest a requester of maxUDPPayload takes or empty and sealed
+// (every answer at least 64 bytes), keyed by the longest payload a query
+// name carries; and the copies' memory, full.
 func TestLoadMemoCapacity(t *testing.T) {
 	if os.Getenv("NIKO_LOAD") == "" {
 		t.Skip("NIKO_LOAD=1")
@@ -35,7 +36,7 @@ func TestLoadMemoCapacity(t *testing.T) {
 	}{{"largest answers", encodedPayload(maxUDPPayload)}, {"empty sealed answers", sealBucket}} {
 		h0 := heapNow()
 		var memo answerMemo
-		for range 2 * memoMax {
+		for memo.prev == nil || memo.curBytes+150+c.data+memoEntryCost <= memoBytes {
 			key := make([]byte, 150) // the longest payload in a name of 255 octets
 			rand.Read(key)
 			rec := &record{Key: string(key), Size: maxUDPPayload,
@@ -48,6 +49,17 @@ func TestLoadMemoCapacity(t *testing.T) {
 			len(memo.cur), len(memo.prev), float64(h1-h0)/(1<<20), float64(h1-h0)/float64(len(memo.cur)+len(memo.prev)))
 		runtime.KeepAlive(&memo)
 	}
+	h0 := heapNow()
+	var copies copyMemory
+	now := time.Now()
+	key := make([]byte, 150)
+	for range len(copies.gens) * copyMemoryCap {
+		rand.Read(key)
+		copies.sight(string(key), now)
+	}
+	h1 := heapNow()
+	t.Logf("copies' memory, full: %d hashes, %.2f MiB", len(copies.gens)*copyMemoryCap, float64(h1-h0)/(1<<20))
+	runtime.KeepAlive(&copies)
 }
 
 // What one distinct ClientID costs in the turbotunnel RemoteMap: sendLoop

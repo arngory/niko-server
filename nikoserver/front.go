@@ -88,6 +88,7 @@ func listenDNS(ctx context.Context, network string, addr netip.AddrPort) (*net.U
 func runDNSFront(ctx context.Context, c *FrontConfig, log *Logger) error {
 	front := &dnsFront{log: log, zoneBackend: make(map[string]*backendLink), sockets: make(map[netip.AddrPort]*net.UDPConn),
 		pktinfo: map[netip.AddrPort]bool{}, probeZones: map[string]bool{}, padZones: map[string]bool{}, apex: map[string]*apexZone{}, tagged: map[string]*taggedZone{}}
+	front.rrl.dataRate = float64(c.DNS.RRLDataKiB) * 1024
 	if c.DNS.ProbeKeyFile != "" {
 		// Without the key the front answers no probes, and goes on: the
 		// tunnels, TCP and UDP 443 must not stop for a resolver check.
@@ -201,6 +202,8 @@ type dnsFront struct {
 	stats       *dnsFrontStats
 	tagged      map[string]*taggedZone // zones whose queries carry a device's tag (slipstream)
 	seenEarly   atomic.Uint64          // their memories' generations started early
+	share       answerShare            // their copies' answers: the first one's
+	rrl         frontRRL               // what goes to one address block
 }
 
 func (f *dnsFront) closeAll() {
@@ -240,7 +243,7 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 		if zone == "" {
 			// not one of our zones: no open resolver here
 			f.stats.refused.Add(1)
-			f.reply(conn, refused(query, questionEnd), client, dst)
+			f.replyOwn(conn, refused(query, questionEnd), client, dst)
 			continue
 		}
 		f.stats.queries[zone].Add(1)
@@ -248,7 +251,7 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 		if a := f.apex[zone]; a != nil && name == zone {
 			if reply, ok := a.answer(query); ok {
 				f.stats.apex.Add(1)
-				f.reply(conn, reply, client, dst)
+				f.replyOwn(conn, reply, client, dst)
 				continue
 			}
 		}
@@ -275,18 +278,27 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 			var verdict int
 			if forward, field, device, verdict = t.check(query, name, questionEnd, rebuilt, raw); verdict != tagPassed {
 				// Not a device's query, or a copy of one: the backend
-				// sees nothing of it. A copy right after the original
-				// gets nothing: the original's answer is on its way.
+				// sees nothing of it. A copy of a field passed on
+				// lately gets the answer the first one gets
+				// (answerShare), a few times; another right after the
+				// original gets nothing: the original's answer is on
+				// its way.
 				switch verdict {
-				case tagEcho:
+				case tagEcho, tagReplayed:
 					f.stats.replayed.Add(1)
-					continue
-				case tagReplayed:
-					f.stats.replayed.Add(1)
+					if reply, handled := f.share.copyOf(field, query, questionEnd, client, local, dst, f.apex[zone]); handled {
+						if reply != nil {
+							f.replyCopy(conn, f.withNegativeSOA(f.apex[zone], reply, requesterSize(query, questionEnd), client.Addr()), client, dst)
+						}
+						continue
+					}
+					if verdict == tagEcho {
+						continue
+					}
 				default:
 					f.stats.untagged.Add(1)
 				}
-				f.reply(conn, nodata(query, questionEnd), client, dst)
+				f.reply(conn, f.nodata(zone, query, questionEnd, client.Addr()), client, dst)
 				continue
 			}
 		}
@@ -297,7 +309,10 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 		// back (docs/IPC.md), not dst: the wire stays as it was, and the
 		// backend keeps one local per client, which a resolver asking two
 		// of the host's addresses from one port would mix up.
-		f.pending.add(client, query, questionEnd, dst)
+		if t != nil {
+			f.share.open(field)
+		}
+		f.pending.addEntry(client, query, questionEnd, pendingEntry{dst: dst, field: field, tagged: t != nil, apex: f.apex[zone]})
 		link := f.zoneBackend[zone]
 		var msg []byte
 		if t != nil && link.ref.Devices {
@@ -309,12 +324,60 @@ func (f *dnsFront) serve(local netip.AddrPort, conn *net.UDPConn) error {
 			f.pending.take(client, query) // the backend never got it
 			if t != nil {
 				t.seen.forget(field, time.Now()) // nor its packet: one retry is no copy
+				f.share.forget(field)
 			}
 			f.stats.backendAway.Add(1)
 			continue
 		}
 		f.stats.forwarded.Add(1)
 	}
+}
+
+// nodata is the front's NODATA to a query of zone below its apex: with the
+// zone's SOA in the authority section when the front answers at the apex
+// (RFC 2308 §3; within the requester's size, else without).
+func (f *dnsFront) nodata(zone string, query []byte, questionEnd int, to netip.Addr) []byte {
+	return f.withNegativeSOA(f.apex[zone], nodata(query, questionEnd), requesterSize(query, questionEnd), to)
+}
+
+// withNegativeSOA is answer with the SOA of a's zone when it is a NODATA
+// below the apex, the SOA fits size (and maxBackendAnswer), and to's block
+// is within its rate of them (frontRRL); else answer as it is. a may be
+// nil: a zone the front does not answer at.
+func (f *dnsFront) withNegativeSOA(a *apexZone, answer []byte, size int, to netip.Addr) []byte {
+	if a == nil {
+		return answer
+	}
+	if end, ok := skipName(answer, 12); ok {
+		if soa := a.negative(answer, end+4, min(size, maxBackendAnswer)); soa != nil {
+			if f.rrl.soa(to) {
+				return soa
+			}
+			f.stats.noSOA.Add(1)
+		}
+	}
+	return answer
+}
+
+// replyOwn is reply for the front's answers that are rate-limited by the
+// block they go to (frontRRL): REFUSED, the apex's.
+func (f *dnsFront) replyOwn(conn *net.UDPConn, b []byte, client netip.AddrPort, dst netip.Addr) {
+	if !f.rrl.own(client.Addr()) {
+		f.stats.rateLimited.Add(1)
+		return
+	}
+	f.reply(conn, b, client, dst)
+}
+
+// replyCopy is reply for a copy given its field's answer (answerShare),
+// within its block's budget of the backends' answers.
+func (f *dnsFront) replyCopy(conn *net.UDPConn, b []byte, client netip.AddrPort, dst netip.Addr) {
+	if !f.rrl.data(client.Addr(), len(b)) {
+		f.stats.overBudget.Add(1)
+		return
+	}
+	f.stats.shared.Add(1)
+	f.reply(conn, b, client, dst)
 }
 
 // reply sends the front's own answer to a query (refused, apex, probe,
@@ -335,12 +398,20 @@ const maxDNSQuery = 4096
 // and on a wildcard from the address it came to: only to a query that
 // waits for it, and within its requester's size (pendingQueries).
 func (f *dnsFront) answer(client, local netip.AddrPort, payload []byte) {
-	size, src, ok := f.pending.take(client, payload)
+	e, ok := f.pending.takeEntry(client, payload)
 	if !ok {
 		f.stats.unmatched.Add(1)
 		f.log.Debugf("an answer to %s no query waits for: dropped", client)
 		return
 	}
+	if e.tagged {
+		// The copies that wait for this answer get it too, as their own.
+		for _, w := range f.share.answered(e.field, payload) {
+			f.answerCopy(w, payload)
+		}
+	}
+	size, src := int(e.size), e.dst
+	payload = f.withNegativeSOA(e.apex, payload, size, client.Addr()) // a NODATA below the apex: the zone's SOA with it
 	cut := false
 	if len(payload) > min(size, maxBackendAnswer) {
 		if payload = truncated(payload); payload == nil {
@@ -365,6 +436,10 @@ func (f *dnsFront) answer(client, local netip.AddrPort, payload []byte) {
 	if !f.pktinfo[local] {
 		src = netip.Addr{} // bound to one address: its own
 	}
+	if !f.rrl.data(client.Addr(), len(payload)) {
+		f.stats.overBudget.Add(1) // past the budget of the block it goes to (frontRRL)
+		return
+	}
 	if _, err := writeFrom(conn, payload, client, src); err != nil {
 		f.stats.dropped.Add(1)
 		return
@@ -373,6 +448,19 @@ func (f *dnsFront) answer(client, local netip.AddrPort, payload []byte) {
 	if cut {
 		f.stats.truncated.Add(1)
 	}
+}
+
+// answerCopy sends a backend's answer to a copy of the query it answers
+// that waited for it (answerShare), made its own, from the socket and
+// address the copy came to.
+func (f *dnsFront) answerCopy(w shareWaiter, answer []byte) {
+	reply := shareReply(answer, w.query, w.questionEnd)
+	conn := f.sockets[w.local]
+	if reply == nil || conn == nil {
+		f.stats.dropped.Add(1)
+		return
+	}
+	f.replyCopy(conn, f.withNegativeSOA(w.apex, reply, requesterSize(w.query, w.questionEnd), w.client.Addr()), w.client, w.dst)
 }
 
 // backendLink is the front's connection to one backend: reconnects with backoff,

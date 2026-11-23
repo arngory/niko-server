@@ -103,8 +103,10 @@ type DeviceAuth struct {
 
 	// Counters (the log, every hour): tags found, by Device or a scan;
 	// queries no key explained; scans not done, for the budget or a scan of
-	// the kind under way.
+	// the kind under way. The tags found by version too (v0.19.3): v1, and
+	// v2 by its hint.
 	Valid, Refused, Throttled atomic.Uint64
+	ValidV1, ValidV2          atomic.Uint64
 }
 
 // SetKeys replaces the keys, as Auth's: lines "<device id> <64 hex
@@ -164,12 +166,13 @@ func (a *DeviceAuth) LoadKeys(file string) error {
 
 // WatchKeys reads the file again every period until stop, as Auth's.
 func (a *DeviceAuth) WatchKeys(file string, every time.Duration, stop <-chan struct{}, logf func(string, ...any)) {
-	var said [3]uint64
+	var said [5]uint64
 	watchKeys(file, every, stop, logf, &a.text, a.SetKeys, a.Devices, func() {
-		now := [3]uint64{a.Valid.Load(), a.Refused.Load(), a.Throttled.Load()}
+		now := [5]uint64{a.Valid.Load(), a.ValidV1.Load(), a.ValidV2.Load(), a.Refused.Load(), a.Throttled.Load()}
 		if now != said {
 			said = now
-			logf("auth: %d valid, %d refused, %d scans not done (budget, or one under way) since the start", now[0], now[1], now[2])
+			logf("auth: %d valid (%d v1, %d v2), %d refused, %d scans not done (budget, or one under way) since the start",
+				now[0], now[1], now[2], now[3], now[4])
 		}
 	})
 }
@@ -205,6 +208,7 @@ func (a *DeviceAuth) Device(id string, tag [AuthTagLen]byte, msg []byte) bool {
 		for _, i := range idx {
 			if x.keyMatches(i, &tag, func(epoch uint32) bool { return k.match2(i, epoch, &tag, msg) }) {
 				a.Valid.Add(1)
+				a.ValidV2.Add(1)
 				return true
 			}
 		}
@@ -223,6 +227,7 @@ func (a *DeviceAuth) Device(id string, tag [AuthTagLen]byte, msg []byte) bool {
 			if hmac.Equal(t[:], tag[:]) {
 				m.mu.Unlock()
 				a.Valid.Add(1)
+				a.ValidV1.Add(1)
 				return true
 			}
 		}
@@ -255,6 +260,7 @@ func (a *DeviceAuth) Scan(kind ScanKind, tag [AuthTagLen]byte, msg []byte) (stri
 			// Not among the recent ones: those are for the v1 pass, and
 			// v2 devices would push v1 ones out of it.
 			a.Valid.Add(1)
+			a.ValidV2.Add(1)
 			return k.keys[i].id, true
 		}
 		if a.Hint == HintRequired {
@@ -359,6 +365,7 @@ func (a *DeviceAuth) charge(slot *scanSlot, hmacs int) {
 // keys drop out.
 func (a *DeviceAuth) found(id string) {
 	a.Valid.Add(1)
+	a.ValidV1.Add(1) // a scan finds v1 tags only
 	k := a.keys.Load()
 	a.recentMu.Lock()
 	defer a.recentMu.Unlock()

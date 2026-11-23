@@ -349,6 +349,7 @@ func TestTaggedZoneSlipstream(t *testing.T) {
 	}
 	// The front's counters tell whose answer it was: the server's and the
 	// front's read the same (an OPT of 4096, no records).
+	var shared uint64
 	stats := func() (forwarded, answers, untagged, replayed uint64) {
 		t.Helper()
 		sc, err := net.Dial("unix", statsSock)
@@ -356,26 +357,30 @@ func TestTaggedZoneSlipstream(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer sc.Close()
-		var st struct{ Forwarded, Answers, Untagged, Replayed uint64 }
+		var st struct{ Forwarded, Answers, Untagged, Replayed, Shared uint64 }
 		if err := json.NewDecoder(sc).Decode(&st); err != nil {
 			t.Fatal(err)
 		}
+		shared = st.Shared
 		return st.Forwarded, st.Answers, st.Untagged, st.Replayed
 	}
 	fw, an, un, _ := stats()
+	for i := 0; an == 0 && i < 50; i++ { // counted once written: the answer may come first
+		time.Sleep(10 * time.Millisecond)
+		fw, an, un, _ = stats()
+	}
 	if fw == 0 || an == 0 || un != 0 || binary.BigEndian.Uint16(a[10:12]) != 1 {
 		t.Fatalf("the server's answer: forwarded %d, answers %d, untagged %d: %x", fw, an, un, a)
 	}
-	// A copy of the device's query (another ID): no answer within 5 s of
-	// the original (a resolver's retry), then the front's NOERROR; the
-	// server sees nothing of it.
-	device := q
+	// A copy of the device's query (another ID): the server's answer to
+	// the original, as its own (v0.19.3); the server sees nothing of it.
+	device := bytes.Clone(q)
 	device[0] ^= 0x5a
-	if c := ask(device); binary.BigEndian.Uint16(c[6:8]) != 0 {
-		t.Fatalf("a copy's answer: %x", c)
+	if c := ask(device); !bytes.Equal(c[:2], device[:2]) || !bytes.Equal(c[2:], a[2:]) {
+		t.Fatalf("a copy's answer:\n%x\nthe original's:\n%x", c, a)
 	}
-	if fw2, _, _, rp := stats(); fw2 != fw || rp == 0 {
-		t.Fatalf("a copy: forwarded %d (was %d), replayed %d", fw2, fw, rp)
+	if fw2, _, _, rp := stats(); fw2 != fw || rp == 0 || shared != 1 {
+		t.Fatalf("a copy: forwarded %d (was %d), replayed %d, shared %d", fw2, fw, rp, shared)
 	}
 	var other [32]byte
 	q = slipQuery(t, dnsttserver.Tag2(&other, dnsttserver.EpochOf(time.Now()), packet), packet, "s.example.com", 16, true)

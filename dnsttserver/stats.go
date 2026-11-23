@@ -11,6 +11,10 @@ import (
 type Stats struct {
 	Queries  atomic.Uint64 // DNS queries parsed
 	MemoHits atomic.Uint64 // retries answered from the memo
+	// Copies answered empty: a query answered before that the memo no
+	// longer answers (v0.19.3); CopyTurns, generations of their memory
+	// started early (a load past ~870 data queries a second).
+	Copies, CopyTurns atomic.Uint64
 
 	SessionsAdmitted atomic.Uint64 // new ClientIDs let in
 	// Session starts refused: start packets of a ClientID not let in, so a
@@ -59,6 +63,8 @@ type StatsSnapshot struct {
 	Started           int64  `json:"started,omitempty"` // Unix seconds
 	Queries           uint64 `json:"queries"`
 	MemoHits          uint64 `json:"memo_hits"`
+	Copies            uint64 `json:"copies"`     // v0.19.3
+	CopyTurns         uint64 `json:"copy_turns"` // v0.19.3
 	Sessions          int    `json:"sessions"`
 	Handshakes        int    `json:"handshakes"`
 	SessionsAdmitted  uint64 `json:"sessions_admitted"`
@@ -69,6 +75,8 @@ type StatsSnapshot struct {
 	HandshakeTimeouts uint64 `json:"handshake_timeouts"`
 	StreamsRefused    uint64 `json:"streams_refused"`
 	AuthValid         uint64 `json:"auth_valid"`
+	AuthValidV1       uint64 `json:"auth_valid_v1"` // of them dnsauth-v1 tags (v0.19.3)
+	AuthValidV2       uint64 `json:"auth_valid_v2"` // and dnsauth-v2 ones, by their hint (v0.19.3)
 	AuthUntagged      uint64 `json:"auth_untagged"`
 	AuthRefused       uint64 `json:"auth_refused"`
 	AuthThrottled     uint64 `json:"auth_throttled"`
@@ -88,7 +96,7 @@ type StatsSnapshot struct {
 // nil).
 func (s *Stats) Snapshot(auth *Auth, seal *Seal) StatsSnapshot {
 	out := StatsSnapshot{
-		Queries: s.Queries.Load(), MemoHits: s.MemoHits.Load(),
+		Queries: s.Queries.Load(), MemoHits: s.MemoHits.Load(), Copies: s.Copies.Load(), CopyTurns: s.CopyTurns.Load(),
 		SessionsAdmitted: s.SessionsAdmitted.Load(), RefusedFull: s.RefusedFull.Load(), RefusedRate: s.RefusedRate.Load(),
 		RefusedDevice: s.RefusedDevice.Load(), SessionsEvicted: s.SessionsEvicted.Load(),
 		HandshakeTimeouts: s.HandshakeTimeouts.Load(), StreamsRefused: s.StreamsRefused.Load(),
@@ -107,6 +115,7 @@ func (s *Stats) Snapshot(auth *Auth, seal *Seal) StatsSnapshot {
 	}
 	if auth != nil {
 		out.AuthValid, out.AuthUntagged = auth.Valid.Load(), auth.Untagged.Load()
+		out.AuthValidV1, out.AuthValidV2 = auth.ValidV1.Load(), auth.ValidV2.Load()
 		out.AuthRefused, out.AuthThrottled = auth.Refused.Load(), auth.Throttled.Load()
 	}
 	if seal != nil {
