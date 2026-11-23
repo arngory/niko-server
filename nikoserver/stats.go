@@ -149,8 +149,8 @@ type dnsFrontStats struct {
 	// and only read after.
 	queries map[string]*atomic.Uint64
 
-	malformed, refused, apex, probes, probesOverRate, probesOverLabel, forwarded, backendAway, answers, unmatched, truncated, dropped, untagged, replayed, shared atomic.Uint64
-	replayTurns                                                                                                                                                   *atomic.Uint64 // the front's, set once before it serves
+	malformed, refused, apex, probes, probesOverRate, probesOverLabel, forwarded, backendAway, answers, unmatched, truncated, dropped, untagged, replayed, shared, rateLimited, noSOA, overBudget atomic.Uint64
+	replayTurns                                                                                                                                                                                   *atomic.Uint64 // the front's, set once before it serves
 }
 
 func newDNSFrontStats(zones []string) *dnsFrontStats {
@@ -186,6 +186,13 @@ type DNSFrontSnapshot struct {
 	Replayed        uint64 `json:"replayed"`     // queries of a tagged zone whose tag was seen before (copies): NOERROR, or nothing within 5 s of the original; the backend sees none (v0.13.0)
 	ReplayTurns     uint64 `json:"replay_turns"` // generations of the memory of tagged fields started early (a load past ~870 queries a second): copies older than that reach the server, which drops them (v0.13.0)
 	Shared          uint64 `json:"shared"`       // copies (in replayed) given the answer their field's first query got, made theirs (v0.19.3)
+	// The limits by the address block an answer goes to (v0.19.3):
+	// REFUSED and the apex's answers not sent, past their rate; NODATA
+	// sent without the zone's SOA, past its rate; the backends' answers
+	// (and copies' shared ones) dropped, past the block's byte budget.
+	RateLimited uint64 `json:"rate_limited"`
+	NoSOA       uint64 `json:"no_soa"`
+	OverBudget  uint64 `json:"over_budget"`
 }
 
 func (s *dnsFrontStats) snapshot() DNSFrontSnapshot {
@@ -195,6 +202,7 @@ func (s *dnsFrontStats) snapshot() DNSFrontSnapshot {
 		Probes: s.probes.Load(), ProbesOverRate: s.probesOverRate.Load(), ProbesOverLabel: s.probesOverLabel.Load(),
 		Forwarded: s.forwarded.Load(), BackendAway: s.backendAway.Load(),
 		Answers: s.answers.Load(), Unmatched: s.unmatched.Load(), Truncated: s.truncated.Load(), Dropped: s.dropped.Load(), Untagged: s.untagged.Load(), Replayed: s.replayed.Load(), ReplayTurns: loadOrZero(s.replayTurns), Shared: s.shared.Load(),
+		RateLimited: s.rateLimited.Load(), NoSOA: s.noSOA.Load(), OverBudget: s.overBudget.Load(),
 	}
 	for z, n := range s.queries {
 		out.Queries[z] = n.Load()
