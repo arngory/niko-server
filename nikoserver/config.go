@@ -126,10 +126,17 @@ type FrontTCP struct {
 
 // UDPRoute sends QUIC flows whose ClientHello names one of these servers,
 // or salamander flows that open with this password, to a backend.
+//
+// SalamanderPasswordsFile (v0.19.3, raycontrol salamander-device-v1): the
+// passwords of the devices, one a line, which the front reads again when
+// the file changes. The front takes salamander off a flow with the key it
+// opened under and puts it on the backend's answers; the backend
+// (options.salamander_front) gets plain QUIC.
 type UDPRoute struct {
-	SNI                    []string `json:"sni,omitempty"`
-	SalamanderPasswordFile string   `json:"salamander_password_file,omitempty"`
-	Backend                string   `json:"backend"`
+	SNI                     []string `json:"sni,omitempty"`
+	SalamanderPasswordFile  string   `json:"salamander_password_file,omitempty"`
+	SalamanderPasswordsFile string   `json:"salamander_passwords_file,omitempty"`
+	Backend                 string   `json:"backend"`
 }
 
 // FrontUDP is udpmux (SPEC §3.2).
@@ -190,6 +197,10 @@ type BackendOptions struct {
 	UpMbps           int    `json:"up_mbps,omitempty"`
 	DownMbps         int    `json:"down_mbps,omitempty"`
 	ObfsPasswordFile string `json:"obfs_password_file,omitempty"`
+	// SalamanderFront (hy2-obfs, v0.19.3): the front takes salamander off
+	// and puts it on (udp.routes[].salamander_passwords_file); the server
+	// has no password and sizes its packets for the front's salt.
+	SalamanderFront bool `json:"salamander_front,omitempty"`
 	// yggdrasil: the node's key in private_key_file (hex: a 32-byte seed or
 	// the 64-byte key of yggdrasil-go's config), the TCP ports of the node's
 	// mesh address that lead to inner, and outgoing peers (public ones; none
@@ -558,6 +569,9 @@ func (c *FrontConfig) validate() []ConfigError {
 				if samePath(c.DNS.StatsSocket, r.SalamanderPasswordFile) {
 					e.add("dns.stats_socket", "the salamander password file of udp.routes[%d]", i)
 				}
+				if samePath(c.DNS.StatsSocket, r.SalamanderPasswordsFile) {
+					e.add("dns.stats_socket", "the salamander passwords file of udp.routes[%d]", i)
+				}
 			}
 		}
 		for i, z := range c.DNS.Zones {
@@ -733,9 +747,14 @@ func (c *BackendConfig) validate() []ConfigError {
 	case "hy2-masq", "hy2-obfs":
 		checkSocket(&e, "users_file", c.UsersFile)
 		checkBackendTLS(&e, c.TLS, "a Hysteria2 backend needs its certificate")
-		if c.Kind == "hy2-obfs" {
+		switch {
+		case c.Kind == "hy2-obfs" && c.Options.SalamanderFront:
+			if c.Options.ObfsPasswordFile != "" {
+				e.add("options.obfs_password_file", "not with salamander_front: the front holds the passwords")
+			}
+		case c.Kind == "hy2-obfs":
 			checkSocket(&e, "options.obfs_password_file", c.Options.ObfsPasswordFile)
-		} else if c.Options.ObfsPasswordFile != "" {
+		case c.Options.ObfsPasswordFile != "":
 			e.add("options.obfs_password_file", "only hy2-obfs has salamander")
 		}
 		if c.Options.UpMbps < 0 || c.Options.DownMbps < 0 {
@@ -832,6 +851,9 @@ func (c *BackendConfig) validate() []ConfigError {
 	}
 	if (c.Options.CIDKeyFile != "" || c.Options.CIDLabel != 0) && c.Kind != "hy2-masq" && c.Kind != "hy2-obfs" {
 		e.add("options", "cid_key_file and cid_label are options of the Hysteria2 backends")
+	}
+	if c.Options.SalamanderFront && c.Kind != "hy2-obfs" {
+		e.add("options.salamander_front", "only hy2-obfs has salamander")
 	}
 	if c.Kind != "yggdrasil" && (len(c.Options.ExitPorts) > 0 || len(c.Options.Peers) > 0) {
 		e.add("options", "exit_ports and peers are Yggdrasil options")
@@ -1006,8 +1028,14 @@ func (u *FrontUDP) validate(e *configErrors, backends map[string]BackendRef) {
 	names := map[string]bool{}
 	for i, r := range u.Routes {
 		path := fmt.Sprintf("udp.routes[%d]", i)
-		if (len(r.SNI) == 0) == (r.SalamanderPasswordFile == "") {
-			e.add(path, "give either sni or salamander_password_file")
+		given := 0
+		for _, set := range []bool{len(r.SNI) > 0, r.SalamanderPasswordFile != "", r.SalamanderPasswordsFile != ""} {
+			if set {
+				given++
+			}
+		}
+		if given != 1 {
+			e.add(path, "give one of sni, salamander_password_file or salamander_passwords_file")
 		}
 		for j, name := range r.SNI {
 			n := normalName(name)
@@ -1021,6 +1049,9 @@ func (u *FrontUDP) validate(e *configErrors, backends map[string]BackendRef) {
 		}
 		if r.SalamanderPasswordFile != "" {
 			checkSocket(e, path+".salamander_password_file", r.SalamanderPasswordFile)
+		}
+		if r.SalamanderPasswordsFile != "" {
+			checkSocket(e, path+".salamander_passwords_file", r.SalamanderPasswordsFile)
 		}
 		b, ok := backends[r.Backend]
 		switch {
