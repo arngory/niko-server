@@ -275,7 +275,7 @@ func runHysteriaMem(ctx context.Context, c *BackendConfig, conn *packetConn, log
 		// stream's first bytes.
 		WrapCongestionControl: mem.wrapSender,
 		StreamStart:           lim.streamStart,
-		RequestWait:           hy2RequestWait,
+		RequestWait:           lim.n.requestWait,
 		PendingStreams:        hy2PendingStreams,
 		Context:               ctx,
 		Logger:                nopLogger(),
@@ -310,7 +310,7 @@ func runHysteriaMem(ctx context.Context, c *BackendConfig, conn *packetConn, log
 	if err := reload(); err != nil {
 		return envError("users: %v", err)
 	}
-	go watchUsers(ctx, c.UsersFile, reload, func() { users.check(); connLimit() }, log)
+	go watchUsers(ctx, c.UsersFile, lim.n.lookEvery, reload, func() { users.check(); connLimit() }, log)
 	if err := service.Start(serveConn); err != nil {
 		return err
 	}
@@ -405,13 +405,14 @@ func (g sagernetCIDs) GenerateConnectionID() (squic.ConnectionID, error) {
 
 func (sagernetCIDs) ConnectionIDLen() int { return cidLen }
 
-// usersLookEvery is how often watchUsers looks (a var for the tests).
-var usersLookEvery = 5 * time.Second
+// usersLookEvery is how often watchUsers looks (tests: hyLimitNumbers'
+// lookEvery for Hysteria2's).
+const usersLookEvery = 5 * time.Second
 
 // watchUsers reloads the users file on SIGHUP and when it changes; check
-// runs at each look, every usersLookEvery and on SIGHUP, whether it changed
-// or not.
-func watchUsers(ctx context.Context, path string, reload func() error, check func(), log *Logger) {
+// runs at each look, each period every (usersLookEvery) and on SIGHUP,
+// whether it changed or not.
+func watchUsers(ctx context.Context, path string, every time.Duration, reload func() error, check func(), log *Logger) {
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 	defer signal.Stop(hup)
@@ -419,7 +420,7 @@ func watchUsers(ctx context.Context, path string, reload func() error, check fun
 	if st, err := os.Stat(path); err == nil {
 		last = st.ModTime()
 	}
-	tick := time.NewTicker(usersLookEvery)
+	tick := time.NewTicker(every)
 	defer tick.Stop()
 	for {
 		select {

@@ -107,7 +107,7 @@ func runYggdrasil(ctx context.Context, c *BackendConfig, log *Logger) error {
 	if err := reload(); err != nil {
 		return envError("users: %v", err)
 	}
-	go watchUsers(ctx, c.UsersFile, reload, relay.check, log)
+	go watchUsers(ctx, c.UsersFile, usersLookEvery, reload, relay.check, log)
 
 	// The core listens where only this process reaches: links come in
 	// through serveLink, after the key check.

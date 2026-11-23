@@ -85,8 +85,9 @@ const hy2ConnsPerUser = 16
 // user must have been unheard to give way to a new one: a live client is
 // heard at least each keepalive (its own 25 s, or its answer to the
 // server's PING at hysteriaKeepAlive), and the watch counts each
-// usersLookEvery; past both and a margin it is gone (a var for the tests).
-var hy2UnheardAfter = hysteriaKeepAlive + 7*time.Second
+// usersLookEvery; past both and a margin it is gone (tests: hyLimitNumbers'
+// unheard).
+const hy2UnheardAfter = hysteriaKeepAlive + 7*time.Second
 
 type hy2Users struct {
 	mu     sync.Mutex
@@ -269,7 +270,7 @@ func (u *hy2Users) admit(user *hy2User, c *hy2Conn) bool {
 		}
 		if gone == nil {
 			for x := range u.byBase[c.base] {
-				if x.look(now); now.Sub(x.heard) >= hy2UnheardAfter && quieter(x, gone) {
+				if x.look(now); now.Sub(x.heard) >= l.n.unheard && quieter(x, gone) {
 					gone = x
 				}
 			}

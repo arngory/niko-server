@@ -53,6 +53,11 @@ type hyLimitNumbers struct {
 	// QUIC connections at once (hy2Users.admit) and streams waiting for
 	// their TCP request (streamStart), all the user's connections together.
 	conns, pending int
+	// The backend's times of v0.19.3, here so that a test's are set before
+	// the backend's goroutines read them: a stream's wait for its request
+	// (hy2RequestWait), the users watch's period (usersLookEvery), and how
+	// long a connection of the user's unheard gives way (hy2UnheardAfter).
+	requestWait, lookEvery, unheard time.Duration
 }
 
 var hyLimitDefaults = hyLimitNumbers{
@@ -63,6 +68,7 @@ var hyLimitDefaults = hyLimitNumbers{
 	pairs:      1024,
 	lookupRate: 20, lookupBurst: 100,
 	conns: hy2ConnsPerUser, pending: hy2PendingPerUser,
+	requestWait: hy2RequestWait, lookEvery: usersLookEvery, unheard: hy2UnheardAfter,
 }
 
 const (
@@ -782,7 +788,7 @@ func (b *bucket) charge(now time.Time, rate, burst, debt float64) {
 // request on.
 const hy2PendingPerUser = 1024
 
-var hy2RequestWait = 10 * time.Second // a var for the tests
+const hy2RequestWait = 10 * time.Second
 
 // streamStart is the service's StreamStart: a place among the user's
 // streams waiting for their request, given back by done once it is read;

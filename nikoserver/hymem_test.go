@@ -538,12 +538,10 @@ func TestHysteriaFlightUnackedStaysCounted(t *testing.T) {
 // the owner's devices); else, every credential at its share, the newcomer
 // is refused. Each is counted (conns), and other users' go on.
 func TestHysteriaConnsPerUser(t *testing.T) {
-	setVar(t, &usersLookEvery, 100*time.Millisecond)
-	setVar(t, &hy2UnheardAfter, time.Second)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	lim := newHyLimits()
-	lim.n.conns = 3
+	lim.n.conns, lim.n.lookEvery, lim.n.unheard = 3, 100*time.Millisecond, time.Second
 	node := hy2MasqNode(t, ctx, lim, nil, "u1", "pw-1", "u1-ab12", "pw-2", "u1-cd34", "pw-3", "u1-ef56", "pw-4", "u2", "pw-u2")
 	to, _ := sinkTarget(t, false)
 	dial := func(password string) (*rawHy2, bool) {
@@ -609,7 +607,7 @@ func TestHysteriaConnsPerUser(t *testing.T) {
 		defer busy(r)()
 		leaked = append(leaked, r)
 	}
-	time.Sleep(3 * usersLookEvery)
+	time.Sleep(3 * lim.n.lookEvery)
 	// The owner's device: pw-2 holds 3, past a fair share of 3/2.
 	owner, ok := dial("pw-1")
 	if n := live(2, leaked...); !ok || n != 2 || closed(owner, 0) {
@@ -637,7 +635,7 @@ func TestHysteriaConnsPerUser(t *testing.T) {
 	}
 	// The third falls silent: once unheard for hy2UnheardAfter it gives way.
 	stopThird()
-	time.Sleep(hy2UnheardAfter + 3*usersLookEvery)
+	time.Sleep(lim.n.unheard + 3*lim.n.lookEvery)
 	e, ok := dial("pw-4")
 	if !ok || !closed(third, 2*time.Second) || closed(owner, 0) || closed(again, 0) || closed(e, 0) {
 		t.Fatalf("after the third's silence: admitted %v, the third closed %v", ok, closed(third, 0))
@@ -652,11 +650,10 @@ func TestHysteriaConnsPerUser(t *testing.T) {
 // the limit is reset at once, counted (pending), and those waiting are
 // reset when their time is up.
 func TestHysteriaPendingStreams(t *testing.T) {
-	setVar(t, &hy2RequestWait, 500*time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	lim := newHyLimits()
-	lim.n.pending = 2
+	lim.n.pending, lim.n.requestWait = 2, 500*time.Millisecond
 	node := hy2MasqNode(t, ctx, lim, nil, "u1", "password-one")
 	r, err := dialRawHy2(t, ctx, node.server, []tls.CurveID{tls.X25519MLKEM768}, 0)
 	if err != nil {
@@ -843,10 +840,11 @@ func TestHyMemAccounting(t *testing.T) {
 // their time is up, and a request after them is answered. Before v0.19.3
 // each held a goroutine until the connection ended.
 func TestHysteriaStreamsWithoutAFrame(t *testing.T) {
-	setVar(t, &hy2RequestWait, 250*time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	node := hy2MasqNode(t, ctx, nil, nil, "u1", "password-one")
+	lim := newHyLimits()
+	lim.n.requestWait = 250 * time.Millisecond
+	node := hy2MasqNode(t, ctx, lim, nil, "u1", "password-one")
 	for _, authed := range []bool{false, true} {
 		r, err := dialRawHy2(t, ctx, node.server, []tls.CurveID{tls.X25519MLKEM768}, 0)
 		if err != nil {
