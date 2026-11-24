@@ -49,14 +49,21 @@ func TestNewCgroupV2(t *testing.T) {
 	if got := readFile(t, filepath.Join(root, "user.slice/cgroup.subtree_control")); got != "+memory" {
 		t.Fatalf("subtree_control written %q", got)
 	}
-	// Enabled already: left alone. The root's own: a child of the root.
-	writeFile(t, filepath.Join(root, "cgroup.subtree_control"), "cpu memory\n")
-	dir, _, err = newCgroup("0::/\n", root, "niko-load-2", 128<<20)
-	if err != nil || dir != filepath.Join(root, "niko-load-2") {
+	// Enabled already: left alone.
+	writeFile(t, filepath.Join(root, "user.slice/cgroup.subtree_control"), "cpu memory\n")
+	dir, _, err = newCgroup("0::/user.slice/session-2.scope\n", root, "niko-load-2", 128<<20)
+	if err != nil || dir != filepath.Join(root, "user.slice/niko-load-2") {
 		t.Fatalf("%s, %v", dir, err)
 	}
-	if got := readFile(t, filepath.Join(root, "cgroup.subtree_control")); got != "cpu memory\n" {
+	if got := readFile(t, filepath.Join(root, "user.slice/cgroup.subtree_control")); got != "cpu memory\n" {
 		t.Fatalf("subtree_control rewritten: %q", got)
+	}
+	// Its own the namespace's root: an error, nothing made.
+	if d, _, err := newCgroup("0::/\n", root, "niko-load-4", 128<<20); err == nil || !strings.Contains(err.Error(), "root of its namespace") {
+		t.Fatalf("%s, %v", d, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "niko-load-4")); err == nil {
+		t.Fatal("a cgroup made under the namespace's root")
 	}
 	// No memory controller in the parent: an error, nothing made.
 	writeFile(t, filepath.Join(root, "system.slice/cgroup.controllers"), "cpu pids\n")
@@ -111,5 +118,28 @@ func TestStartIn(t *testing.T) {
 	out := strings.TrimSpace(readFile(t, filepath.Join(dir, "out")))
 	if out != procs+" a b" {
 		t.Fatalf("cgroup.procs %q, the command wrote %q", procs, out)
+	}
+}
+
+// cleanup runs what was asked last first, once, however often it is
+// called (must, a signal, main's end).
+func TestCleanup(t *testing.T) {
+	var got []int
+	for i := range 3 {
+		atExit(func() { got = append(got, i) })
+	}
+	cleanup()
+	cleanup()
+	if len(got) != 3 || got[0] != 2 || got[2] != 0 {
+		t.Fatalf("ran %v", got)
+	}
+}
+
+// The loadgen's own memory cgroup, as /proc says (v1 here, or v2).
+func TestCgroupOf(t *testing.T) {
+	dir, v2 := cgroupOf(os.Getpid(), "/sys/fs/cgroup")
+	t.Logf("%s, v2 %v", dir, v2)
+	if _, err := os.Stat(dir); dir != "" && err != nil {
+		t.Fatalf("%s: %v", dir, err)
 	}
 }
