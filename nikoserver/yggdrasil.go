@@ -778,23 +778,32 @@ func serveExits(s *stack.Stack, exits map[uint16]bool, inner string, allowed fun
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, fwd.HandlePacket)
 }
 
-// The exits open at once: in all, and of one user, whatever key they
-// come from; and of one user, those whose handshake is not done (an exit
-// is taken at the SYN, and a handshake whose SYN-ACK goes unanswered holds
-// its place two minutes). Past them: RST. A user's limit is under its
-// limit of TCP at once in inner (raycontrol conn-limit-v1, 1024), so over
-// Yggdrasil the node's comes first: 8 users fill the node, not 4 (third
-// review; an idle exit holds some 53 KiB).
+// The exits open at once: in all (yggExitsMax, and at most as many as the
+// process's memory has floors for: yggExitsBound); of one user, whatever
+// key they come from, an eighth of that, yggExitsPerUser at most and
+// yggExitsShaking at least (yggExitsOfUser); and of one user, those whose
+// handshake is not done (an exit is taken at the SYN, and a handshake
+// whose SYN-ACK goes unanswered holds its place two minutes). Past them:
+// RST. A user's limit is under its limit of TCP at once in inner
+// (raycontrol conn-limit-v1, 1024), so over Yggdrasil the node's comes
+// first: 8 users fill the node, not 4 (third review; an idle exit holds
+// some 53 KiB), whatever the bound; on a bound under 8 × 64 = 512, fewer.
 const (
 	yggExitsMax, yggExitsPerUser = 4096, 512
 	yggExitsShaking              = 64
 )
+
+// yggExitsOfUser is a user's exits at once when the node has n: an eighth,
+// within yggExitsShaking and yggExitsPerUser.
+func yggExitsOfUser(n int) int { return min(yggExitsPerUser, max(n/8, yggExitsShaking)) }
 
 // yggExitCount counts the exits, and holds them by key to close those of a
 // key gone (drop); and their buffers past their floors, in all and by
 // user, within budget (yggexitmem.go).
 type yggExitCount struct {
 	mu      sync.Mutex
+	max     int // yggExitsBound
+	perUser int // yggExitsOfUser(max)
 	total   int
 	byUser  map[string]int
 	shaking map[string]int
@@ -817,7 +826,8 @@ type yggExitCount struct {
 }
 
 func newYggExitCount() *yggExitCount {
-	return &yggExitCount{byUser: map[string]int{}, shaking: map[string]int{}, conns: map[[32]byte]map[io.Closer]bool{},
+	n := yggExitsBound()
+	return &yggExitCount{max: n, perUser: yggExitsOfUser(n), byUser: map[string]int{}, shaking: map[string]int{}, conns: map[[32]byte]map[io.Closer]bool{},
 		budget: yggExitBudget(), grownBy: map[string]int64{}, reclaimedBy: map[string]time.Time{}, closingMax: yggExitsClosing, linger: yggExitLinger}
 }
 
@@ -826,7 +836,7 @@ func newYggExitCount() *yggExitCount {
 func (c *yggExitCount) take(who yggExitSource) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.total >= yggExitsMax || c.byUser[who.user] >= yggExitsPerUser || c.shaking[who.user] >= yggExitsShaking {
+	if c.total >= c.max || c.byUser[who.user] >= c.perUser || c.shaking[who.user] >= yggExitsShaking {
 		return false
 	}
 	c.total++

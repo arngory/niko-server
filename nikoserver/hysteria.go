@@ -170,7 +170,7 @@ func hysteriaTLS(c *BackendConfig) (option.InboundTLSOptions, tls.CurveID) {
 // runHysteriaWith is runHysteria with the backend's limits given (tests:
 // their numbers and clock).
 func runHysteriaWith(ctx context.Context, c *BackendConfig, conn *packetConn, log *Logger, dial dialFunc, lim *hyLimits) error {
-	return runHysteriaMem(ctx, c, conn, log, dial, lim, newHyMem(hyMemBudget(), log))
+	return runHysteriaMem(ctx, c, conn, log, dial, lim, newHyMemFor(procMemory(), log))
 }
 
 // runHysteriaMem is runHysteriaWith with the budget of the connections'
@@ -221,7 +221,7 @@ func runHysteriaMem(ctx context.Context, c *BackendConfig, conn *packetConn, log
 	connLimit()
 	var live sessions
 	users := newHy2Users()
-	users.limits = lim
+	users.limits, users.mem = lim, mem
 	if c.StatsSocket != "" {
 		stop, err := live.serveStats(c.StatsSocket, users, log)
 		if err != nil {
@@ -282,7 +282,7 @@ func runHysteriaMem(ctx context.Context, c *BackendConfig, conn *packetConn, log
 		RequestWait:           lim.n.requestWait,
 		PendingStreams:        hy2PendingStreams,
 		Context:               ctx,
-		Logger:                nopLogger(),
+		Logger:                hysteriaServiceLogger(),
 		SendBPS:               uint64(c.Options.UpMbps * hysteria.MbpsToBps),
 		ReceiveBPS:            uint64(c.Options.DownMbps * hysteria.MbpsToBps),
 		SalamanderPassword:    salamander,
@@ -608,3 +608,14 @@ func Public(a netip.Addr) bool {
 }
 
 func nopLogger() log.ContextLogger { return log.NewNOPFactory().NewLogger("") }
+
+// serviceLogger is the sing-quic service's logger when set: nil but in
+// the tests, which slow the service down where it logs.
+var serviceLogger atomic.Pointer[log.ContextLogger]
+
+func hysteriaServiceLogger() log.ContextLogger {
+	if l := serviceLogger.Load(); l != nil {
+		return *l
+	}
+	return nopLogger()
+}

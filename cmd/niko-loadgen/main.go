@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -41,7 +42,7 @@ var (
 	flagProcs    = flag.Int("procs", 1, "GOMAXPROCS of the server processes")
 	flagCPUs     = flag.String("cpus", "0", "taskset CPU list of the server processes")
 	flagMemLimit = flag.String("memlimit", "", "GOMEMLIMIT of the server processes")
-	flagCgroup   = flag.Int64("cgroup", 0, "memory cgroup limit (bytes) for the backend process; 0: none")
+	flagCgroup   = flag.Int64("cgroup", 0, "memory cgroup limit (bytes) for the backend process, which starts in it (a systemd-run scope under systemd, else a cgroup of its own, v2 or v1); 0: none")
 	flagScenario = flag.String("scenario", "legit", "legit|flood|garbage|probe|apex|refused|idle")
 	flagDur      = flag.Duration("d", 30*time.Second, "load duration")
 	flagAfter    = flag.Duration("after", 0, "keep sampling this long after the load")
@@ -81,11 +82,24 @@ type proc struct {
 	role  string
 	cmd   *exec.Cmd
 	pprof string
+	// cgroup is the process's memory cgroup of its own, "" without one
+	// (-cgroup), and whether it is v2's. scope is systemd's unit when the
+	// process runs in a transient scope (systemdScope): its cgroup is found
+	// right after the start (scopeCgroup), and at the stop its oom_kill is
+	// read while the scope lives, and systemd's Result of the unit after
+	// (oom-kill when the kernel killed it: the scope is gone by then, and
+	// its cgroup's count with it); the unit, not collected, is reset after
+	// (systemctl reset-failed).
+	cgroup   string
+	cgroupV2 bool
+	scope    string
+	stopOnce sync.Once
 }
 
 func must(err error) {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "niko-loadgen:", err)
+		cleanup()
 		os.Exit(1)
 	}
 }
@@ -183,18 +197,48 @@ func setup() *node {
 		"backends": map[string]any{"dns": map[string]any{"socket": socket, "mode": "packet", "uid": uid}},
 		"dns":      frontDNS,
 	})
-	n.backend = start("backend", backendPath, n.backPprof)
+	var cg string
+	var v2, scope bool
+	name := "niko-load-" + strconv.Itoa(os.Getpid())
 	if *flagCgroup > 0 {
-		cgroupLimit(n.backend.cmd.Process.Pid, *flagCgroup)
+		if os.Geteuid() != 0 {
+			must(fmt.Errorf("-cgroup needs root: a systemd scope of the system's, or a cgroup of its own"))
+		}
+		if systemdScope(name, *flagCgroup) != nil {
+			scope = true
+			fmt.Printf("backend in systemd scope %s.scope, MemoryMax %d MiB\n", name, *flagCgroup>>20)
+		} else {
+			self, _ := os.ReadFile("/proc/self/cgroup")
+			var err error
+			cg, v2, err = newCgroup(string(self), "/sys/fs/cgroup", name, *flagCgroup)
+			must(err)
+			atExit(func() { os.Remove(cg) }) // once the backend is gone; a start that failed leaves it empty
+			version := "v1"
+			if v2 {
+				version = "v2"
+			}
+			fmt.Printf("backend in cgroup %s %s, limit %d MiB\n", version, cg, *flagCgroup>>20)
+		}
 	}
+	n.backend = start("backend", backendPath, n.backPprof, cg, v2, scope, name)
 	time.Sleep(300 * time.Millisecond)
-	n.front = start("front", frontPath, n.frontPprof)
+	n.front = start("front", frontPath, n.frontPprof, "", false, false, "")
 	time.Sleep(500 * time.Millisecond)
 	return n
 }
 
-func start(role, config, pprof string) *proc {
-	cmd := exec.Command("taskset", "-c", *flagCPUs, *flagSrv, role, "-c", config)
+func start(role, config, pprof, cgroup string, v2, scope bool, name string) *proc {
+	args := []string{"taskset", "-c", *flagCPUs, *flagSrv, role, "-c", config}
+	switch {
+	case scope:
+		// A failed scope of the name left by a run killed outright (a pid
+		// used again) would keep systemd-run from making it.
+		systemctl("reset-failed", name+".scope")
+		args = systemdScope(name, *flagCgroup, args...)
+	case cgroup != "":
+		args = startIn(cgroup, args...)
+	}
+	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Env = append(os.Environ(), "GOMAXPROCS="+strconv.Itoa(*flagProcs), "NIKO_PPROF="+pprof)
 	if *flagMemLimit != "" {
 		cmd.Env = append(cmd.Env, "GOMEMLIMIT="+*flagMemLimit)
@@ -204,27 +248,42 @@ func start(role, config, pprof string) *proc {
 	cmd.Stdout, cmd.Stderr = logf, logf
 	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
 	must(cmd.Start())
-	return &proc{role: role, cmd: cmd, pprof: pprof}
-}
-
-// cgroupLimit puts pid in a memory cgroup (v1) of its own with a limit.
-func cgroupLimit(pid int, limit int64) {
-	self, _ := os.ReadFile("/proc/self/cgroup")
-	base := "/sys/fs/cgroup/memory"
-	for _, line := range strings.Split(string(self), "\n") {
-		if f := strings.SplitN(line, ":", 3); len(f) == 3 && f[1] == "memory" {
-			base = filepath.Join(base, f[2])
+	p := &proc{role: role, cmd: cmd, pprof: pprof, cgroup: cgroup, cgroupV2: v2}
+	atExit(p.stop)
+	if scope {
+		p.scope = name + ".scope"
+		p.cgroup, p.cgroupV2 = scopeCgroup(cmd.Process.Pid, p.scope, 3*time.Second, p.alive)
+		if p.cgroup == "" {
+			fmt.Fprintf(os.Stderr, "niko-loadgen: %s's cgroup not found: oom_kill unknown\n", p.scope)
 		}
 	}
-	dir := filepath.Join(base, "niko-load-"+strconv.Itoa(pid))
-	must(os.MkdirAll(dir, 0o755))
-	must(os.WriteFile(filepath.Join(dir, "memory.limit_in_bytes"), []byte(strconv.FormatInt(limit, 10)), 0o644))
-	os.WriteFile(filepath.Join(dir, "memory.memsw.limit_in_bytes"), []byte(strconv.FormatInt(limit, 10)), 0o644)
-	must(os.WriteFile(filepath.Join(dir, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0o644))
-	fmt.Printf("backend pid %d in %s, limit %d MiB\n", pid, dir, limit>>20)
+	return p
 }
 
-func (p *proc) stop() {
+// scopeCgroup waits within d for pid to be in the scope unit (systemd-run
+// moves itself there before it execs), and is its memory cgroup then;
+// nothing once the process is gone (alive).
+func scopeCgroup(pid int, unit string, d time.Duration, alive func() bool) (dir string, v2 bool) {
+	for deadline := time.Now().Add(d); time.Now().Before(deadline) && alive(); time.Sleep(20 * time.Millisecond) {
+		b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cgroup")
+		if err != nil {
+			return "", false
+		}
+		if strings.Contains(string(b), "/"+unit+"\n") {
+			return cgroupOf(string(b), "/sys/fs/cgroup")
+		}
+	}
+	return "", false
+}
+
+// stop ends the process, once: the count of its cgroup's OOM kills first,
+// and its own cgroup removed after.
+func (p *proc) stop() { p.stopOnce.Do(p.stopNow) }
+
+func (p *proc) stopNow() {
+	if p.cgroup != "" {
+		fmt.Printf("%s cgroup: oom_kill %d\n", p.role, oomKills(p.cgroup, p.cgroupV2))
+	}
 	if p.cmd.Process != nil {
 		p.cmd.Process.Signal(syscall.SIGTERM)
 		done := make(chan struct{})
@@ -233,6 +292,16 @@ func (p *proc) stop() {
 		case <-done:
 		case <-time.After(3 * time.Second):
 			p.cmd.Process.Kill()
+			<-done
+		}
+	}
+	if p.scope != "" {
+		out := systemctl("show", "-p", "Result", "--value", p.scope)
+		fmt.Printf("%s scope %s: result %s\n", p.role, p.scope, strings.TrimSpace(string(out))) // oom-kill: killed
+		systemctl("reset-failed", p.scope)
+	} else if p.cgroup != "" {
+		if err := os.Remove(p.cgroup); err != nil {
+			fmt.Fprintln(os.Stderr, "niko-loadgen: cgroup:", err)
 		}
 	}
 }
@@ -405,6 +474,15 @@ func report(phase string, d time.Duration, before, after map[string]Stats, peaks
 
 func main() {
 	flag.Parse()
+	defer cleanup()
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		s := <-sig
+		fmt.Fprintln(os.Stderr, "niko-loadgen:", s)
+		cleanup()
+		os.Exit(1)
+	}()
 	if *flagDir == "" || *flagSrv == "" {
 		must(fmt.Errorf("-dir and -srv"))
 	}

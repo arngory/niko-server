@@ -68,6 +68,7 @@ const trafficStale = 5 * time.Minute
 type hy2Conn struct {
 	close   func()
 	packets func() uint64
+	done    <-chan struct{} // its end, by which hyMem knows it; nil: none (tests)
 
 	base  string    // its user's base name (baseName)
 	at    time.Time // admitted
@@ -80,6 +81,10 @@ type hy2Conn struct {
 // conns). Each connection holds windows of its own (hymem.go), and before
 // v0.19.3 one user could open as many as the front let through.
 const hy2ConnsPerUser = 16
+
+// admitDelay is how long admit waits first: 0 but in the tests, which
+// make the hook slow to see what the connection does meanwhile.
+var admitDelay atomic.Int64
 
 // hy2UnheardAfter is how long a connection of another credential of the
 // user must have been unheard to give way to a new one: a live client is
@@ -105,6 +110,9 @@ type hy2Users struct {
 	// limits are the backend's per-user connection limits, whose refusals
 	// the traffic line gives too; set before the stats socket serves.
 	limits *hyLimits
+	// mem is the backend's budget, whose floors admit takes; nil: none
+	// (tests).
+	mem *hyMem
 }
 
 func (u *hy2Users) clock() time.Time {
@@ -240,15 +248,38 @@ func (u *hy2Users) trafficOf(name string) *hy2Traffic {
 //     the limit's worth of live connections loses places to the owner's
 //     other devices, down to an equal share, and takes nothing from them;
 //  4. else none, and the newcomer is refused: every credential is at its
-//     fair share or under, all heard. Its client has the auth's answer
-//     (233) by then and sees the connection closed as a revoked user's
-//     is, with no error code; Hysteria clients dial again.
+//     fair share or under, all heard. The service closes it before the
+//     auth's answer (the hook's false), with no error code; Hysteria
+//     clients dial again.
 //
-// Each is counted (conns). Live connections of different credentials do not
-// take each other's places in turn: a newcomer of a credential at its share
-// replaces its own. Two clients of one credential (a shared link) cut down
-// below their number by (3) do: each one's redial replaces the other's.
+// Then the newcomer takes its floor of the budget (hyMem.takeFloor),
+// whatever the limits say: the floor of the connection it replaces, if
+// one gives way, else the budget's. Short of that (the node's budget, or
+// the user's quarter of it), and none chosen to give way (the user under
+// its limit, or the limits off), one of the user's gives way by (1) and
+// (2), its floor passing to the newcomer: a device back after a change of
+// network gets in at once, not once its old connection idles out (60 s).
+// Still none, the newcomer is refused, and one chosen by the limits stays.
+// A connection that gave way, or a newcomer refused, is counted: conns for
+// the limits, memory for the budget. Live connections of different
+// credentials do not take each other's places in turn: a newcomer of a
+// credential at its share replaces its own. Two clients of one credential
+// (a shared link) cut down below their number by (3) do: each one's
+// redial replaces the other's.
+//
+// The same holds, by design, for the budget: short of a floor, (1) takes
+// the quietest of the newcomer's own credential even if it was heard just
+// now, so two clients of one credential on a full node replace each other
+// at each redial, and a leaked credential can push its owner's device out
+// under memory pressure. A trade-off taken deliberately (memory-v1
+// review): raycontrol gives each device a credential of its own, and the
+// connection a device leaves behind on a change of network was heard
+// recently, so waiting for it to fall silent would refuse the device for
+// up to hy2UnheardAfter.
 func (u *hy2Users) admit(user *hy2User, c *hy2Conn) bool {
+	if d := admitDelay.Load(); d > 0 {
+		time.Sleep(time.Duration(d)) // tests: a slow hook
+	}
 	u.mu.Lock()
 	if user == nil || user.revoked {
 		u.mu.Unlock()
@@ -259,11 +290,12 @@ func (u *hy2Users) admit(user *hy2User, c *hy2Conn) bool {
 	if c.packets != nil {
 		c.seen = c.packets()
 	}
-	var gone *hy2Conn
-	if l := u.limits; l != nil && l.limited(c.base) && len(u.byBase[c.base]) >= max(1, l.n.conns) {
-		quieter := func(x, y *hy2Conn) bool {
-			return y == nil || x.heard.Before(y.heard) || x.heard.Equal(y.heard) && x.at.Before(y.at)
-		}
+	quieter := func(x, y *hy2Conn) bool {
+		return y == nil || x.heard.Before(y.heard) || x.heard.Equal(y.heard) && x.at.Before(y.at)
+	}
+	// own is the quietest of the newcomer's credential's (1), else the
+	// quietest of the user's unheard for unheard (2).
+	own := func(unheard time.Duration) (gone *hy2Conn) {
 		for x := range u.conns[user] {
 			if x.look(now); quieter(x, gone) {
 				gone = x
@@ -271,11 +303,21 @@ func (u *hy2Users) admit(user *hy2User, c *hy2Conn) bool {
 		}
 		if gone == nil {
 			for x := range u.byBase[c.base] {
-				if x.look(now); now.Sub(x.heard) >= l.n.unheard && quieter(x, gone) {
+				if x.look(now); now.Sub(x.heard) >= unheard && quieter(x, gone) {
 					gone = x
 				}
 			}
 		}
+		return gone
+	}
+	var gone *hy2Conn
+	l := u.limits
+	unheard := hy2UnheardAfter
+	if l != nil {
+		unheard = l.n.unheard
+	}
+	if l != nil && l.limited(c.base) && len(u.byBase[c.base]) >= max(1, l.n.conns) {
+		gone = own(unheard)
 		if gone == nil {
 			held := map[*hy2User]int{}
 			for _, y := range u.byBase[c.base] {
@@ -296,10 +338,38 @@ func (u *hy2Users) admit(user *hy2User, c *hy2Conn) bool {
 				}
 			}
 		}
-		l.refuse(c.base, refusedConns)
 		if gone == nil {
+			l.refuse(c.base, refusedConns)
 			u.mu.Unlock()
 			return false
+		}
+	}
+	kind := refusedConns
+	if u.mem != nil {
+		var from <-chan struct{}
+		if gone != nil {
+			from = gone.done
+		}
+		ok := u.mem.takeFloor(c.done, from)
+		if !ok && gone == nil {
+			if gone = own(unheard); gone != nil {
+				kind = refusedMemory
+				if ok = u.mem.takeFloor(c.done, gone.done); !ok {
+					gone = nil
+				}
+			}
+		}
+		if !ok {
+			if l != nil {
+				l.refuse(c.base, refusedMemory)
+			}
+			u.mu.Unlock()
+			return false
+		}
+	}
+	if gone != nil {
+		if l != nil {
+			l.refuse(c.base, kind)
 		}
 		u.dropLocked(u.byBase[c.base][gone], gone)
 	}
@@ -346,15 +416,17 @@ func (u *hy2Users) leave(user *hy2User, c *hy2Conn) {
 }
 
 // connectionHook is the service's ConnectionHook: a connection is admitted
-// (or closed at once, its user revoked between its password check and
-// now) and counted in its address's stats until it ends.
-func connectionHook(users *hy2Users, live *sessions) func(net.Addr, any, func() hysteria2.ConnectionStats, func(), <-chan struct{}) {
-	return func(remote net.Addr, user any, stats func() hysteria2.ConnectionStats, closeConnection func(), done <-chan struct{}) {
+// with its floor of the budget (admit), and counted in its address's stats
+// until it ends; or refused (its limit, the budget short of its floor,
+// counted as memory whatever conn_limit says, or its user revoked between
+// its password check and now), and the service closes it before the
+// auth's answer.
+func connectionHook(users *hy2Users, live *sessions) func(net.Addr, any, func() hysteria2.ConnectionStats, func(), <-chan struct{}) bool {
+	return func(remote net.Addr, user any, stats func() hysteria2.ConnectionStats, closeConnection func(), done <-chan struct{}) bool {
 		u, _ := user.(*hy2User)
-		c := &hy2Conn{close: closeConnection, packets: func() uint64 { return stats().PacketsReceived }}
+		c := &hy2Conn{close: closeConnection, packets: func() uint64 { return stats().PacketsReceived }, done: done}
 		if !users.admit(u, c) {
-			closeConnection()
-			return
+			return false
 		}
 		forget := live.add(remote, u.name, stats)
 		go func() {
@@ -362,6 +434,7 @@ func connectionHook(users *hy2Users, live *sessions) func(net.Addr, any, func() 
 			forget()
 			users.leave(u, c)
 		}()
+		return true
 	}
 }
 

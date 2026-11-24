@@ -59,8 +59,11 @@ type ServiceOptions struct {
 	// and datagrams, at once or later, as often as wanted. The hook runs in
 	// the auth request's handler after the password check, which may have
 	// read the table UpdateUsers has just replaced: a caller closing the
-	// connections of users it took out must refuse those here as well.
-	ConnectionHook func(remote net.Addr, user any, stats func() ConnectionStats, closeConnection func(), done <-chan struct{})
+	// connections of users it took out must refuse those here as well. It
+	// runs before the auth's answer, and returns whether the connection is
+	// admitted (neko): one it refuses is closed unanswered, so its client
+	// never sees 233, and the hook's closeConnection is not called for it.
+	ConnectionHook func(remote net.Addr, user any, stats func() ConnectionStats, closeConnection func(), done <-chan struct{}) bool
 	// ConnectionIDGenerator, if set, makes the server's connection IDs
 	// (neko: IDs whose label the UDP front routes a client by when its
 	// address changes); nil: quic-go's random ones.
@@ -146,7 +149,7 @@ type Service[U comparable] struct {
 	tlsConfig             aTLS.ServerConfig
 	quicConfig            *quic.Config
 	users                 atomic.Pointer[map[string]U] // swapped whole by UpdateUsers (neko: was a racy map write)
-	connectionHook        func(remote net.Addr, user any, stats func() ConnectionStats, closeConnection func(), done <-chan struct{})
+	connectionHook        func(remote net.Addr, user any, stats func() ConnectionStats, closeConnection func(), done <-chan struct{}) bool
 	udpDisabled           bool
 	udpTimeout            time.Duration
 	handler               ServerHandler
@@ -347,6 +350,7 @@ func (s *Service[U]) handleConnection(connection *quic.Conn) {
 		ctx:        s.ctx,
 		quicConn:   connection,
 		connDone:   make(chan struct{}),
+		ready:      make(chan struct{}),
 		udpConnMap: make(map[uint32]*udpPacketConn),
 	}
 	httpServer := http3.Server{
@@ -429,7 +433,13 @@ type serverSession[U comparable] struct {
 	// a bool and a U written by the auth request's handler and read by the
 	// stream's goroutines without a lock, so a stream could see the bool
 	// and not the user).
-	auth       atomic.Pointer[U]
+	auth atomic.Pointer[U]
+	// ready closes once the authenticated connection is admitted, its
+	// ConnectionHook said yes (neko): before, a second auth request was
+	// answered 233 and a TCP stream dialled while the hook ran, and so for
+	// a connection the hook then refused. Until then the auth requests wait
+	// for it (or for the connection's end), and streams are reset.
+	ready      chan struct{}
 	udpAccess  sync.RWMutex
 	udpConnMap map[uint32]*udpPacketConn
 }
@@ -444,8 +454,24 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			})
 			w.WriteHeader(protocol.StatusAuthOK)
 		}
+		// Answered once admitted, and never for a connection refused
+		// (neko): another auth request of the connection waits for it. A
+		// connection that ends meanwhile (refused, or the first request's
+		// handler gone without admitting it) aborts the request: its stream
+		// is reset, where a handler that returned would have had http3
+		// answer 200 before the connection closed (connDone closes first).
+		answer := func() {
+			select {
+			case <-s.ready:
+				authenticated()
+			case <-s.connDone:
+				panic(http.ErrAbortHandler)
+			case <-s.quicConn.Context().Done():
+				panic(http.ErrAbortHandler)
+			}
+		}
 		if _, ok := s.user(); ok {
-			authenticated()
+			answer()
 			return
 		}
 		request := protocol.AuthRequestFromHeader(r.Header)
@@ -471,9 +497,18 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !s.auth.CompareAndSwap(nil, &user) {
-			authenticated()
+			answer()
 			return
 		}
+		// The winner admits the connection or ends it (neko): a handler
+		// gone without either (a panic) leaves no request waiting.
+		defer func() {
+			select {
+			case <-s.ready:
+			default:
+				s.closeWithError(errClosedByHook)
+			}
+		}()
 		var rxAuto bool
 		var brutal *hyCC.BrutalSender
 		if !(s.receiveBPS == 0 && s.ignoreClientBandwidth) && request.Rx > 0 {
@@ -490,22 +525,28 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			))
 			rxAuto = true
 		}
+		// The hook first, the answer after (neko): a connection the hook
+		// refuses is closed before its client learns the password was good.
+		if s.connectionHook != nil {
+			conn := s.quicConn
+			if !s.connectionHook(conn.RemoteAddr(), user, func() ConnectionStats {
+				st := ConnectionStats{ConnectionStats: conn.ConnectionStats()}
+				if brutal != nil {
+					st.Brutal, st.RateBPS, st.AckRate = true, brutal.BPS(), brutal.AckRate()
+				}
+				return st
+			}, func() { s.closeWithError(errClosedByHook) }, conn.Context().Done()) {
+				s.closeWithError(errClosedByHook)
+				panic(http.ErrAbortHandler) // no default 200 either
+			}
+		}
+		close(s.ready)
 		protocol.AuthResponseToHeader(w.Header(), protocol.AuthResponse{
 			UDPEnabled: !s.udpDisabled,
 			Rx:         s.receiveBPS,
 			RxAuto:     rxAuto,
 		})
 		w.WriteHeader(protocol.StatusAuthOK)
-		if s.connectionHook != nil {
-			conn := s.quicConn
-			s.connectionHook(conn.RemoteAddr(), user, func() ConnectionStats {
-				st := ConnectionStats{ConnectionStats: conn.ConnectionStats()}
-				if brutal != nil {
-					st.Brutal, st.RateBPS, st.AckRate = true, brutal.BPS(), brutal.AckRate()
-				}
-				return st
-			}, func() { s.closeWithError(errClosedByHook) }, conn.Context().Done())
-		}
 		if s.ctx.Done() != nil {
 			go func() {
 				select {
@@ -548,6 +589,15 @@ func (s *serverSession[U]) dispatchStream(frameType http3.FrameType, stream *qui
 	}
 	if frameType != protocol.FrameTypeTCPRequest {
 		return false, nil
+	}
+	// A stream before the connection is admitted (neko): reset, never
+	// dialled. Clients open streams once they have the 233.
+	select {
+	case <-s.ready:
+	default:
+		stream.CancelRead(0)
+		stream.CancelWrite(0)
+		return true, nil
 	}
 	// The caller's admission of a stream before its request (neko): one
 	// refused is reset, as a stream past the connection's limit would be.

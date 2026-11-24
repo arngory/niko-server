@@ -107,6 +107,7 @@ const (
 	refusedLookup  = "lookup"  // name lookups
 	refusedConns   = "conns"   // QUIC connections: one gave way, or the new one was refused (v0.19.3)
 	refusedPending = "pending" // streams waiting for their request (v0.19.3)
+	refusedMemory  = "memory"  // QUIC connections: the node's budget short of their floors (v0.19.3, hymem.go)
 )
 
 var (

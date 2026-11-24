@@ -115,7 +115,7 @@ func startHy2MasqMem(t *testing.T, ctx context.Context, log *Logger, lim *hyLimi
 	go conn.acceptLoop()
 	var direct net.Dialer
 	if mem == nil {
-		mem = newHyMem(hyMemBudget(), log)
+		mem = newHyMemFor(procMemory(), log)
 	}
 	go runHysteriaMem(ctx, c, conn, log, direct.DialContext, lim, mem)
 	fc := &FrontUDP{Listen: []string{"127.0.0.1:0"}, Routes: []UDPRoute{{SNI: []string{"h.example.com"}, Backend: "hy2-masq"}}}
@@ -607,7 +607,10 @@ func TestHy2UsersReloadRace(t *testing.T) {
 			return closed, done, false // refused at the check: a 404
 		}
 		between()
-		connectionHook(u, &sessions{})(remote, user, stats, func() { closed.Store(true) }, done)
+		// A refused connection the service closes (the hook's false).
+		if !connectionHook(u, &sessions{})(remote, user, stats, func() { closed.Store(true) }, done) {
+			closed.Store(true)
+		}
 		return closed, done, true
 	}
 	reload := func(u *hy2Users, table *atomic.Pointer[map[string]*hy2User]) {

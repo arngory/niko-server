@@ -89,6 +89,7 @@ func main() {
 			os.Exit(exitConfig)
 		}
 		log := nikoserver.NewLogger(c.Log.Level, nil)
+		nikoserver.SetMemoryLimit(log, true)
 		watchHUP(log, "the front has no users or keys: change routes with a restart")
 		err = nikoserver.RunFront(ctx, c, log)
 	case *nikoserver.BackendConfig:
@@ -97,6 +98,7 @@ func main() {
 			os.Exit(exitConfig)
 		}
 		log := nikoserver.NewLogger(c.Log.Level, nil)
+		nikoserver.SetMemoryLimit(log, false)
 		watchHUP(log, "the "+c.Kind+" backend has no users: a new key takes a restart")
 		err = nikoserver.RunBackend(ctx, c, log)
 	}

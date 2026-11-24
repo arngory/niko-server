@@ -8,8 +8,6 @@ import (
 	"io"
 	"net"
 	"net/netip"
-	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -398,56 +396,6 @@ func TestYggExitFinWait2(t *testing.T) {
 	}
 	if d := time.Since(start); d < yggFinWait2/4 {
 		t.Fatalf("closed after %v", d)
-	}
-}
-
-// The budget comes from the cgroup's limit, the least up the tree, v2's
-// memory.max or v1's memory.limit_in_bytes, else MemTotal.
-func TestHostMemory(t *testing.T) {
-	dir := t.TempDir()
-	write := func(name, s string) string {
-		p := filepath.Join(dir, name)
-		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(p, []byte(s), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		return p
-	}
-	meminfo := write("meminfo", "MemTotal:        2048000 kB\nMemFree:  1 kB\n")
-	self := write("cgroup", "0::/system.slice/niko.service\n")
-	root := filepath.Join(dir, "fs")
-	if got := hostMemory(self, root, meminfo); got != 2048000<<10 {
-		t.Fatalf("no cgroup files: %d", got)
-	}
-	write("fs/system.slice/niko.service/memory.max", "max\n")
-	write("fs/system.slice/memory.max", "536870912\n")
-	if got := hostMemory(self, root, meminfo); got != 512<<20 {
-		t.Fatalf("a parent's memory.max: %d", got)
-	}
-	// cgroup v1: the memory hierarchy's limit, "unlimited" above MemTotal;
-	// a container's own cgroup mounted as the root.
-	v1 := write("cgroup1", "4:memory:/docker/abc\n3:cpu,cpuacct:/docker/abc\n0::/\n")
-	write("fs/memory/memory.limit_in_bytes", "9223372036854771712\n")
-	if got := hostMemory(v1, root, meminfo); got != 2048000<<10 {
-		t.Fatalf("v1, unlimited: %d", got)
-	}
-	write("fs/memory/memory.limit_in_bytes", "1073741824\n")
-	if got := hostMemory(v1, root, meminfo); got != 1<<30 {
-		t.Fatalf("v1, the container's root: %d", got)
-	}
-	write("fs/memory/docker/abc/memory.limit_in_bytes", "268435456\n")
-	if got := hostMemory(v1, root, meminfo); got != 256<<20 {
-		t.Fatalf("v1, its own cgroup: %d", got)
-	}
-	if got := hostMemory(filepath.Join(dir, "none"), root, filepath.Join(dir, "none")); got != 0 {
-		t.Fatalf("nothing known: %d", got)
-	}
-	for mem, want := range map[int64]int64{0: 64 << 20, 1 << 30: 256 << 20, 64 << 30: 4 << 30} {
-		if got := exitBudgetFor(mem); got != want {
-			t.Fatalf("budget for %d: %d, want %d", mem, got, want)
-		}
 	}
 }
 

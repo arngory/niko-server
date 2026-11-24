@@ -1,21 +1,16 @@
 package nikoserver
 
 import (
-	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
-	"os"
-	"path"
 	"reflect"
-	"slices"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
 
+	"github.com/arngory/niko-server/nikoserver/memlimit"
 	"github.com/sagernet/gvisor/pkg/atomicbitops"
 	"github.com/sagernet/gvisor/pkg/tcpip"
 	"github.com/sagernet/gvisor/pkg/tcpip/transport/tcp"
@@ -31,9 +26,10 @@ import (
 // past a floor taken from the node's budget (yggExitBudget) within its
 // user's share of it, yggExitShares-th. When either is short the exits
 // idle yggExitIdle give back what they grew (giveBack). So gVisor counts
-// the exits' buffers at most at the budget plus their floors, yggExitsMax
+// the exits' buffers at most at the budget plus their floors, yggExitsBound
 // of them at most (the heap under received segments up to twice that,
-// their pool chunks), and a node with few exits open has its windows.
+// their pool chunks), and a node with few exits open has its windows. In a
+// unit with a limit L the budget is L/3 and the floors L/4 at most.
 const (
 	// The send floor is above where gVisor's tuning starts at the mesh's
 	// MTU (10 segments of 1220 bytes, twice); the receive floor is the
@@ -46,61 +42,34 @@ const (
 	yggExitIdle      = time.Second
 )
 
-// yggExitBudget is the default budget: a quarter of the memory the
-// process may have (its cgroup's limit, else the host's MemTotal), within
-// 64 MiB and 4 GiB.
-var yggExitBudget = sync.OnceValue(func() int64 {
-	return exitBudgetFor(hostMemory("/proc/self/cgroup", "/sys/fs/cgroup", "/proc/meminfo"))
-})
+// yggExitBudget is the default budget, of the memory the process may
+// have (procMemory): a third of its cgroup's limit when it has one below
+// the host (memlimit.Limits.Limit), else a quarter of the host's MemTotal
+// as before v0.19.3, within 64 MiB and 4 GiB; 64 MiB when neither is
+// known. With a limit, a third and no less: the exits' floors take up to a
+// quarter more (yggExitsBound), and a unit's limit is honest only if
+// both fit in it.
+var yggExitBudget = sync.OnceValue(func() int64 { return exitBudgetFor(procMemory()) })
 
-func exitBudgetFor(mem int64) int64 { return min(max(mem/4, 64<<20), 4<<30) }
+func exitBudgetFor(l memlimit.Limits) int64 {
+	if n := l.Limit(); n > 0 {
+		return min(n/3, 4<<30)
+	}
+	return min(max(l.MemTotal/4, 64<<20), 4<<30)
+}
 
-// hostMemory is the least of MemTotal and the limits of the cgroup the
-// process is in and of its parents: memory.max in v2 (root), and
-// memory.limit_in_bytes in v1's memory hierarchy (root/memory), whose
-// "unlimited" is above any MemTotal. 0 when none is known. A container's
-// own cgroup mounted as the hierarchy's root is read there, its path
-// from /proc/self/cgroup not found under the mount.
-func hostMemory(self, root, meminfo string) int64 {
-	var mem int64
-	least := func(n int64) {
-		if n > 0 && (mem == 0 || n < mem) {
-			mem = n
-		}
+// yggExitsBound is the most exits open at once, so that their floors
+// (yggExitSendFloor + yggExitRecvFloor, 96 KiB an exit) take at most a
+// quarter of the process's memory, its cgroup's limit or else MemTotal;
+// yggExitsMax at most, and yggExitsMax when neither is known.
+var yggExitsBound = sync.OnceValue(func() int { return exitsFor(procMemory()) })
+
+func exitsFor(l memlimit.Limits) int {
+	mem := l.Memory()
+	if mem <= 0 {
+		return yggExitsMax
 	}
-	limits := func(dir, mount, file string) {
-		for dir = path.Clean("/" + dir); ; dir = path.Dir(dir) {
-			if b, err := os.ReadFile(path.Join(mount, dir, file)); err == nil {
-				n, _ := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64) // "max": 0
-				least(n)
-			}
-			if dir == "/" {
-				return
-			}
-		}
-	}
-	if b, err := os.ReadFile(self); err == nil {
-		for line := range strings.SplitSeq(string(b), "\n") {
-			f := strings.SplitN(line, ":", 3)
-			switch {
-			case len(f) < 3:
-			case f[0] == "0" && f[1] == "":
-				limits(f[2], root, "memory.max")
-			case slices.Contains(strings.Split(f[1], ","), "memory"):
-				limits(f[2], path.Join(root, "memory"), "memory.limit_in_bytes")
-			}
-		}
-	}
-	if f, err := os.Open(meminfo); err == nil {
-		defer f.Close()
-		for s := bufio.NewScanner(f); s.Scan(); {
-			if v, ok := strings.CutPrefix(s.Text(), "MemTotal:"); ok {
-				kb, _ := strconv.ParseInt(strings.TrimSuffix(strings.TrimSpace(v), " kB"), 10, 64)
-				least(kb << 10)
-			}
-		}
-	}
-	return mem
+	return int(max(min(mem/4/(yggExitSendFloor+yggExitRecvFloor), yggExitsMax), 1))
 }
 
 // grow gives e up to want more bytes of buffer, as much as the budget and
