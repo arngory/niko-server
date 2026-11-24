@@ -32,12 +32,15 @@ type Paths struct {
 var System = Paths{Cgroup: "/proc/self/cgroup", Mountinfo: "/proc/self/mountinfo", Root: "/sys/fs/cgroup", Meminfo: "/proc/meminfo"}
 
 // mount is a cgroup hierarchy's mount: where (point), and which of its
-// cgroups is mounted there (root, "/" for the hierarchy's own root).
+// cgroups is mounted there (root, "/" for the hierarchy's own root). Of
+// several mounts of a hierarchy (bind mounts of its cgroups) Read takes
+// the one whose root is the longest prefix of the process's cgroup.
 type mount struct{ point, root string }
 
 // mounts reads where cgroup v2 and v1's memory controller are mounted,
-// from mountinfo; the first of each.
-func mounts(mountinfo string) (v2, v1 *mount) {
+// from mountinfo: all of each, but those whose root is outside the
+// process's cgroup namespace ("..").
+func mounts(mountinfo string) (v2, v1 []mount) {
 	b, err := os.ReadFile(mountinfo)
 	if err != nil {
 		return nil, nil
@@ -49,15 +52,42 @@ func mounts(mountinfo string) (v2, v1 *mount) {
 		if !ok || len(f) < 5 || len(r) < 1 {
 			continue
 		}
-		m := &mount{point: unescape(f[4]), root: path.Clean("/" + unescape(f[3]))}
+		root := unescape(f[3])
+		if slices.Contains(strings.Split(root, "/"), "..") {
+			continue
+		}
+		m := mount{point: unescape(f[4]), root: path.Clean("/" + root)}
 		switch {
-		case r[0] == "cgroup2" && v2 == nil:
-			v2 = m
-		case r[0] == "cgroup" && v1 == nil && len(r) >= 3 && slices.Contains(strings.Split(r[2], ","), "memory"):
-			v1 = m
+		case r[0] == "cgroup2":
+			v2 = append(v2, m)
+		case r[0] == "cgroup" && len(r) >= 3 && slices.Contains(strings.Split(r[2], ","), "memory"):
+			v1 = append(v1, m)
 		}
 	}
 	return v2, v1
+}
+
+// pick is the mount of ms for the cgroup dir: the one whose root is the
+// longest prefix of dir, else the first (dir not under any: read from its
+// root up), else none.
+func pick(ms []mount, dir, fallback string) mount {
+	dir = path.Clean("/" + dir)
+	best := -1
+	for i, m := range ms {
+		if m.root != "/" && dir != m.root && !strings.HasPrefix(dir, m.root+"/") {
+			continue
+		}
+		if best < 0 || len(m.root) > len(ms[best].root) {
+			best = i
+		}
+	}
+	switch {
+	case best >= 0:
+		return ms[best]
+	case len(ms) > 0:
+		return ms[0]
+	}
+	return mount{point: fallback, root: "/"}
 }
 
 // unescape undoes mountinfo's octal escapes (\040 a space).
@@ -131,23 +161,19 @@ func Read(p Paths) Limits {
 			}
 		}
 	}
-	v2, v1 := mounts(p.Mountinfo)
-	if v2 == nil {
-		v2 = &mount{point: p.Root, root: "/"}
-	}
-	if v1 == nil {
-		v1 = &mount{point: path.Join(p.Root, "memory"), root: "/"}
-	}
+	v2s, v1s := mounts(p.Mountinfo)
 	if b, err := os.ReadFile(p.Cgroup); err == nil {
 		for line := range strings.SplitSeq(string(b), "\n") {
 			f := strings.SplitN(line, ":", 3)
 			switch {
 			case len(f) < 3:
 			case f[0] == "0" && f[1] == "":
-				limits(under(f[2], v2.root), v2.point, "memory.max", &l.Max)
-				limits(under(f[2], v2.root), v2.point, "memory.high", &l.High)
+				m := pick(v2s, f[2], p.Root)
+				limits(under(f[2], m.root), m.point, "memory.max", &l.Max)
+				limits(under(f[2], m.root), m.point, "memory.high", &l.High)
 			case slices.Contains(strings.Split(f[1], ","), "memory"):
-				limits(under(f[2], v1.root), v1.point, "memory.limit_in_bytes", &l.Max)
+				m := pick(v1s, f[2], path.Join(p.Root, "memory"))
+				limits(under(f[2], m.root), m.point, "memory.limit_in_bytes", &l.Max)
 			}
 		}
 	}

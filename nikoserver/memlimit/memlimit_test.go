@@ -137,6 +137,18 @@ func TestReadMountinfo(t *testing.T) {
 	tr.write("fs/memory/lxc/c1/memory.limit_in_bytes", "1\n") // not the mount: unread
 	tr.write("fs/lxc/c1/app/memory.max", "1\n")
 	check(t, "mountinfo", p, Limits{Max: 256 * mib, High: 192 * mib, MemTotal: 4 << 30})
+	// Several mounts of v2: the one whose root is the longest prefix of
+	// the cgroup's path; one outside the namespace ("..") skipped.
+	other := tr.path("v2 other")
+	tr.write("mountinfo", "37 36 0:29 / "+strings.ReplaceAll(v1, " ", "\\040")+" rw - cgroup cgroup rw,cpu,memory\n"+
+		"38 36 0:30 / "+strings.ReplaceAll(other, " ", "\\040")+" rw - cgroup2 cgroup2 rw\n"+
+		"39 36 0:30 /../.. "+tr.path("v2 outside")+" rw - cgroup2 cgroup2 rw\n"+
+		"40 36 0:30 /lxc/c1 "+v2+" rw - cgroup2 cgroup2 rw\n"+
+		"41 36 0:30 /lxc/c2 "+tr.path("v2 c2")+" rw - cgroup2 cgroup2 rw\n")
+	tr.write("v2 other/memory.max", "1\n")
+	tr.write("v2 outside/memory.max", "2\n")
+	tr.write("v2 c2/memory.max", "3\n")
+	check(t, "longest prefix", p, Limits{Max: 256 * mib, High: 192 * mib, MemTotal: 4 << 30}) // not 1, 2 or 3
 	// Without mountinfo, Root's and Root/memory.
 	p.Mountinfo = tr.path("none")
 	check(t, "no mountinfo", p, Limits{Max: 1, MemTotal: 4 << 30})
