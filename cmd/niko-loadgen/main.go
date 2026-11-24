@@ -231,6 +231,9 @@ func start(role, config, pprof, cgroup string, v2, scope bool, name string) *pro
 	args := []string{"taskset", "-c", *flagCPUs, *flagSrv, role, "-c", config}
 	switch {
 	case scope:
+		// A failed scope of the name left by a run killed outright (a pid
+		// used again) would keep systemd-run from making it.
+		systemctl("reset-failed", name+".scope")
 		args = systemdScope(name, *flagCgroup, args...)
 	case cgroup != "":
 		args = startIn(cgroup, args...)
@@ -249,7 +252,7 @@ func start(role, config, pprof, cgroup string, v2, scope bool, name string) *pro
 	atExit(p.stop)
 	if scope {
 		p.scope = name + ".scope"
-		p.cgroup, p.cgroupV2 = scopeCgroup(cmd.Process.Pid, p.scope, 3*time.Second)
+		p.cgroup, p.cgroupV2 = scopeCgroup(cmd.Process.Pid, p.scope, 3*time.Second, p.alive)
 		if p.cgroup == "" {
 			fmt.Fprintf(os.Stderr, "niko-loadgen: %s's cgroup not found: oom_kill unknown\n", p.scope)
 		}
@@ -258,9 +261,10 @@ func start(role, config, pprof, cgroup string, v2, scope bool, name string) *pro
 }
 
 // scopeCgroup waits within d for pid to be in the scope unit (systemd-run
-// moves itself there before it execs), and is its memory cgroup then.
-func scopeCgroup(pid int, unit string, d time.Duration) (dir string, v2 bool) {
-	for deadline := time.Now().Add(d); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+// moves itself there before it execs), and is its memory cgroup then;
+// nothing once the process is gone (alive).
+func scopeCgroup(pid int, unit string, d time.Duration, alive func() bool) (dir string, v2 bool) {
+	for deadline := time.Now().Add(d); time.Now().Before(deadline) && alive(); time.Sleep(20 * time.Millisecond) {
 		b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cgroup")
 		if err != nil {
 			return "", false
@@ -292,9 +296,9 @@ func (p *proc) stopNow() {
 		}
 	}
 	if p.scope != "" {
-		out, _ := exec.Command("systemctl", "show", "-p", "Result", "--value", p.scope).Output()
+		out := systemctl("show", "-p", "Result", "--value", p.scope)
 		fmt.Printf("%s scope %s: result %s\n", p.role, p.scope, strings.TrimSpace(string(out))) // oom-kill: killed
-		exec.Command("systemctl", "reset-failed", p.scope).Run()
+		systemctl("reset-failed", p.scope)
 	} else if p.cgroup != "" {
 		if err := os.Remove(p.cgroup); err != nil {
 			fmt.Fprintln(os.Stderr, "niko-loadgen: cgroup:", err)
