@@ -31,6 +31,15 @@ type QUICOptions struct {
 	// go on, and the idle timeout still ends a connection nobody keeps
 	// alive. niko-server's tests use it for a client that falls silent.
 	DisableKeepAlive bool
+	// neko: InitialStreamReceiveWindow and InitialConnectionReceiveWindow,
+	// when set, are where the receive windows start; StreamReceiveWindow
+	// and ConnectionReceiveWindow (or the protocol's own) are then only
+	// how far quic-go's tuning may grow them, as the application reads.
+	// AllowConnectionWindowIncrease is quic-go's: asked before each growth
+	// of a connection's window (a stream's grows the connection's too).
+	InitialStreamReceiveWindow     uint64
+	InitialConnectionReceiveWindow uint64
+	AllowConnectionWindowIncrease  func(conn *quic.Conn, delta uint64) bool
 }
 
 type Config interface {
@@ -84,6 +93,22 @@ func ApplyQUICOptions(quicConfig *quic.Config, options QUICOptions) {
 	}
 	if options.DisablePathMTUDiscovery {
 		quicConfig.DisablePathMTUDiscovery = true
+	}
+	// An initial window above its maximum is the maximum.
+	if w := options.InitialStreamReceiveWindow; w != 0 {
+		if m := quicConfig.MaxStreamReceiveWindow; m != 0 {
+			w = min(w, m)
+		}
+		quicConfig.InitialStreamReceiveWindow = w
+	}
+	if w := options.InitialConnectionReceiveWindow; w != 0 {
+		if m := quicConfig.MaxConnectionReceiveWindow; m != 0 {
+			w = min(w, m)
+		}
+		quicConfig.InitialConnectionReceiveWindow = w
+	}
+	if options.AllowConnectionWindowIncrease != nil {
+		quicConfig.AllowConnectionWindowIncrease = options.AllowConnectionWindowIncrease
 	}
 }
 

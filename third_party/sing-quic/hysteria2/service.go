@@ -2,6 +2,7 @@ package hysteria2
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/sagernet/quic-go"
+	"github.com/sagernet/quic-go/congestion"
 	"github.com/sagernet/quic-go/http3"
 	"github.com/sagernet/quic-go/quicvarint"
 	qtls "github.com/sagernet/sing-quic"
@@ -84,6 +86,31 @@ type ServiceOptions struct {
 	// ObfsConnFilter (neko), if set, wraps the packet socket under the
 	// obfuscation, where the QUIC packets are plain.
 	ObfsConnFilter func(net.PacketConn) net.PacketConn
+	// AuthCurve (neko), if set, is the key exchange a connection's TLS must
+	// have taken for its password to be checked: on any other the auth
+	// request gets the masquerade, as a wrong password does. The handshake
+	// may then take groups the users' clients never offer (a site's), and
+	// what the users send stays under this one.
+	AuthCurve tls.CurveID
+	// WrapCongestionControl (neko), if set, takes an authenticated
+	// connection's congestion controller (Brutal, or BBR when the client
+	// gives no rate) with the user, and gives the one the connection gets.
+	WrapCongestionControl func(conn *quic.Conn, user any, cc congestion.CongestionControl) congestion.CongestionControl
+	// StreamStart (neko), if set, is asked for each stream of an
+	// authenticated connection before its TCP request is read: false resets
+	// the stream at once; true with done, which the service calls once the
+	// request is read (or failed), as the handler is called. RequestWait
+	// (neko), if set, bounds the wait for the request.
+	StreamStart func(user any) (done func(), ok bool)
+	RequestWait time.Duration
+	// PendingStreams (neko), if set, is how many streams of a connection,
+	// authenticated or not, are read at once before they are known: until
+	// their first frame type, and an HTTP request (the auth request, the
+	// masquerade's) until its handler returns; the next ones wait to be
+	// accepted. Each then waits RequestWait at most for its bytes, or is
+	// reset. Without it (upstream) every stream gets a goroutine at once,
+	// which waits as long as its client sends nothing.
+	PendingStreams int
 }
 
 // errClosedByHook is how a connection ends when its ConnectionHook closes it
@@ -130,6 +157,11 @@ type Service[U comparable] struct {
 	connIDGenerator       quic.ConnectionIDGenerator
 	statelessResetKey     *quic.StatelessResetKey
 	obfsConnFilter        func(net.PacketConn) net.PacketConn
+	authCurve             tls.CurveID
+	wrapCongestionControl func(conn *quic.Conn, user any, cc congestion.CongestionControl) congestion.CongestionControl
+	streamStart           func(user any) (done func(), ok bool)
+	requestWait           time.Duration
+	pendingStreams        int
 }
 
 func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
@@ -202,6 +234,11 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		connIDGenerator:       options.ConnectionIDGenerator,
 		statelessResetKey:     options.StatelessResetKey,
 		obfsConnFilter:        options.ObfsConnFilter,
+		authCurve:             options.AuthCurve,
+		wrapCongestionControl: options.WrapCongestionControl,
+		streamStart:           options.StreamStart,
+		requestWait:           options.RequestWait,
+		pendingStreams:        options.PendingStreams,
 	}
 	service.users.Store(&map[string]U{})
 	return service, nil
@@ -316,57 +353,138 @@ func (s *Service[U]) handleConnection(connection *quic.Conn) {
 		Handler:          session,
 		StreamDispatcher: session.dispatchStream,
 	}
-	_ = httpServer.ServeQUICConn(connection)
+	if s.pendingStreams > 0 {
+		_ = session.serveStreams(&httpServer)
+	} else {
+		_ = httpServer.ServeQUICConn(connection)
+	}
 	_ = connection.CloseWithError(0, "")
+}
+
+// serveStreams is http3.Server.ServeQUICConn with the streams read before
+// they are known bounded (neko, PendingStreams): pendingStreams at once,
+// each for requestWait at most. Graceful shutdown is not needed here: the
+// service closes its connections whole.
+func (s *serverSession[U]) serveStreams(srv *http3.Server) error {
+	conn := s.quicConn
+	hconn, err := srv.NewRawServerConn(conn)
+	if err != nil {
+		return err
+	}
+	go func() {
+		for {
+			str, err := conn.AcceptUniStream(conn.Context())
+			if err != nil {
+				return
+			}
+			go hconn.HandleUnidirectionalStream(str)
+		}
+	}()
+	places := make(chan struct{}, s.pendingStreams)
+	for {
+		str, err := conn.AcceptStream(conn.Context())
+		if err != nil {
+			return err
+		}
+		select {
+		case places <- struct{}{}:
+		case <-conn.Context().Done():
+			return conn.Context().Err()
+		}
+		go func() {
+			defer func() { <-places }()
+			if s.requestWait > 0 {
+				_ = str.SetReadDeadline(time.Now().Add(s.requestWait))
+			}
+			frameType, err := quicvarint.Peek(str)
+			if err != nil {
+				str.CancelRead(quic.StreamErrorCode(http3.ErrCodeRequestIncomplete))
+				str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestIncomplete))
+				return
+			}
+			handled, err := s.dispatchStream(http3.FrameType(frameType), str, nil)
+			if err != nil {
+				str.CancelRead(quic.StreamErrorCode(http3.ErrCodeRequestIncomplete))
+				str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestIncomplete))
+				return
+			}
+			if !handled {
+				// An HTTP request: its header and its handler within the
+				// same wait (the auth request has no body, the masquerade
+				// reads none).
+				hconn.HandleRequestStream(str)
+			}
+		}()
+	}
 }
 
 type serverSession[U comparable] struct {
 	*Service[U]
-	ctx           context.Context
-	quicConn      *quic.Conn
-	connAccess    sync.Mutex
-	connDone      chan struct{}
-	connErr       error
-	authenticated bool
-	authUser      U
-	udpAccess     sync.RWMutex
-	udpConnMap    map[uint32]*udpPacketConn
+	ctx        context.Context
+	quicConn   *quic.Conn
+	connAccess sync.Mutex
+	connDone   chan struct{}
+	connErr    error
+	// auth is the user the connection authenticated as, nil before (neko:
+	// a bool and a U written by the auth request's handler and read by the
+	// stream's goroutines without a lock, so a stream could see the bool
+	// and not the user).
+	auth       atomic.Pointer[U]
+	udpAccess  sync.RWMutex
+	udpConnMap map[uint32]*udpPacketConn
 }
 
 func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost && r.Host == protocol.URLHost && r.URL.Path == protocol.URLPath {
-		if s.authenticated {
+		authenticated := func() {
 			protocol.AuthResponseToHeader(w.Header(), protocol.AuthResponse{
 				UDPEnabled: !s.udpDisabled,
 				Rx:         s.receiveBPS,
 				RxAuto:     s.receiveBPS == 0 && s.ignoreClientBandwidth,
 			})
 			w.WriteHeader(protocol.StatusAuthOK)
+		}
+		if _, ok := s.user(); ok {
+			authenticated()
 			return
 		}
 		request := protocol.AuthRequestFromHeader(r.Header)
 		user, loaded := (*s.users.Load())[request.Auth]
+		if loaded && s.authCurve != 0 && s.quicConn.ConnectionState().TLS.CurveID != s.authCurve {
+			// Not the key exchange the users' traffic must have (neko):
+			// a stranger's, whatever the password.
+			loaded = false
+		}
 		if !loaded {
 			s.masqueradeHandler.ServeHTTP(w, r)
 			return
 		}
-		s.authUser = user
-		s.authenticated = true
-		var rxAuto bool
-		var brutal *hyCC.BrutalSender
+		// One auth request of a connection's makes it its user's (neko): of
+		// two at once, the second is answered as authenticated already, and
+		// the connection's controller, hook and datagram loop are set once.
+		// Before, both went on, and the hook admitted the connection twice.
+		// A request the server answers with the masquerade is no auth: it
+		// leaves the connection unauthenticated (neko), before the swap.
 		if s.receiveBPS > 0 && s.ignoreClientBandwidth && request.Rx == 0 {
 			s.logger.Debug("process connection from ", r.RemoteAddr, ": BBR disabled by server")
 			s.masqueradeHandler.ServeHTTP(w, r)
 			return
-		} else if !(s.receiveBPS == 0 && s.ignoreClientBandwidth) && request.Rx > 0 {
+		}
+		if !s.auth.CompareAndSwap(nil, &user) {
+			authenticated()
+			return
+		}
+		var rxAuto bool
+		var brutal *hyCC.BrutalSender
+		if !(s.receiveBPS == 0 && s.ignoreClientBandwidth) && request.Rx > 0 {
 			rx := request.Rx
 			if s.sendBPS > 0 && rx > s.sendBPS {
 				rx = s.sendBPS
 			}
 			brutal = hyCC.NewBrutalSender(rx, s.quicConn.InitialPacketSize(), s.brutalDebug, s.logger)
-			s.quicConn.SetCongestionControl(brutal)
+			s.setCongestionControl(user, brutal)
 		} else {
-			s.quicConn.SetCongestionControl(congestion_meta2.NewBbrSenderWithProfile(
+			s.setCongestionControl(user, congestion_meta2.NewBbrSenderWithProfile(
 				s.quicConn.InitialPacketSize(),
 				s.bbrProfile,
 			))
@@ -405,20 +523,57 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// user is whom the connection authenticated as, if it did.
+func (s *serverSession[U]) user() (U, bool) {
+	if p := s.auth.Load(); p != nil {
+		return *p, true
+	}
+	var none U
+	return none, false
+}
+
+// setCongestionControl gives the connection cc, through the caller's wrap
+// if it has one (neko).
+func (s *serverSession[U]) setCongestionControl(user U, cc congestion.CongestionControl) {
+	if s.wrapCongestionControl != nil {
+		cc = s.wrapCongestionControl(s.quicConn, user, cc)
+	}
+	s.quicConn.SetCongestionControl(cc)
+}
+
 func (s *serverSession[U]) dispatchStream(frameType http3.FrameType, stream *quic.Stream, err error) (bool, error) {
-	if !s.authenticated || err != nil {
+	user, authenticated := s.user()
+	if !authenticated || err != nil {
 		return false, nil
 	}
 	if frameType != protocol.FrameTypeTCPRequest {
 		return false, nil
 	}
+	// The caller's admission of a stream before its request (neko): one
+	// refused is reset, as a stream past the connection's limit would be.
+	var started func()
+	if s.streamStart != nil {
+		done, ok := s.streamStart(user)
+		if !ok {
+			stream.CancelRead(0)
+			stream.CancelWrite(0)
+			return true, nil
+		}
+		started = done
+	}
+	if s.requestWait > 0 {
+		_ = stream.SetReadDeadline(time.Now().Add(s.requestWait))
+	}
 	_, err = quicvarint.Read(quicvarint.NewReader(stream))
 	if err != nil {
+		if started != nil {
+			started()
+		}
 		s.logger.Error(E.Cause(err, "seek frame type"))
 		return true, nil
 	}
 	go func() {
-		hErr := s.handleStream(stream)
+		hErr := s.handleStream(stream, user, started)
 		if hErr != nil {
 			stream.CancelRead(0)
 			stream.Close()
@@ -428,8 +583,14 @@ func (s *serverSession[U]) dispatchStream(frameType http3.FrameType, stream *qui
 	return true, nil
 }
 
-func (s *serverSession[U]) handleStream(stream *quic.Stream) error {
+func (s *serverSession[U]) handleStream(stream *quic.Stream, user U, started func()) error {
 	destinationString, err := protocol.ReadTCPRequest(stream)
+	if started != nil {
+		started()
+	}
+	if s.requestWait > 0 {
+		_ = stream.SetReadDeadline(time.Time{})
+	}
 	if err != nil {
 		return E.New("read TCP request")
 	}
@@ -437,7 +598,7 @@ func (s *serverSession[U]) handleStream(stream *quic.Stream) error {
 	if len(destination.Fqdn) > 255 {
 		return E.New("fqdn too long")
 	}
-	s.handler.NewConnectionEx(auth.ContextWithUser(s.ctx, s.authUser), &serverConn{Stream: stream}, M.SocksaddrFromNet(s.quicConn.RemoteAddr()).Unwrap(), destination, nil)
+	s.handler.NewConnectionEx(auth.ContextWithUser(s.ctx, user), &serverConn{Stream: stream}, M.SocksaddrFromNet(s.quicConn.RemoteAddr()).Unwrap(), destination, nil)
 	return nil
 }
 

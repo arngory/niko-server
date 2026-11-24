@@ -81,6 +81,13 @@ func startHy2Masq(t *testing.T, ctx context.Context, log *Logger, pairs ...strin
 // numbers) and changes to its config before it starts.
 func startHy2MasqWith(t *testing.T, ctx context.Context, log *Logger, lim *hyLimits, change func(*BackendConfig), pairs ...string) *hy2Node {
 	t.Helper()
+	return startHy2MasqMem(t, ctx, log, lim, nil, change, pairs...)
+}
+
+// startHy2MasqMem is startHy2MasqWith with the budget of the connections'
+// windows and flight (nil: the default).
+func startHy2MasqMem(t *testing.T, ctx context.Context, log *Logger, lim *hyLimits, mem *hyMem, change func(*BackendConfig), pairs ...string) *hy2Node {
+	t.Helper()
 	dir := t.TempDir()
 	uid := os.Getuid()
 	cert := selfSigned(t, "h.example.com")
@@ -107,7 +114,10 @@ func startHy2MasqWith(t *testing.T, ctx context.Context, log *Logger, lim *hyLim
 	conn.port = 443
 	go conn.acceptLoop()
 	var direct net.Dialer
-	go runHysteriaWith(ctx, c, conn, log, direct.DialContext, lim)
+	if mem == nil {
+		mem = newHyMem(hyMemBudget(), log)
+	}
+	go runHysteriaMem(ctx, c, conn, log, direct.DialContext, lim, mem)
 	fc := &FrontUDP{Listen: []string{"127.0.0.1:0"}, Routes: []UDPRoute{{SNI: []string{"h.example.com"}, Backend: "hy2-masq"}}}
 	front, err := newUDPFront(fc, map[string]BackendRef{"hy2-masq": {Socket: sock, Mode: "packet", UID: uid}}, log)
 	if err != nil {

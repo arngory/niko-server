@@ -54,7 +54,8 @@ func (s *serverSession[U]) handleUDPMessage(message *udpMessage) {
 // datagram made a third, and the second ran on unseen until its idle time.
 func (s *serverSession[U]) newUDPConn(sessionID uint32) *udpPacketConn {
 	var udpConn *udpPacketConn
-	udpConn = newUDPPacketConn(auth.ContextWithUser(s.ctx, s.authUser), s.quicConn, func() {
+	user, _ := s.user() // loopMessages runs once the connection authenticated
+	udpConn = newUDPPacketConn(auth.ContextWithUser(s.ctx, user), s.quicConn, func() {
 		s.udpAccess.Lock()
 		if s.udpConnMap[sessionID] == udpConn {
 			delete(s.udpConnMap, sessionID)

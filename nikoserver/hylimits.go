@@ -50,6 +50,14 @@ type hyLimitNumbers struct {
 	pairs int
 	// Name lookups (misses of the process's cache), TCP and UDP together.
 	lookupRate, lookupBurst float64
+	// QUIC connections at once (hy2Users.admit) and streams waiting for
+	// their TCP request (streamStart), all the user's connections together.
+	conns, pending int
+	// The backend's times of v0.19.3, here so that a test's are set before
+	// the backend's goroutines read them: a stream's wait for its request
+	// (hy2RequestWait), the users watch's period (usersLookEvery), and how
+	// long a connection of the user's unheard gives way (hy2UnheardAfter).
+	requestWait, lookEvery, unheard time.Duration
 }
 
 var hyLimitDefaults = hyLimitNumbers{
@@ -59,6 +67,8 @@ var hyLimitDefaults = hyLimitNumbers{
 	destRate: 100, destBurst: 200,
 	pairs:      1024,
 	lookupRate: 20, lookupBurst: 100,
+	conns: hy2ConnsPerUser, pending: hy2PendingPerUser,
+	requestWait: hy2RequestWait, lookEvery: usersLookEvery, unheard: hy2UnheardAfter,
 }
 
 const (
@@ -95,6 +105,8 @@ const (
 	refusedDest    = "dest"    // new UDP destinations
 	refusedLive    = "live"    // UDP pairs
 	refusedLookup  = "lookup"  // name lookups
+	refusedConns   = "conns"   // QUIC connections: one gave way, or the new one was refused (v0.19.3)
+	refusedPending = "pending" // streams waiting for their request (v0.19.3)
 )
 
 var (
@@ -145,6 +157,7 @@ func newHyLimits() *hyLimits { return &hyLimits{n: hyLimitDefaults} }
 
 type limUser struct {
 	tcp      int
+	pending  int // streams waiting for their request (streamStart)
 	sessions int // UDP sessions holding a place
 	// slots are the UDP sessions not ended yet: those holding a place, and
 	// those that gave way and are ending (their pairs still count).
@@ -244,7 +257,7 @@ func (l *hyLimits) sweepLocked(now time.Time) {
 				delete(u.refusedIDs, id)
 			}
 		}
-		if u.tcp == 0 && u.pairs == 0 && len(u.slots) == 0 && len(u.refusedIDs) == 0 &&
+		if u.tcp == 0 && u.pending == 0 && u.pairs == 0 && len(u.slots) == 0 && len(u.refusedIDs) == 0 &&
 			u.attempts.full(now, l.n.tcpRate, l.n.tcpBurst) && u.failed.full(now, l.n.failRate, l.n.failBurst) &&
 			u.dests.full(now, l.n.destRate, l.n.destBurst) && u.lookups.full(now, l.n.lookupRate, l.n.lookupBurst) {
 			delete(l.users, k)
@@ -765,4 +778,45 @@ func (b *bucket) take(now time.Time, rate, burst float64) bool {
 // charge takes a token in debt: down to -debt.
 func (b *bucket) charge(now time.Time, rate, burst, debt float64) {
 	b.tokens = max(-debt, b.level(now, rate, burst)-1)
+}
+
+// hy2PendingPerUser bounds a user's streams that wait for their TCP
+// request, all its connections together; hy2RequestWait bounds each wait.
+// Before v0.19.3 a stream opened and left without its request held a
+// goroutine and its stream until the connection ended, up to 2048 a
+// connection (hy2MaxStreams). The user's TCP at once (1024) count from the
+// request on.
+const hy2PendingPerUser = 1024
+
+const hy2RequestWait = 10 * time.Second
+
+// streamStart is the service's StreamStart: a place among the user's
+// streams waiting for their request, given back by done once it is read;
+// false at the limit (counted, pending). With the limits off, or without a
+// user, all pass.
+func (l *hyLimits) streamStart(user any) (done func(), ok bool) {
+	name := ""
+	if u, _ := user.(*hy2User); u != nil {
+		name = baseName(u.name)
+	}
+	if !l.limited(name) {
+		return func() {}, true
+	}
+	l.mu.Lock()
+	u := l.userLocked(name, l.clock())
+	if u.pending >= max(1, l.n.pending) {
+		l.refuseLocked(name, refusedPending)
+		l.mu.Unlock()
+		return nil, false
+	}
+	u.pending++
+	l.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			l.mu.Lock()
+			u.pending--
+			l.mu.Unlock()
+		})
+	}, true
 }
