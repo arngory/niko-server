@@ -674,9 +674,9 @@ func TestYggExitCount(t *testing.T) {
 	if !take(who("u5", 9)) {
 		t.Fatal("a place freed, yet refused")
 	}
-	for i := 0; c.total < yggExitsMax; i++ {
+	for i := 0; c.total < c.max; i++ {
 		if !take(who(fmt.Sprintf("u%d", 100+i/yggExitsPerUser), i%7)) {
-			t.Fatalf("exit %d of %d refused", c.total, yggExitsMax)
+			t.Fatalf("exit %d of %d refused", c.total, c.max)
 		}
 	}
 	if take(who("u7", 0)) {

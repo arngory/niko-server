@@ -607,7 +607,7 @@ func TestHy2UsersReloadRace(t *testing.T) {
 			return closed, done, false // refused at the check: a 404
 		}
 		between()
-		connectionHook(u, &sessions{})(remote, user, stats, func() { closed.Store(true) }, done)
+		connectionHook(u, &sessions{}, nil)(remote, user, stats, func() { closed.Store(true) }, done)
 		return closed, done, true
 	}
 	reload := func(u *hy2Users, table *atomic.Pointer[map[string]*hy2User]) {

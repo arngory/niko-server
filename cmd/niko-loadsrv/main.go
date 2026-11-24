@@ -47,9 +47,13 @@ func main() {
 	defer stop()
 	switch c := config.(type) {
 	case *nikoserver.FrontConfig:
-		err = nikoserver.RunFront(ctx, c, nikoserver.NewLogger(c.Log.Level, nil))
+		log := nikoserver.NewLogger(c.Log.Level, nil)
+		nikoserver.SetMemoryLimit(log, true) // as niko-server's
+		err = nikoserver.RunFront(ctx, c, log)
 	case *nikoserver.BackendConfig:
-		err = nikoserver.RunBackend(ctx, c, nikoserver.NewLogger(c.Log.Level, nil))
+		log := nikoserver.NewLogger(c.Log.Level, nil)
+		nikoserver.SetMemoryLimit(log, false)
+		err = nikoserver.RunBackend(ctx, c, log)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "niko-loadsrv:", err)

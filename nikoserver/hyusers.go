@@ -345,12 +345,22 @@ func (u *hy2Users) leave(user *hy2User, c *hy2Conn) {
 	u.dropLocked(user, c)
 }
 
-// connectionHook is the service's ConnectionHook: a connection is admitted
-// (or closed at once, its user revoked between its password check and
-// now) and counted in its address's stats until it ends.
-func connectionHook(users *hy2Users, live *sessions) func(net.Addr, any, func() hysteria2.ConnectionStats, func(), <-chan struct{}) {
+// connectionHook is the service's ConnectionHook: a connection takes its
+// floor from mem's budget (hyMem.takeFloor; none taken with mem nil, the
+// tests'), is admitted (or closed at once: the budget short, counted as
+// memory whatever conn_limit says, or its user revoked between its
+// password check and now) and counted in its address's stats until it
+// ends.
+func connectionHook(users *hy2Users, live *sessions, mem *hyMem) func(net.Addr, any, func() hysteria2.ConnectionStats, func(), <-chan struct{}) {
 	return func(remote net.Addr, user any, stats func() hysteria2.ConnectionStats, closeConnection func(), done <-chan struct{}) {
 		u, _ := user.(*hy2User)
+		if u != nil && mem != nil && !mem.takeFloor(done) {
+			if users.limits != nil {
+				users.limits.refuse(baseName(u.name), refusedMemory)
+			}
+			closeConnection()
+			return
+		}
 		c := &hy2Conn{close: closeConnection, packets: func() uint64 { return stats().PacketsReceived }}
 		if !users.admit(u, c) {
 			closeConnection()

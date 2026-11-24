@@ -270,7 +270,7 @@ func runHysteriaMem(ctx context.Context, c *BackendConfig, conn *packetConn, log
 		PathValidation:    true,
 		StatelessResetKey: resetKey,
 		ObfsConnFilter:    obfsFilter,
-		ConnectionHook:    connectionHook(users, &live),
+		ConnectionHook:    connectionHook(users, &live, mem),
 		AuthCurve:         authCurve,
 		// The flight of an authenticated connection within the budget
 		// (hymem.go), and a user's streams waiting for their request

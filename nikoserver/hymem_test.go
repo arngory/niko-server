@@ -314,13 +314,13 @@ func waitReleased(t *testing.T, m *hyMem) {
 	for {
 		grown, by, conns := m.state()
 		m.mu.Lock()
-		recv, recvBy := m.recvAll, len(m.recvBy)
+		recv, recvBy, floors := m.recvAll, len(m.recvBy), m.floors
 		m.mu.Unlock()
-		if grown == 0 && len(by) == 0 && conns == 0 && recv == 0 && recvBy == 0 {
+		if grown == 0 && len(by) == 0 && conns == 0 && recv == 0 && recvBy == 0 && floors == 0 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("after the connections: %d taken, %v by user, %d connections, %d of windows", grown, by, conns, recv)
+			t.Fatalf("after the connections: %d taken, %v by user, %d connections, %d of windows, %d of floors", grown, by, conns, recv, floors)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
