@@ -455,12 +455,19 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(protocol.StatusAuthOK)
 		}
 		// Answered once admitted, and never for a connection refused
-		// (neko): another auth request of the connection waits for it.
+		// (neko): another auth request of the connection waits for it. A
+		// connection that ends meanwhile (refused, or the first request's
+		// handler gone without admitting it) aborts the request: its stream
+		// is reset, where a handler that returned would have had http3
+		// answer 200 before the connection closed (connDone closes first).
 		answer := func() {
 			select {
 			case <-s.ready:
 				authenticated()
 			case <-s.connDone:
+				panic(http.ErrAbortHandler)
+			case <-s.quicConn.Context().Done():
+				panic(http.ErrAbortHandler)
 			}
 		}
 		if _, ok := s.user(); ok {
@@ -493,6 +500,15 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			answer()
 			return
 		}
+		// The winner admits the connection or ends it (neko): a handler
+		// gone without either (a panic) leaves no request waiting.
+		defer func() {
+			select {
+			case <-s.ready:
+			default:
+				s.closeWithError(errClosedByHook)
+			}
+		}()
 		var rxAuto bool
 		var brutal *hyCC.BrutalSender
 		if !(s.receiveBPS == 0 && s.ignoreClientBandwidth) && request.Rx > 0 {
@@ -521,7 +537,7 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return st
 			}, func() { s.closeWithError(errClosedByHook) }, conn.Context().Done()) {
 				s.closeWithError(errClosedByHook)
-				return
+				panic(http.ErrAbortHandler) // no default 200 either
 			}
 		}
 		close(s.ready)

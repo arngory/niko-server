@@ -282,7 +282,7 @@ func runHysteriaMem(ctx context.Context, c *BackendConfig, conn *packetConn, log
 		RequestWait:           lim.n.requestWait,
 		PendingStreams:        hy2PendingStreams,
 		Context:               ctx,
-		Logger:                nopLogger(),
+		Logger:                hysteriaServiceLogger(),
 		SendBPS:               uint64(c.Options.UpMbps * hysteria.MbpsToBps),
 		ReceiveBPS:            uint64(c.Options.DownMbps * hysteria.MbpsToBps),
 		SalamanderPassword:    salamander,
@@ -608,3 +608,14 @@ func Public(a netip.Addr) bool {
 }
 
 func nopLogger() log.ContextLogger { return log.NewNOPFactory().NewLogger("") }
+
+// serviceLogger is the sing-quic service's logger when set: nil but in
+// the tests, which slow the service down where it logs.
+var serviceLogger atomic.Pointer[log.ContextLogger]
+
+func hysteriaServiceLogger() log.ContextLogger {
+	if l := serviceLogger.Load(); l != nil {
+		return *l
+	}
+	return nopLogger()
+}

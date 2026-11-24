@@ -5,6 +5,7 @@ package nikoserver
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -15,6 +16,7 @@ import (
 	"github.com/arngory/niko-server/nikoserver/memlimit"
 	"github.com/sagernet/quic-go/congestion"
 	"github.com/sagernet/quic-go/monotime"
+	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-quic/hysteria2"
 )
 
@@ -470,6 +472,12 @@ func TestHysteriaAdmittedOnlyAfterTheHook(t *testing.T) {
 				mem = newHyMem(hyFloor/2, nil) // no floor fits: every connection refused
 			}
 			mem.floorsIn = true
+			// The service slow between its connDone and the connection's
+			// close (where it logs the close): a request that returned
+			// there would have http3 answer 200 before the close.
+			var slow log.ContextLogger = slowCloseLogger{nopLogger()}
+			serviceLogger.Store(&slow)
+			defer serviceLogger.Store(nil)
 			node := hy2MasqNode(t, ctx, nil, mem, "u1", "password-one")
 			admitDelay.Store(int64(400 * time.Millisecond))
 			defer admitDelay.Store(0)
@@ -503,8 +511,8 @@ func TestHysteriaAdmittedOnlyAfterTheHook(t *testing.T) {
 			if n := dialled.Load(); n != 0 {
 				t.Errorf("a stream sent before the admission dialled %d times", n)
 			}
-			if refuse && (st[0] == 233 || st[1] == 233) {
-				t.Fatalf("a refused connection answered 233: %v", st)
+			if refuse && (st[0] != 0 || st[1] != 0) {
+				t.Fatalf("a refused connection answered: %v", st)
 			}
 			if !refuse && (st[0] != 233 || st[1] != 233 || second < 300*time.Millisecond) {
 				t.Fatalf("admitted: statuses %v, the second answered after %v, before the hook", st, second)
@@ -575,4 +583,15 @@ func TestHysteriaFloorReconnectUnderLimit(t *testing.T) {
 			waitReleased(t, m)
 		})
 	}
+}
+
+// slowCloseLogger is a service's logger that takes 100 ms over the line of
+// a connection closed by the server.
+type slowCloseLogger struct{ log.ContextLogger }
+
+func (l slowCloseLogger) Debug(args ...any) {
+	if strings.Contains(fmt.Sprint(args...), "closed by the server") {
+		time.Sleep(100 * time.Millisecond)
+	}
+	l.ContextLogger.Debug(args...)
 }

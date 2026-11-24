@@ -266,6 +266,16 @@ func (u *hy2Users) trafficOf(name string) *hy2Traffic {
 // credential at its share replaces its own. Two clients of one credential
 // (a shared link) cut down below their number by (3) do: each one's
 // redial replaces the other's.
+//
+// The same holds, by design, for the budget: short of a floor, (1) takes
+// the quietest of the newcomer's own credential even if it was heard just
+// now, so two clients of one credential on a full node replace each other
+// at each redial, and a leaked credential can push its owner's device out
+// under memory pressure. A trade-off taken deliberately (memory-v1
+// review): raycontrol gives each device a credential of its own, and the
+// connection a device leaves behind on a change of network was heard
+// recently, so waiting for it to fall silent would refuse the device for
+// up to hy2UnheardAfter.
 func (u *hy2Users) admit(user *hy2User, c *hy2Conn) bool {
 	if d := admitDelay.Load(); d > 0 {
 		time.Sleep(time.Duration(d)) // tests: a slow hook
