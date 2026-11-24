@@ -120,6 +120,13 @@ func TestReadLxcfs(t *testing.T) {
 	}
 }
 
+// esc is p as mountinfo has it: the kernel escapes a space as \040 and a
+// backslash as \134 (a Windows temporary directory has backslashes, and
+// "\001" in one would read as a byte).
+func esc(p string) string {
+	return strings.NewReplacer(`\`, `\134`, " ", `\040`).Replace(p)
+}
+
 // The mounts from mountinfo: v1's memory controller co-mounted with cpu
 // (cpu,memory), not at Root/memory; v2 at another point, a container's
 // cgroup mounted there (its root field), the path from /proc/self/cgroup
@@ -127,9 +134,9 @@ func TestReadLxcfs(t *testing.T) {
 func TestReadMountinfo(t *testing.T) {
 	tr, p := newTree(t, "5:cpu,memory:/lxc/c1/app\n0::/lxc/c1/app\n")
 	v1, v2 := tr.path("v1 mounts/cpu,memory"), tr.path("v2")
-	tr.write("mountinfo", "36 23 0:28 / "+tr.path("fs")+" rw,relatime - tmpfs tmpfs rw,mode=755\n"+
-		"37 36 0:29 / "+strings.ReplaceAll(v1, " ", "\\040")+" rw,relatime shared:9 - cgroup cgroup rw,cpu,memory\n"+
-		"38 36 0:30 /lxc/c1 "+v2+" rw,relatime - cgroup2 cgroup2 rw,nsdelegate\n")
+	tr.write("mountinfo", "36 23 0:28 / "+esc(tr.path("fs"))+" rw,relatime - tmpfs tmpfs rw,mode=755\n"+
+		"37 36 0:29 / "+esc(v1)+" rw,relatime shared:9 - cgroup cgroup rw,cpu,memory\n"+
+		"38 36 0:30 /lxc/c1 "+esc(v2)+" rw,relatime - cgroup2 cgroup2 rw,nsdelegate\n")
 	p.Mountinfo = tr.path("mountinfo")
 	tr.write("v1 mounts/cpu,memory/lxc/c1/memory.limit_in_bytes", "268435456\n")
 	tr.write("v2/app/memory.high", "201326592\n")
@@ -140,11 +147,11 @@ func TestReadMountinfo(t *testing.T) {
 	// Several mounts of v2: the one whose root is the longest prefix of
 	// the cgroup's path; one outside the namespace ("..") skipped.
 	other := tr.path("v2 other")
-	tr.write("mountinfo", "37 36 0:29 / "+strings.ReplaceAll(v1, " ", "\\040")+" rw - cgroup cgroup rw,cpu,memory\n"+
-		"38 36 0:30 / "+strings.ReplaceAll(other, " ", "\\040")+" rw - cgroup2 cgroup2 rw\n"+
-		"39 36 0:30 /../.. "+tr.path("v2 outside")+" rw - cgroup2 cgroup2 rw\n"+
-		"40 36 0:30 /lxc/c1 "+v2+" rw - cgroup2 cgroup2 rw\n"+
-		"41 36 0:30 /lxc/c2 "+tr.path("v2 c2")+" rw - cgroup2 cgroup2 rw\n")
+	tr.write("mountinfo", "37 36 0:29 / "+esc(v1)+" rw - cgroup cgroup rw,cpu,memory\n"+
+		"38 36 0:30 / "+esc(other)+" rw - cgroup2 cgroup2 rw\n"+
+		"39 36 0:30 /../.. "+esc(tr.path("v2 outside"))+" rw - cgroup2 cgroup2 rw\n"+
+		"40 36 0:30 /lxc/c1 "+esc(v2)+" rw - cgroup2 cgroup2 rw\n"+
+		"41 36 0:30 /lxc/c2 "+esc(tr.path("v2 c2"))+" rw - cgroup2 cgroup2 rw\n")
 	tr.write("v2 other/memory.max", "1\n")
 	tr.write("v2 outside/memory.max", "2\n")
 	tr.write("v2 c2/memory.max", "3\n")
