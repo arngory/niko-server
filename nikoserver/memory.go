@@ -11,7 +11,7 @@ import (
 
 // procMemory is the process's memory as its start found it: its cgroup's
 // limits and the host's MemTotal (raycontrol docs/spec/memory-v1.md). The
-// budgets of Hysteria2 (hyMemBudget) and of Yggdrasil's exits
+// budgets of Hysteria2 (newHyMemFor) and of Yggdrasil's exits
 // (yggExitBudget, yggExitsBound) come from it, as the Go memory limit
 // does (SetMemoryLimit).
 var procMemory = sync.OnceValue(func() memlimit.Limits { return memlimit.Read(memlimit.System) })

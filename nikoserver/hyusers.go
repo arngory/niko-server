@@ -68,6 +68,7 @@ const trafficStale = 5 * time.Minute
 type hy2Conn struct {
 	close   func()
 	packets func() uint64
+	done    <-chan struct{} // its end, by which hyMem knows it; nil: none (tests)
 
 	base  string    // its user's base name (baseName)
 	at    time.Time // admitted
@@ -105,6 +106,9 @@ type hy2Users struct {
 	// limits are the backend's per-user connection limits, whose refusals
 	// the traffic line gives too; set before the stats socket serves.
 	limits *hyLimits
+	// mem is the backend's budget, whose floors admit takes; nil: none
+	// (tests).
+	mem *hyMem
 }
 
 func (u *hy2Users) clock() time.Time {
@@ -240,11 +244,14 @@ func (u *hy2Users) trafficOf(name string) *hy2Traffic {
 //     the limit's worth of live connections loses places to the owner's
 //     other devices, down to an equal share, and takes nothing from them;
 //  4. else none, and the newcomer is refused: every credential is at its
-//     fair share or under, all heard. Its client has the auth's answer
-//     (233) by then and sees the connection closed as a revoked user's
-//     is, with no error code; Hysteria clients dial again.
+//     fair share or under, all heard. The service closes it before the
+//     auth's answer (the hook's false), with no error code; Hysteria
+//     clients dial again.
 //
-// Each is counted (conns). Live connections of different credentials do not
+// Then the newcomer takes its floor of the budget (hyMem.takeFloor),
+// whatever the limits say: the floor of the connection it replaces, if
+// one gives way, else the budget's. Short, it is refused (memory) and the
+// one chosen to give way stays. Else each is counted (conns). Live connections of different credentials do not
 // take each other's places in turn: a newcomer of a credential at its share
 // replaces its own. Two clients of one credential (a shared link) cut down
 // below their number by (3) do: each one's redial replaces the other's.
@@ -260,7 +267,8 @@ func (u *hy2Users) admit(user *hy2User, c *hy2Conn) bool {
 		c.seen = c.packets()
 	}
 	var gone *hy2Conn
-	if l := u.limits; l != nil && l.limited(c.base) && len(u.byBase[c.base]) >= max(1, l.n.conns) {
+	l := u.limits
+	if l != nil && l.limited(c.base) && len(u.byBase[c.base]) >= max(1, l.n.conns) {
 		quieter := func(x, y *hy2Conn) bool {
 			return y == nil || x.heard.Before(y.heard) || x.heard.Equal(y.heard) && x.at.Before(y.at)
 		}
@@ -296,11 +304,27 @@ func (u *hy2Users) admit(user *hy2User, c *hy2Conn) bool {
 				}
 			}
 		}
-		l.refuse(c.base, refusedConns)
 		if gone == nil {
+			l.refuse(c.base, refusedConns)
 			u.mu.Unlock()
 			return false
 		}
+	}
+	if u.mem != nil {
+		var from <-chan struct{}
+		if gone != nil {
+			from = gone.done
+		}
+		if !u.mem.takeFloor(c.done, from) {
+			if l != nil {
+				l.refuse(c.base, refusedMemory)
+			}
+			u.mu.Unlock()
+			return false
+		}
+	}
+	if gone != nil {
+		l.refuse(c.base, refusedConns)
 		u.dropLocked(u.byBase[c.base][gone], gone)
 	}
 	if u.conns == nil {
@@ -345,26 +369,18 @@ func (u *hy2Users) leave(user *hy2User, c *hy2Conn) {
 	u.dropLocked(user, c)
 }
 
-// connectionHook is the service's ConnectionHook: a connection takes its
-// floor from mem's budget (hyMem.takeFloor; none taken with mem nil, the
-// tests'), is admitted (or closed at once: the budget short, counted as
-// memory whatever conn_limit says, or its user revoked between its
-// password check and now) and counted in its address's stats until it
-// ends.
-func connectionHook(users *hy2Users, live *sessions, mem *hyMem) func(net.Addr, any, func() hysteria2.ConnectionStats, func(), <-chan struct{}) {
-	return func(remote net.Addr, user any, stats func() hysteria2.ConnectionStats, closeConnection func(), done <-chan struct{}) {
+// connectionHook is the service's ConnectionHook: a connection is admitted
+// with its floor of the budget (admit), and counted in its address's stats
+// until it ends; or refused (its limit, the budget short of its floor,
+// counted as memory whatever conn_limit says, or its user revoked between
+// its password check and now), and the service closes it before the
+// auth's answer.
+func connectionHook(users *hy2Users, live *sessions) func(net.Addr, any, func() hysteria2.ConnectionStats, func(), <-chan struct{}) bool {
+	return func(remote net.Addr, user any, stats func() hysteria2.ConnectionStats, closeConnection func(), done <-chan struct{}) bool {
 		u, _ := user.(*hy2User)
-		if u != nil && mem != nil && !mem.takeFloor(done) {
-			if users.limits != nil {
-				users.limits.refuse(baseName(u.name), refusedMemory)
-			}
-			closeConnection()
-			return
-		}
-		c := &hy2Conn{close: closeConnection, packets: func() uint64 { return stats().PacketsReceived }}
+		c := &hy2Conn{close: closeConnection, packets: func() uint64 { return stats().PacketsReceived }, done: done}
 		if !users.admit(u, c) {
-			closeConnection()
-			return
+			return false
 		}
 		forget := live.add(remote, u.name, stats)
 		go func() {
@@ -372,6 +388,7 @@ func connectionHook(users *hy2Users, live *sessions, mem *hyMem) func(net.Addr, 
 			forget()
 			users.leave(u, c)
 		}()
+		return true
 	}
 }
 

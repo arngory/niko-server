@@ -31,7 +31,7 @@ import (
 //     KiB a connection (hyStreamWindow, hyConnWindow), and grow as quic-go's
 //     tuning grows them while the reader keeps up, to Hysteria's 8 and 20
 //     MiB; every byte a connection's window grows by is taken from the
-//     node's budget (hyMemBudget) within its user's share of it,
+//     node's budget (hyBudgetFor) within its user's share of it,
 //     hyMemShares-th, and given back when the connection ends (quic-go
 //     never shrinks a window it gave); the windows take half the budget
 //     and half a share at most, so that a long upload leaves the flights
@@ -52,10 +52,11 @@ import (
 //
 // So the windows and the flight of all connections are at most the budget
 // plus the floors of the unauthenticated, hyConnWindow a connection, as
-// many as the front lets through: an authenticated connection's floor
-// (hyFloor, 1.75 MiB) is taken from the budget, and one the budget has no
-// floor for is closed (takeFloor). Before v0.19.3 the floors were outside
-// it, hy2ConnsPerUser × hyFloor, some 28 MiB a user. quic-go holds a
+// many as the front lets through: with a cgroup limit an authenticated
+// connection's floor (hyFloor, 1.75 MiB) is taken from the budget, and one
+// the budget has no floor for is refused (takeFloor). Without one, and
+// before v0.19.3, the floors are outside it, hy2ConnsPerUser × hyFloor,
+// some 28 MiB a user. quic-go holds a
 // STREAM frame of 128 bytes or more in a packet buffer of its own (1452
 // bytes), so the heap under a full receive window is up to 11 times the
 // window for a client that sends 128-byte frames, about the window for one
@@ -73,25 +74,25 @@ const (
 	hySendFloor    = 1 << 20   // in flight without asking the budget
 	// hyFloor is an authenticated connection's floor, its flight's and its
 	// connection window's start: taken from the node's budget when it
-	// authenticates (takeFloor).
-	hyFloor       = hySendFloor + hyConnWindow
-	hySendStep    = 256 << 10 // the least a sender takes at a time
-	hyMemShares   = 8         // as 8 users fill the budget
-	hyMemIdle     = time.Second
-	hyMemSweepGap = 100 * time.Millisecond
+	// authenticates (takeFloor), a user's hyFloorsPerUser-th of it at most.
+	hyFloor         = hySendFloor + hyConnWindow
+	hyFloorsPerUser = 4
+	hySendStep      = 256 << 10 // the least a sender takes at a time
+	hyMemShares     = 8         // as 8 users fill the budget
+	hyMemIdle       = time.Second
+	hyMemSweepGap   = 100 * time.Millisecond
 	// hyMemShortFor: a sender short of the budget asks again this later.
 	hyMemShortFor = 20 * time.Millisecond
 )
 
-// hyMemBudget is the default budget, of the memory the process may have
-// (procMemory): 3/8 of its cgroup's limit when it has one below the host
+// hyBudgetFor is the default budget, of the memory the process may have
+// (procMemory, newHyMemFor): 3/8 of its cgroup's limit when it has one below the host
 // (memlimit.Limits.Limit), each Hysteria2 backend its own unit and its
 // own limit (raycontrol memory-v1), 2 GiB at most; else an eighth of the
 // host's MemTotal as before, within 32 MiB and 2 GiB (an eighth: a node
 // has two Hysteria2 backends, each its own process, and the heap under a
 // receive window can be more than the window); 32 MiB when neither is
-// known. The connections' floors are in it (hyFloor).
-var hyMemBudget = sync.OnceValue(func() int64 { return hyBudgetFor(procMemory()) })
+// known. With a cgroup limit the connections' floors are in it (hyFloor).
 
 func hyBudgetFor(l memlimit.Limits) int64 {
 	if n := l.Limit(); n > 0 {
@@ -120,9 +121,16 @@ type hyMem struct {
 	recvAll int64
 	recvBy  map[string]int64
 	// floors are the authenticated connections' floors, hyFloor each
-	// (takeFloor): of the budget, of no user's share.
-	floors      int64
-	warnedFloor bool
+	// (takeFloor): of the budget, of no user's share; floorsBy of each
+	// user, within floorsPerUser. Taken only with floorsIn, which is on
+	// when the process has a cgroup limit (newHyMemFor): without one the
+	// budget is an eighth of MemTotal, sized when the floors were outside
+	// it, and they stay outside it.
+	floors          int64
+	floorsBy        map[string]int64
+	floorsIn        bool
+	warnedFloor     bool
+	warnedFloorUser bool
 
 	takes atomic.Int64 // asks of the budget, for the tests
 
@@ -131,7 +139,15 @@ type hyMem struct {
 
 func newHyMem(budget int64, log *Logger) *hyMem {
 	return &hyMem{budget: budget, log: log, grownBy: map[string]int64{}, conns: map[<-chan struct{}]*hyMemConn{},
-		reclaimedBy: map[string]time.Time{}, recvBy: map[string]int64{}}
+		reclaimedBy: map[string]time.Time{}, recvBy: map[string]int64{}, floorsBy: map[string]int64{}}
+}
+
+// newHyMemFor is a backend's budget for a process of memory l
+// (hyBudgetFor), the floors in it when l has a cgroup limit.
+func newHyMemFor(l memlimit.Limits, log *Logger) *hyMem {
+	m := newHyMem(hyBudgetFor(l), log)
+	m.floorsIn = l.Limit() > 0
+	return m
 }
 
 // hyMemConn is what one QUIC connection took: of its receive window, and
@@ -178,6 +194,12 @@ func (m *hyMem) end(done <-chan struct{}) {
 	c.ended = true
 	if c.floor {
 		m.floors -= hyFloor
+		if m.floorsBy[c.user] -= hyFloor; m.floorsBy[c.user] <= 0 {
+			if m.floorsBy[c.user] < 0 || m.floors < 0 {
+				m.overReleased.Add(1)
+			}
+			delete(m.floorsBy, c.user)
+		}
 		c.floor = false
 	}
 	m.recvLocked(c.user, -c.recv)
@@ -295,35 +317,69 @@ func (m *hyMem) sweepLocked(c *hyMemConn, mine bool) (idle []*hyMemSender) {
 }
 
 // takeFloor takes an authenticated connection's floor, hyFloor, from the
-// node's budget (not from its user's share), and says whether it has it.
-// Short, the other connections give back what they hold past their
-// windows and flights (giveBack, at most each hyMemSweepGap) and the
-// budget is asked once more; still short, the node warns once and the
-// connection is refused (connectionHook closes it, and its client dials
-// again). So the floors of all connections are in the budget: a user's
-// floors are no longer guaranteed (before v0.19.3 they were outside it,
-// some 28 MiB a user), and a node whose budget its connections hold takes
-// none more, of anyone's, until some end or give back.
-func (m *hyMem) takeFloor(done <-chan struct{}) bool {
+// node's budget (not from its user's share), and says whether it has it;
+// with floorsIn off (no cgroup limit) it takes nothing and says yes, the
+// floors outside the budget as before v0.19.3. A user's floors are a
+// quarter of the budget at most, one connection's at least
+// (hyFloorsPerUser). from, when not nil, is the end of a connection of
+// the same user that admit closes to make room for this one (it gave way):
+// its floor passes to this one, whatever the budget. Else, short of the
+// node's budget, the other connections give back what they hold past
+// their windows and flights (giveBack, at most each hyMemSweepGap) and the
+// budget is asked once more; still short, or past the user's quarter, the
+// node warns once (of each) and the connection is refused: admit refuses
+// it, and the service closes it before its auth's answer (its client dials
+// again). So with a cgroup limit the floors of all connections are in the
+// budget: a user's floors are no longer guaranteed, and a node whose
+// budget its connections hold takes none more, but in place of one of the
+// same user's, until some end or give back.
+func (m *hyMem) takeFloor(done, from <-chan struct{}) bool {
+	if !m.floorsIn {
+		return true
+	}
+	select {
+	case <-done:
+		// Ended already (a record made now would end at once): nothing
+		// to take, and nothing to admit.
+		return false
+	default:
+	}
 	for asked := false; ; asked = true {
 		m.mu.Lock()
 		c := m.connLocked(done)
-		if !c.ended && !c.floor && m.budget-m.grown-m.floors >= hyFloor {
-			m.floors += hyFloor
-			c.floor = true
-		}
-		if c.floor || c.ended {
+		if c.floor {
 			m.mu.Unlock()
-			return c.floor
+			return true
+		}
+		if g := m.conns[from]; from != nil && g != nil && g != c && g.floor && g.user == c.user {
+			g.floor, c.floor = false, true
+			m.mu.Unlock()
+			return true
+		}
+		var warn string
+		if m.floorsBy[c.user]+hyFloor > m.floorsPerUser() {
+			if !m.warnedFloorUser {
+				m.warnedFloorUser = true
+				warn = fmt.Sprintf("a user's Hysteria2 connections' floors at a quarter of the node's budget, %d MiB: its new connections are closed but in place of its own (logged once)", m.floorsPerUser()>>20)
+			}
+			m.mu.Unlock()
+			m.after(nil, warn)
+			return false
+		}
+		if m.budget-m.grown-m.floors >= hyFloor {
+			m.floors += hyFloor
+			m.floorsBy[c.user] += hyFloor
+			c.floor = true
+			m.mu.Unlock()
+			return true
 		}
 		var idle []*hyMemSender
 		if !asked {
 			idle = m.sweepLocked(c, false)
 		}
-		var warn string
 		if (asked || len(idle) == 0) && !m.warnedFloor {
 			m.warnedFloor = true
-			warn = fmt.Sprintf("Hysteria2 connections' floors and windows at the node's budget, %d MiB: new connections are closed until others end or give back (logged once)", m.budget>>20)
+			warn = fmt.Sprintf("Hysteria2 connections' floors and windows at the node's budget, %d MiB: new connections are closed but in place of their user's own, until others end or give back (logged once)", m.budget>>20)
 		}
 		m.mu.Unlock()
 		m.after(idle, warn)
@@ -332,6 +388,10 @@ func (m *hyMem) takeFloor(done <-chan struct{}) bool {
 		}
 	}
 }
+
+// floorsPerUser is the most of the floors one user holds: a quarter of
+// the budget, one connection's floor at least.
+func (m *hyMem) floorsPerUser() int64 { return max(m.budget/hyFloorsPerUser, hyFloor) }
 
 // allowRecv is quic-go's AllowConnectionWindowIncrease: a connection's
 // receive window grows by delta only if the budget and its user's share

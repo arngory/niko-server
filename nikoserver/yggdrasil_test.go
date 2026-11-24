@@ -644,7 +644,7 @@ func TestNekoServerYggdrasilPacketTooBig(t *testing.T) {
 	}
 }
 
-// The exits' count: at most yggExitsPerUser of one user whatever its keys
+// The exits' count: at most perUser (yggExitsPerUser at 4096) of one user whatever its keys
 // (second review: a user of 8 keys, 1100 each, filled the node),
 // yggExitsMax in all, and yggExitsShaking of one user's handshakes at once
 // (1024 unanswered SYNs of one key held every user's for two minutes); a
@@ -662,7 +662,11 @@ func TestYggExitCount(t *testing.T) {
 		c.shook(w)
 		return true
 	}
-	for i := range yggExitsPerUser {
+	c.max, c.perUser = yggExitsMax, yggExitsOfUser(yggExitsMax) // whatever the host's memory
+	if c.perUser != yggExitsPerUser {
+		t.Fatalf("a user's exits %d at %d", c.perUser, yggExitsMax)
+	}
+	for i := range c.perUser {
 		if !take(who("u5", i%3)) {
 			t.Fatalf("exit %d of a user refused", i)
 		}
@@ -675,7 +679,7 @@ func TestYggExitCount(t *testing.T) {
 		t.Fatal("a place freed, yet refused")
 	}
 	for i := 0; c.total < c.max; i++ {
-		if !take(who(fmt.Sprintf("u%d", 100+i/yggExitsPerUser), i%7)) {
+		if !take(who(fmt.Sprintf("u%d", 100+i/c.perUser), i%7)) {
 			t.Fatalf("exit %d of %d refused", c.total, c.max)
 		}
 	}

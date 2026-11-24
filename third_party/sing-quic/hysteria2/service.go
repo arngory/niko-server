@@ -59,8 +59,11 @@ type ServiceOptions struct {
 	// and datagrams, at once or later, as often as wanted. The hook runs in
 	// the auth request's handler after the password check, which may have
 	// read the table UpdateUsers has just replaced: a caller closing the
-	// connections of users it took out must refuse those here as well.
-	ConnectionHook func(remote net.Addr, user any, stats func() ConnectionStats, closeConnection func(), done <-chan struct{})
+	// connections of users it took out must refuse those here as well. It
+	// runs before the auth's answer, and returns whether the connection is
+	// admitted (neko): one it refuses is closed unanswered, so its client
+	// never sees 233, and the hook's closeConnection is not called for it.
+	ConnectionHook func(remote net.Addr, user any, stats func() ConnectionStats, closeConnection func(), done <-chan struct{}) bool
 	// ConnectionIDGenerator, if set, makes the server's connection IDs
 	// (neko: IDs whose label the UDP front routes a client by when its
 	// address changes); nil: quic-go's random ones.
@@ -146,7 +149,7 @@ type Service[U comparable] struct {
 	tlsConfig             aTLS.ServerConfig
 	quicConfig            *quic.Config
 	users                 atomic.Pointer[map[string]U] // swapped whole by UpdateUsers (neko: was a racy map write)
-	connectionHook        func(remote net.Addr, user any, stats func() ConnectionStats, closeConnection func(), done <-chan struct{})
+	connectionHook        func(remote net.Addr, user any, stats func() ConnectionStats, closeConnection func(), done <-chan struct{}) bool
 	udpDisabled           bool
 	udpTimeout            time.Duration
 	handler               ServerHandler
@@ -490,22 +493,27 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			))
 			rxAuto = true
 		}
+		// The hook first, the answer after (neko): a connection the hook
+		// refuses is closed before its client learns the password was good.
+		if s.connectionHook != nil {
+			conn := s.quicConn
+			if !s.connectionHook(conn.RemoteAddr(), user, func() ConnectionStats {
+				st := ConnectionStats{ConnectionStats: conn.ConnectionStats()}
+				if brutal != nil {
+					st.Brutal, st.RateBPS, st.AckRate = true, brutal.BPS(), brutal.AckRate()
+				}
+				return st
+			}, func() { s.closeWithError(errClosedByHook) }, conn.Context().Done()) {
+				s.closeWithError(errClosedByHook)
+				return
+			}
+		}
 		protocol.AuthResponseToHeader(w.Header(), protocol.AuthResponse{
 			UDPEnabled: !s.udpDisabled,
 			Rx:         s.receiveBPS,
 			RxAuto:     rxAuto,
 		})
 		w.WriteHeader(protocol.StatusAuthOK)
-		if s.connectionHook != nil {
-			conn := s.quicConn
-			s.connectionHook(conn.RemoteAddr(), user, func() ConnectionStats {
-				st := ConnectionStats{ConnectionStats: conn.ConnectionStats()}
-				if brutal != nil {
-					st.Brutal, st.RateBPS, st.AckRate = true, brutal.BPS(), brutal.AckRate()
-				}
-				return st
-			}, func() { s.closeWithError(errClosedByHook) }, conn.Context().Done())
-		}
 		if s.ctx.Done() != nil {
 			go func() {
 				select {

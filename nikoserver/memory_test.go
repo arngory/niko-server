@@ -121,13 +121,14 @@ func TestMemoryBudgets(t *testing.T) {
 func TestHyMemFloors(t *testing.T) {
 	var out syncBuffer
 	m := newHyMem(2*hyFloor+256<<10, NewLogger("warn", &out)) // two floors and 256 KiB, shares of 480 KiB
+	m.floorsIn = true
 	ends := make([]chan struct{}, 4)
 	for i := range ends {
 		ends[i] = make(chan struct{})
 	}
 	s0 := m.sender(ends[0], "u1", &fakeCC{cwnd: 8 << 20})
 	m.sender(ends[1], "u2", &fakeCC{cwnd: 8 << 20})
-	if !m.takeFloor(ends[0]) || !m.takeFloor(ends[0]) || !m.takeFloor(ends[1]) {
+	if !m.takeFloor(ends[0], nil) || !m.takeFloor(ends[0], nil) || !m.takeFloor(ends[1], nil) {
 		t.Fatal("two floors refused in a budget of two and more")
 	}
 	if m.floors != 2*hyFloor || m.grown != 0 {
@@ -151,7 +152,7 @@ func TestHyMemFloors(t *testing.T) {
 	m.reclaimed = time.Time{} // s0's own sweep, short, was just now
 	m.mu.Unlock()
 	m.sender(ends[2], "u3", &fakeCC{cwnd: 8 << 20})
-	if m.takeFloor(ends[2]) {
+	if m.takeFloor(ends[2], nil) {
 		t.Fatal("a floor past the budget taken")
 	}
 	if s0.limit.Load() != hySendFloor {
@@ -174,18 +175,19 @@ func TestHyMemFloors(t *testing.T) {
 		}
 	}
 	m.sender(ends[3], "u3", &fakeCC{cwnd: 8 << 20})
-	if !m.takeFloor(ends[3]) {
+	if !m.takeFloor(ends[3], nil) {
 		t.Fatal("a floor given back, yet refused")
 	}
 	// A budget of two floors: the first grown by its share (448 KiB), the
 	// budget is short of a second floor by that; the first, idle, gives
 	// it back and the floor is taken: pressure before refusal.
 	m2 := newHyMem(2*hyFloor, nil)
+	m2.floorsIn = true
 	e0, e1 := make(chan struct{}), make(chan struct{})
 	defer close(e0)
 	defer close(e1)
 	g := m2.sender(e0, "u1", &fakeCC{cwnd: 8 << 20})
-	if !m2.takeFloor(e0) {
+	if !m2.takeFloor(e0, nil) {
 		t.Fatal("the first floor refused")
 	}
 	for i := 0; i < 8; i++ {
@@ -198,7 +200,7 @@ func TestHyMemFloors(t *testing.T) {
 	g.lastSent.Store(int64(monotime.Now().Add(-2 * hyMemIdle)))
 	g.inFlight.Store(0)
 	m2.sender(e1, "u2", &fakeCC{cwnd: 8 << 20})
-	if !m2.takeFloor(e1) {
+	if !m2.takeFloor(e1, nil) {
 		t.Fatal("an idle connection's growth not given back for a floor")
 	}
 	if g.limit.Load() != hySendFloor {
@@ -211,24 +213,29 @@ func TestHyMemFloors(t *testing.T) {
 }
 
 // A backend whose budget has one floor and a half takes one connection;
-// the next, authenticated, is closed and counted as memory; one more once
-// the first ended gets in.
+// the next, its password good, is closed before its auth's answer and
+// counted as memory; one more once the first ended gets in.
 func TestHysteriaFloorsWithinBudget(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	lim := newHyLimits()
 	var out syncBuffer
 	mem := newHyMem(hyFloor+hyFloor/2, NewLogger("warn", &out))
+	mem.floorsIn = true
 	node := hy2MasqNode(t, ctx, lim, mem, "u1", "password-one", "u2", "password-two")
-	// dial authenticates; refused is true when the server closed the
-	// connection (its answer, 233, may or may not reach the client first).
+	// dial authenticates; refused: the server closes the connection
+	// before its auth's answer, and the client gets no 233.
 	dial := func(password string, refused bool) *rawHy2 {
 		t.Helper()
 		r, err := dialRawHy2(t, ctx, node.server, []tls.CurveID{tls.X25519MLKEM768}, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if st, err := r.tryAuth(password, 0); err != nil && !refused || err == nil && st != 233 {
+		st, err := r.tryAuth(password, 0)
+		if refused && err == nil {
+			t.Fatalf("refused, yet answered %d", st)
+		}
+		if !refused && (err != nil || st != 233) {
 			t.Fatalf("auth %d, %v", st, err)
 		}
 		return r
@@ -301,4 +308,129 @@ func TestYggExitsBound(t *testing.T) {
 	if !c.take(who(0)) {
 		t.Fatal("a place freed, yet refused")
 	}
+}
+
+// A user's floors are a quarter of the budget at most, one connection's at
+// least; past it a connection of its own is refused, others' are not, and
+// one that replaces a connection of its user's takes over that one's
+// floor, whatever the budget or the quarter. Without a cgroup limit
+// (floorsIn off) the floors stay outside the budget, as before v0.19.3.
+func TestHyMemFloorsPerUser(t *testing.T) {
+	m := newHyMem(8*hyFloor, nil) // a user's quarter: two floors
+	m.floorsIn = true
+	var ends []chan struct{}
+	conn := func(user string) chan struct{} {
+		e := make(chan struct{})
+		ends = append(ends, e)
+		m.sender(e, user, &fakeCC{cwnd: 8 << 20})
+		return e
+	}
+	a, b, c := conn("u1"), conn("u1"), conn("u1")
+	if !m.takeFloor(a, nil) || !m.takeFloor(b, nil) {
+		t.Fatal("a user's floors within its quarter refused")
+	}
+	if m.takeFloor(c, nil) {
+		t.Fatal("a user's floors past its quarter taken")
+	}
+	if !m.takeFloor(conn("u2"), nil) {
+		t.Fatal("another user's floor refused")
+	}
+	// c replaces a: a's floor passes to c.
+	if !m.takeFloor(c, a) {
+		t.Fatal("a replacement refused")
+	}
+	m.mu.Lock()
+	floors, byU1, aFloor := m.floors, m.floorsBy["u1"], m.conns[a].floor
+	m.mu.Unlock()
+	if floors != 3*hyFloor || byU1 != 2*hyFloor || aFloor {
+		t.Fatalf("after the replacement: floors %d, u1's %d, the replaced one's kept %v", floors/hyFloor, byU1/hyFloor, aFloor)
+	}
+	// Not another user's: u2 cannot take u1's floor.
+	d := conn("u2")
+	m.budget = 3 * hyFloor // full
+	if m.takeFloor(d, b) {
+		t.Fatal("a floor passed between users")
+	}
+	for _, e := range ends {
+		close(e)
+	}
+	waitReleased(t, m)
+
+	// Without a cgroup limit: no floor taken, whatever the budget.
+	off := newHyMemFor(memlimit.Limits{MemTotal: 1 << 30}, nil)
+	if off.floorsIn || off.budget != 128*mib {
+		t.Fatalf("no limit: floors in %v, budget %d", off.floorsIn, off.budget)
+	}
+	e := make(chan struct{})
+	for range 200 { // 350 MiB of floors past a budget of 128 MiB
+		if !off.takeFloor(e, nil) {
+			t.Fatal("no limit, yet a floor refused")
+		}
+	}
+	if off.floors != 0 {
+		t.Fatalf("no limit, floors %d", off.floors)
+	}
+	close(e)
+	if on := newHyMemFor(unit(1<<30), nil); !on.floorsIn || on.budget != 336*mib {
+		t.Fatalf("a limit: floors in %v, budget %d", on.floorsIn, on.budget)
+	}
+}
+
+// The budget full, a user at its limit of connections reconnects from the
+// same device: its new connection takes the old one's place and floor,
+// and the old one closes; another user's still finds no room.
+func TestHysteriaFloorReplaces(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	lim := newHyLimits()
+	lim.n.conns = 1
+	mem := newHyMem(hyFloor+hyFloor/2, nil)
+	mem.floorsIn = true
+	node := hy2MasqNode(t, ctx, lim, mem, "u1", "password-one", "u2", "password-two")
+	dial := func(password string) (*rawHy2, bool) {
+		t.Helper()
+		r, err := dialRawHy2(t, ctx, node.server, []tls.CurveID{tls.X25519MLKEM768}, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		st, err := r.tryAuth(password, 0)
+		return r, err == nil && st == 233
+	}
+	closed := func(r *rawHy2, within time.Duration) bool {
+		select {
+		case <-r.conn.Context().Done():
+			return true
+		case <-time.After(within):
+			return false
+		}
+	}
+	old, ok := dial("password-one")
+	if !ok {
+		t.Fatal("the first refused")
+	}
+	if _, ok := dial("password-two"); ok {
+		t.Fatal("past the budget, another user's admitted")
+	}
+	next, ok := dial("password-one")
+	if !ok {
+		t.Fatal("the budget full, a replacement refused")
+	}
+	if !closed(old, 5*time.Second) {
+		t.Fatal("the replaced connection stayed")
+	}
+	if closed(next, 500*time.Millisecond) {
+		t.Fatal("the replacement closed")
+	}
+	tr := node.traffic(t)
+	if tr.Limit["u1"]["conns"] != 1 || tr.Limit["u1"]["memory"] != 0 || tr.Limit["u2"]["memory"] != 1 {
+		t.Fatalf("refusals %v", tr.Limit)
+	}
+	mem.mu.Lock()
+	floors := mem.floors
+	mem.mu.Unlock()
+	if floors != hyFloor {
+		t.Fatalf("floors %d after the replacement", floors)
+	}
+	next.conn.CloseWithError(0, "")
+	waitReleased(t, mem)
 }

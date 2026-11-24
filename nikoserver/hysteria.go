@@ -170,7 +170,7 @@ func hysteriaTLS(c *BackendConfig) (option.InboundTLSOptions, tls.CurveID) {
 // runHysteriaWith is runHysteria with the backend's limits given (tests:
 // their numbers and clock).
 func runHysteriaWith(ctx context.Context, c *BackendConfig, conn *packetConn, log *Logger, dial dialFunc, lim *hyLimits) error {
-	return runHysteriaMem(ctx, c, conn, log, dial, lim, newHyMem(hyMemBudget(), log))
+	return runHysteriaMem(ctx, c, conn, log, dial, lim, newHyMemFor(procMemory(), log))
 }
 
 // runHysteriaMem is runHysteriaWith with the budget of the connections'
@@ -221,7 +221,7 @@ func runHysteriaMem(ctx context.Context, c *BackendConfig, conn *packetConn, log
 	connLimit()
 	var live sessions
 	users := newHy2Users()
-	users.limits = lim
+	users.limits, users.mem = lim, mem
 	if c.StatsSocket != "" {
 		stop, err := live.serveStats(c.StatsSocket, users, log)
 		if err != nil {
@@ -270,7 +270,7 @@ func runHysteriaMem(ctx context.Context, c *BackendConfig, conn *packetConn, log
 		PathValidation:    true,
 		StatelessResetKey: resetKey,
 		ObfsConnFilter:    obfsFilter,
-		ConnectionHook:    connectionHook(users, &live, mem),
+		ConnectionHook:    connectionHook(users, &live),
 		AuthCurve:         authCurve,
 		// The flight of an authenticated connection within the budget
 		// (hymem.go), and a user's streams waiting for their request
