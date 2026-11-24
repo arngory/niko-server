@@ -41,7 +41,7 @@ var (
 	flagProcs    = flag.Int("procs", 1, "GOMAXPROCS of the server processes")
 	flagCPUs     = flag.String("cpus", "0", "taskset CPU list of the server processes")
 	flagMemLimit = flag.String("memlimit", "", "GOMEMLIMIT of the server processes")
-	flagCgroup   = flag.Int64("cgroup", 0, "memory cgroup limit (bytes) for the backend process; 0: none")
+	flagCgroup   = flag.Int64("cgroup", 0, "memory cgroup limit (bytes) for the backend process, which starts in it (v2, else v1); 0: none")
 	flagScenario = flag.String("scenario", "legit", "legit|flood|garbage|probe|apex|refused|idle")
 	flagDur      = flag.Duration("d", 30*time.Second, "load duration")
 	flagAfter    = flag.Duration("after", 0, "keep sampling this long after the load")
@@ -81,6 +81,10 @@ type proc struct {
 	role  string
 	cmd   *exec.Cmd
 	pprof string
+	// cgroup is the process's memory cgroup of its own, "" without one
+	// (-cgroup), and whether it is v2's.
+	cgroup   string
+	cgroupV2 bool
 }
 
 func must(err error) {
@@ -183,18 +187,32 @@ func setup() *node {
 		"backends": map[string]any{"dns": map[string]any{"socket": socket, "mode": "packet", "uid": uid}},
 		"dns":      frontDNS,
 	})
-	n.backend = start("backend", backendPath, n.backPprof)
+	var cg string
+	var v2 bool
 	if *flagCgroup > 0 {
-		cgroupLimit(n.backend.cmd.Process.Pid, *flagCgroup)
+		self, _ := os.ReadFile("/proc/self/cgroup")
+		var err error
+		cg, v2, err = newCgroup(string(self), "/sys/fs/cgroup", "niko-load-"+strconv.Itoa(os.Getpid()), *flagCgroup)
+		must(err)
+		version := "v1"
+		if v2 {
+			version = "v2"
+		}
+		fmt.Printf("backend in cgroup %s %s, limit %d MiB\n", version, cg, *flagCgroup>>20)
 	}
+	n.backend = start("backend", backendPath, n.backPprof, cg, v2)
 	time.Sleep(300 * time.Millisecond)
-	n.front = start("front", frontPath, n.frontPprof)
+	n.front = start("front", frontPath, n.frontPprof, "", false)
 	time.Sleep(500 * time.Millisecond)
 	return n
 }
 
-func start(role, config, pprof string) *proc {
-	cmd := exec.Command("taskset", "-c", *flagCPUs, *flagSrv, role, "-c", config)
+func start(role, config, pprof, cgroup string, v2 bool) *proc {
+	args := []string{"taskset", "-c", *flagCPUs, *flagSrv, role, "-c", config}
+	if cgroup != "" {
+		args = startIn(cgroup, args...)
+	}
+	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Env = append(os.Environ(), "GOMAXPROCS="+strconv.Itoa(*flagProcs), "NIKO_PPROF="+pprof)
 	if *flagMemLimit != "" {
 		cmd.Env = append(cmd.Env, "GOMEMLIMIT="+*flagMemLimit)
@@ -204,24 +222,7 @@ func start(role, config, pprof string) *proc {
 	cmd.Stdout, cmd.Stderr = logf, logf
 	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
 	must(cmd.Start())
-	return &proc{role: role, cmd: cmd, pprof: pprof}
-}
-
-// cgroupLimit puts pid in a memory cgroup (v1) of its own with a limit.
-func cgroupLimit(pid int, limit int64) {
-	self, _ := os.ReadFile("/proc/self/cgroup")
-	base := "/sys/fs/cgroup/memory"
-	for _, line := range strings.Split(string(self), "\n") {
-		if f := strings.SplitN(line, ":", 3); len(f) == 3 && f[1] == "memory" {
-			base = filepath.Join(base, f[2])
-		}
-	}
-	dir := filepath.Join(base, "niko-load-"+strconv.Itoa(pid))
-	must(os.MkdirAll(dir, 0o755))
-	must(os.WriteFile(filepath.Join(dir, "memory.limit_in_bytes"), []byte(strconv.FormatInt(limit, 10)), 0o644))
-	os.WriteFile(filepath.Join(dir, "memory.memsw.limit_in_bytes"), []byte(strconv.FormatInt(limit, 10)), 0o644)
-	must(os.WriteFile(filepath.Join(dir, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0o644))
-	fmt.Printf("backend pid %d in %s, limit %d MiB\n", pid, dir, limit>>20)
+	return &proc{role: role, cmd: cmd, pprof: pprof, cgroup: cgroup, cgroupV2: v2}
 }
 
 func (p *proc) stop() {
@@ -233,6 +234,13 @@ func (p *proc) stop() {
 		case <-done:
 		case <-time.After(3 * time.Second):
 			p.cmd.Process.Kill()
+			<-done
+		}
+	}
+	if p.cgroup != "" {
+		fmt.Printf("%s cgroup: oom_kill %d\n", p.role, oomKills(p.cgroup, p.cgroupV2))
+		if err := os.Remove(p.cgroup); err != nil {
+			fmt.Fprintln(os.Stderr, "niko-loadgen: cgroup:", err)
 		}
 	}
 }
