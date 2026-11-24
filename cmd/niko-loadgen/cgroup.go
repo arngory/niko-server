@@ -93,8 +93,9 @@ func startIn(dir string, args ...string) []string {
 // systemdScope is the command that runs args in a transient scope of
 // systemd's, name, with MemoryMax limit and no swap, when systemd runs the
 // host (PID 1, /run/systemd/system) and systemd-run is there; else nil.
-// systemd-run execs args in the scope (the same pid), and the scope goes
-// when they end.
+// systemd-run execs args in the scope (the same pid). Not collected: a
+// scope the kernel's OOM killer ended stays, failed, with its Result
+// (oom-kill) for the loadgen to read, and is reset after (proc.stopNow).
 func systemdScope(name string, limit int64, args ...string) []string {
 	if _, err := os.Stat("/run/systemd/system"); err != nil {
 		return nil
@@ -102,19 +103,16 @@ func systemdScope(name string, limit int64, args ...string) []string {
 	if _, err := exec.LookPath("systemd-run"); err != nil {
 		return nil
 	}
-	return append([]string{"systemd-run", "--scope", "--quiet", "--collect", "--unit", name,
+	return append([]string{"systemd-run", "--scope", "--quiet", "--unit", name,
 		"-p", "MemoryMax=" + strconv.FormatInt(limit, 10), "-p", "MemorySwapMax=0", "--"}, args...)
 }
 
-// cgroupOf is the memory cgroup of pid, as /proc/<pid>/cgroup says, under
-// the mount at root: v2's when it has the memory controller, else v1's.
-func cgroupOf(pid int, root string) (dir string, v2 bool) {
-	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cgroup")
-	if err != nil {
-		return "", false
-	}
+// cgroupOf is the memory cgroup of a process whose /proc/<pid>/cgroup is
+// self, under the mount at root: v2's when it has the memory controller,
+// else v1's.
+func cgroupOf(self, root string) (dir string, v2 bool) {
 	ctl, _ := os.ReadFile(filepath.Join(root, "cgroup.controllers"))
-	for line := range strings.SplitSeq(string(b), "\n") {
+	for line := range strings.SplitSeq(self, "\n") {
 		f := strings.SplitN(line, ":", 3)
 		switch {
 		case len(f) < 3:
@@ -127,33 +125,37 @@ func cgroupOf(pid int, root string) (dir string, v2 bool) {
 	return dir, false
 }
 
-// atExit and cleanup: what the loadgen undoes however it ends, at its
-// end, at must's failure or at SIGINT and SIGTERM (os.Exit runs no
-// defers): the servers stopped, the cgroups removed. Last first, once.
-var exits struct {
-	sync.Mutex
+// exitList is what the loadgen undoes however it ends, at its end, at
+// must's failure or at SIGINT and SIGTERM (os.Exit runs no defers): the
+// servers stopped, the cgroups removed. Last first, once: a second caller
+// (a signal while must fails) waits for the first to finish.
+type exitList struct {
+	mu   sync.Mutex
 	fs   []func()
-	done bool
+	once sync.Once
 }
 
-func atExit(f func()) {
-	exits.Lock()
-	defer exits.Unlock()
-	exits.fs = append(exits.fs, f)
+func (e *exitList) add(f func()) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.fs = append(e.fs, f)
 }
 
-func cleanup() {
-	exits.Lock()
-	fs := exits.fs
-	if exits.done {
-		fs = nil
-	}
-	exits.done = true
-	exits.Unlock()
-	for i := len(fs) - 1; i >= 0; i-- {
-		fs[i]()
-	}
+func (e *exitList) run() {
+	e.once.Do(func() {
+		e.mu.Lock()
+		fs := e.fs
+		e.mu.Unlock()
+		for i := len(fs) - 1; i >= 0; i-- {
+			fs[i]()
+		}
+	})
 }
+
+var exits exitList
+
+func atExit(f func()) { exits.add(f) }
+func cleanup()        { exits.run() }
 
 // oomKills is the cgroup's count of processes the OOM killer killed in
 // it: oom_kill of memory.events (v2) or of memory.oom_control (v1, Linux

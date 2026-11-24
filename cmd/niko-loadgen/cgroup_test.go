@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func writeFile(t *testing.T, p, s string) {
@@ -121,25 +122,47 @@ func TestStartIn(t *testing.T) {
 	}
 }
 
-// cleanup runs what was asked last first, once, however often it is
-// called (must, a signal, main's end).
-func TestCleanup(t *testing.T) {
+// An exitList runs what was asked last first, once, however often it is
+// called (must, a signal, main's end); a second caller waits for the
+// first to finish.
+func TestExitList(t *testing.T) {
+	var e exitList
 	var got []int
-	for i := range 3 {
-		atExit(func() { got = append(got, i) })
+	release := make(chan struct{})
+	e.add(func() { got = append(got, 0) })
+	e.add(func() { <-release; got = append(got, 1) })
+	first := make(chan struct{})
+	go func() { e.run(); close(first) }()
+	time.Sleep(20 * time.Millisecond)
+	second := make(chan struct{})
+	go func() { e.run(); close(second) }()
+	select {
+	case <-second:
+		t.Fatal("a second caller returned before the first finished")
+	case <-time.After(50 * time.Millisecond):
 	}
-	cleanup()
-	cleanup()
-	if len(got) != 3 || got[0] != 2 || got[2] != 0 {
+	close(release)
+	<-first
+	<-second
+	e.run()
+	if len(got) != 2 || got[0] != 1 || got[1] != 0 {
 		t.Fatalf("ran %v", got)
 	}
 }
 
-// The loadgen's own memory cgroup, as /proc says (v1 here, or v2).
+// A process's memory cgroup from its /proc/<pid>/cgroup: v2's where the
+// hierarchy has the memory controller, else v1's.
 func TestCgroupOf(t *testing.T) {
-	dir, v2 := cgroupOf(os.Getpid(), "/sys/fs/cgroup")
-	t.Logf("%s, v2 %v", dir, v2)
-	if _, err := os.Stat(dir); dir != "" && err != nil {
-		t.Fatalf("%s: %v", dir, err)
+	root := t.TempDir()
+	self := "4:memory:/system.slice/niko-load-1.scope\n0::/system.slice/niko-load-1.scope\n"
+	if dir, v2 := cgroupOf(self, root); v2 || dir != filepath.Join(root, "memory/system.slice/niko-load-1.scope") {
+		t.Fatalf("v1: %s, v2 %v", dir, v2)
+	}
+	writeFile(t, filepath.Join(root, "cgroup.controllers"), "cpu io memory pids\n")
+	if dir, v2 := cgroupOf("0::/system.slice/niko-load-1.scope\n", root); !v2 || dir != filepath.Join(root, "system.slice/niko-load-1.scope") {
+		t.Fatalf("v2: %s, v2 %v", dir, v2)
+	}
+	if dir, _ := cgroupOf("1:cpu:/\n", root); dir != "" {
+		t.Fatalf("none: %s", dir)
 	}
 }

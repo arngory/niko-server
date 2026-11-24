@@ -83,11 +83,16 @@ type proc struct {
 	cmd   *exec.Cmd
 	pprof string
 	// cgroup is the process's memory cgroup of its own, "" without one
-	// (-cgroup), and whether it is v2's; scope: systemd's, found once the
-	// process runs (cgroupOf), which systemd removes.
+	// (-cgroup), and whether it is v2's. scope is systemd's unit when the
+	// process runs in a transient scope (systemdScope): its cgroup is found
+	// right after the start (scopeCgroup), and at the stop its oom_kill is
+	// read while the scope lives, and systemd's Result of the unit after
+	// (oom-kill when the kernel killed it: the scope is gone by then, and
+	// its cgroup's count with it); the unit, not collected, is reset after
+	// (systemctl reset-failed).
 	cgroup   string
 	cgroupV2 bool
-	scope    bool
+	scope    string
 	stopOnce sync.Once
 }
 
@@ -196,6 +201,9 @@ func setup() *node {
 	var v2, scope bool
 	name := "niko-load-" + strconv.Itoa(os.Getpid())
 	if *flagCgroup > 0 {
+		if os.Geteuid() != 0 {
+			must(fmt.Errorf("-cgroup needs root: a systemd scope of the system's, or a cgroup of its own"))
+		}
 		if systemdScope(name, *flagCgroup) != nil {
 			scope = true
 			fmt.Printf("backend in systemd scope %s.scope, MemoryMax %d MiB\n", name, *flagCgroup>>20)
@@ -237,9 +245,31 @@ func start(role, config, pprof, cgroup string, v2, scope bool, name string) *pro
 	cmd.Stdout, cmd.Stderr = logf, logf
 	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
 	must(cmd.Start())
-	p := &proc{role: role, cmd: cmd, pprof: pprof, cgroup: cgroup, cgroupV2: v2, scope: scope}
+	p := &proc{role: role, cmd: cmd, pprof: pprof, cgroup: cgroup, cgroupV2: v2}
 	atExit(p.stop)
+	if scope {
+		p.scope = name + ".scope"
+		p.cgroup, p.cgroupV2 = scopeCgroup(cmd.Process.Pid, p.scope, 3*time.Second)
+		if p.cgroup == "" {
+			fmt.Fprintf(os.Stderr, "niko-loadgen: %s's cgroup not found: oom_kill unknown\n", p.scope)
+		}
+	}
 	return p
+}
+
+// scopeCgroup waits within d for pid to be in the scope unit (systemd-run
+// moves itself there before it execs), and is its memory cgroup then.
+func scopeCgroup(pid int, unit string, d time.Duration) (dir string, v2 bool) {
+	for deadline := time.Now().Add(d); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cgroup")
+		if err != nil {
+			return "", false
+		}
+		if strings.Contains(string(b), "/"+unit+"\n") {
+			return cgroupOf(string(b), "/sys/fs/cgroup")
+		}
+	}
+	return "", false
 }
 
 // stop ends the process, once: the count of its cgroup's OOM kills first,
@@ -247,9 +277,6 @@ func start(role, config, pprof, cgroup string, v2, scope bool, name string) *pro
 func (p *proc) stop() { p.stopOnce.Do(p.stopNow) }
 
 func (p *proc) stopNow() {
-	if p.scope && p.cmd.Process != nil {
-		p.cgroup, p.cgroupV2 = cgroupOf(p.cmd.Process.Pid, "/sys/fs/cgroup")
-	}
 	if p.cgroup != "" {
 		fmt.Printf("%s cgroup: oom_kill %d\n", p.role, oomKills(p.cgroup, p.cgroupV2))
 	}
@@ -264,7 +291,11 @@ func (p *proc) stopNow() {
 			<-done
 		}
 	}
-	if p.cgroup != "" && !p.scope {
+	if p.scope != "" {
+		out, _ := exec.Command("systemctl", "show", "-p", "Result", "--value", p.scope).Output()
+		fmt.Printf("%s scope %s: result %s\n", p.role, p.scope, strings.TrimSpace(string(out))) // oom-kill: killed
+		exec.Command("systemctl", "reset-failed", p.scope).Run()
+	} else if p.cgroup != "" {
 		if err := os.Remove(p.cgroup); err != nil {
 			fmt.Fprintln(os.Stderr, "niko-loadgen: cgroup:", err)
 		}
