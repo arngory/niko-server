@@ -3,6 +3,7 @@ package memlimit
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -107,6 +108,40 @@ func TestReadV1(t *testing.T) {
 	check(t, "combined", p2, Limits{Max: 128 * mib, MemTotal: 4 << 30})
 }
 
+// lxcfs: /proc/meminfo is the container's own, its MemTotal its
+// memory.max; the limit stands.
+func TestReadLxcfs(t *testing.T) {
+	tr, p := newTree(t, "0::/\n")
+	tr.write("meminfo", "MemTotal:        1048576 kB\n")
+	tr.write("fs/memory.max", "1073741824\n")
+	l := check(t, "lxcfs", p, Limits{Max: 1 << 30, MemTotal: 1 << 30})
+	if l.Limit() != 1<<30 || l.GoLimit(7, 8) != 840*mib {
+		t.Fatalf("limit %d, Go %d", l.Limit(), l.GoLimit(7, 8))
+	}
+}
+
+// The mounts from mountinfo: v1's memory controller co-mounted with cpu
+// (cpu,memory), not at Root/memory; v2 at another point, a container's
+// cgroup mounted there (its root field), the path from /proc/self/cgroup
+// taken under it.
+func TestReadMountinfo(t *testing.T) {
+	tr, p := newTree(t, "5:cpu,memory:/lxc/c1/app\n0::/lxc/c1/app\n")
+	v1, v2 := tr.path("v1 mounts/cpu,memory"), tr.path("v2")
+	tr.write("mountinfo", "36 23 0:28 / "+tr.path("fs")+" rw,relatime - tmpfs tmpfs rw,mode=755\n"+
+		"37 36 0:29 / "+strings.ReplaceAll(v1, " ", "\\040")+" rw,relatime shared:9 - cgroup cgroup rw,cpu,memory\n"+
+		"38 36 0:30 /lxc/c1 "+v2+" rw,relatime - cgroup2 cgroup2 rw,nsdelegate\n")
+	p.Mountinfo = tr.path("mountinfo")
+	tr.write("v1 mounts/cpu,memory/lxc/c1/memory.limit_in_bytes", "268435456\n")
+	tr.write("v2/app/memory.high", "201326592\n")
+	tr.write("v2/memory.max", "536870912\n")
+	tr.write("fs/memory/lxc/c1/memory.limit_in_bytes", "1\n") // not the mount: unread
+	tr.write("fs/lxc/c1/app/memory.max", "1\n")
+	check(t, "mountinfo", p, Limits{Max: 256 * mib, High: 192 * mib, MemTotal: 4 << 30})
+	// Without mountinfo, Root's and Root/memory.
+	p.Mountinfo = tr.path("none")
+	check(t, "no mountinfo", p, Limits{Max: 1, MemTotal: 4 << 30})
+}
+
 // Nothing known: no files, or files of garbage.
 func TestReadNone(t *testing.T) {
 	dir := t.TempDir()
@@ -120,8 +155,9 @@ func TestReadNone(t *testing.T) {
 	check(t, "garbage", p, Limits{})
 }
 
-// A limit at or above MemTotal limits nothing; under it, the less of
-// High and Max is the limit.
+// A limit above MemTotal limits nothing; at or under it, the less of High
+// and Max is the limit: under lxcfs MemTotal is the container's
+// memory.max, and MemoryMax=100% the host's memory.
 func TestLimit(t *testing.T) {
 	const host = 4 << 30
 	for _, c := range []struct {
@@ -129,7 +165,9 @@ func TestLimit(t *testing.T) {
 		limit, memory int64
 	}{
 		{Limits{MemTotal: host}, 0, host},
-		{Limits{Max: host, MemTotal: host}, 0, host},
+		{Limits{Max: host, MemTotal: host}, host, host},     // lxcfs, MemoryMax=100%
+		{Limits{Max: host + 4096, MemTotal: host}, 0, host}, // above it
+		{Limits{Max: host, High: host / 8 * 7, MemTotal: host}, host / 8 * 7, host / 8 * 7},
 		{Limits{Max: 8 << 30, High: 8 << 30, MemTotal: host}, 0, host},
 		{Limits{Max: 1 << 30, MemTotal: host}, 1 << 30, 1 << 30},
 		{Limits{High: 1 << 30, MemTotal: host}, 1 << 30, 1 << 30},
