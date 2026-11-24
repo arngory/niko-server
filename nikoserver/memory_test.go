@@ -5,13 +5,17 @@ package nikoserver
 import (
 	"context"
 	"crypto/tls"
+	"net"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/arngory/niko-server/nikoserver/memlimit"
 	"github.com/sagernet/quic-go/congestion"
 	"github.com/sagernet/quic-go/monotime"
+	"github.com/sagernet/sing-quic/hysteria2"
 )
 
 const mib = 1 << 20
@@ -433,4 +437,142 @@ func TestHysteriaFloorReplaces(t *testing.T) {
 	}
 	next.conn.CloseWithError(0, "")
 	waitReleased(t, mem)
+}
+
+// A connection is admitted only once its hook said yes: another auth
+// request of it meanwhile waits, and gets no 233 when the hook refuses;
+// a TCP stream sent right after the auth, before the answer, is reset and
+// never dials, whatever the hook says. Before, the second request was
+// answered at once and the stream dialled while the hook ran.
+func TestHysteriaAdmittedOnlyAfterTheHook(t *testing.T) {
+	for _, refuse := range []bool{true, false} {
+		t.Run(map[bool]string{true: "refused", false: "admitted"}[refuse], func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ln.Close()
+			var dialled atomic.Int32
+			go func() {
+				for {
+					c, err := ln.Accept()
+					if err != nil {
+						return
+					}
+					dialled.Add(1)
+					c.Close()
+				}
+			}()
+			mem := newHyMem(1<<30, nil)
+			if refuse {
+				mem = newHyMem(hyFloor/2, nil) // no floor fits: every connection refused
+			}
+			mem.floorsIn = true
+			node := hy2MasqNode(t, ctx, nil, mem, "u1", "password-one")
+			admitDelay.Store(int64(400 * time.Millisecond))
+			defer admitDelay.Store(0)
+			r, err := dialRawHy2(t, ctx, node.server, []tls.CurveID{tls.X25519MLKEM768}, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var wg sync.WaitGroup
+			st := make([]int, 2)
+			start := time.Now()
+			var second time.Duration
+			for i := range 2 {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					if i == 1 {
+						time.Sleep(50 * time.Millisecond)
+					}
+					st[i], _ = r.tryAuth("password-one", 0)
+					if i == 1 {
+						second = time.Since(start)
+					}
+				}()
+			}
+			// A stream while the hook runs: its request at once.
+			time.Sleep(100 * time.Millisecond)
+			r.stream(t, ln.Addr().String())
+			wg.Wait()
+			t.Logf("statuses %v, the second after %v", st, second.Round(time.Millisecond))
+			time.Sleep(200 * time.Millisecond)
+			if n := dialled.Load(); n != 0 {
+				t.Errorf("a stream sent before the admission dialled %d times", n)
+			}
+			if refuse && (st[0] == 233 || st[1] == 233) {
+				t.Fatalf("a refused connection answered 233: %v", st)
+			}
+			if !refuse && (st[0] != 233 || st[1] != 233 || second < 300*time.Millisecond) {
+				t.Fatalf("admitted: statuses %v, the second answered after %v, before the hook", st, second)
+			}
+			if !refuse {
+				// Once admitted, a stream goes through.
+				s := r.stream(t, ln.Addr().String())
+				defer s.Close()
+				for deadline := time.Now().Add(5 * time.Second); dialled.Load() == 0; time.Sleep(10 * time.Millisecond) {
+					if time.Now().After(deadline) {
+						t.Fatal("after the admission a stream never dialled")
+					}
+				}
+			}
+		})
+	}
+}
+
+// The budget full and the user under its limit of connections (or the
+// limits off): a device that reconnects (after a change of network, its
+// old connection not yet idled out) takes its old connection's place and
+// floor, counted as memory; another user's newcomer is still refused.
+func TestHysteriaFloorReconnectUnderLimit(t *testing.T) {
+	for _, off := range []bool{false, true} {
+		t.Run(map[bool]string{false: "limits on", true: "limits off"}[off], func(t *testing.T) {
+			m := newHyMem(2*hyFloor, nil) // two floors in all
+			m.floorsIn = true
+			u := newHy2Users()
+			u.limits, u.mem = newHyLimits(), m // 16 connections a user
+			u.limits.SetConnLimit(!off)
+			u.set([]string{"u1-a", "u2-a", "u3-a"}, []string{"p1", "p2", "p3"}, func([]*hy2User, []string) {})
+			hook := connectionHook(u, &sessions{})
+			var ends []chan struct{}
+			conn := func(p, name string) (ok bool, closed *atomic.Bool) {
+				done := make(chan struct{})
+				ends = append(ends, done)
+				closed = new(atomic.Bool)
+				m.sender(done, baseName(name), &fakeCC{cwnd: 1 << 20})
+				ok = hook(&net.UDPAddr{}, u.byPass[p], func() hysteria2.ConnectionStats { return hysteria2.ConnectionStats{} },
+					func() { closed.Store(true) }, done)
+				return ok, closed
+			}
+			ok1, old := conn("p1", "u1-a")
+			ok2, _ := conn("p2", "u2-a")
+			if !ok1 || !ok2 {
+				t.Fatal("two floors in a budget of two refused")
+			}
+			if ok, _ := conn("p3", "u3-a"); ok {
+				t.Fatal("a third user's past the budget admitted")
+			}
+			ok3, _ := conn("p1", "u1-a") // the same device, reconnected
+			if !ok3 || !old.Load() {
+				t.Fatalf("the device's reconnect admitted %v, its old connection closed %v", ok3, old.Load())
+			}
+			r := u.limits.Refused()
+			if r["u1"]["memory"] != 1 || r["u3"]["memory"] != 1 || r["u1"]["conns"] != 0 {
+				t.Fatalf("refusals %v", r)
+			}
+			m.mu.Lock()
+			floors := m.floors
+			m.mu.Unlock()
+			if floors != 2*hyFloor {
+				t.Fatalf("floors %d", floors/hyFloor)
+			}
+			for _, e := range ends {
+				close(e)
+			}
+			waitReleased(t, m)
+		})
+	}
 }
